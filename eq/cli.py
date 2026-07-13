@@ -623,15 +623,16 @@ def ml_predict_batch(
     print(df.to_string(index=False))
 
 
-@ml_app.command("update-data", help="更新 qlib 本地数据到最新（baostock 拉 A 股日线 → 续 .bin）")
+@ml_app.command("update-data", help="更新 qlib 本地数据到最新（baostock 拉 A 股日线 → 续 .bin，多线程并行）")
 def ml_update_data(
     start: str = typer.Option("2020-09-28", "--start", "-s", help="续期起始日，默认接 2020-09-25"),
     end: str = typer.Option("", "--end", "-e", help="续期结束日，默认今天"),
     universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all"),
+    workers: int = typer.Option(10, "--workers", "-w", help="并行线程数（IO 密集型，默认 10）"),
 ):
     from eq.strategy.factors.ml_data_updater import update_qlib_data
     try:
-        result = update_qlib_data(start=start, end=end or None, universe=universe, verbose=True)
+        result = update_qlib_data(start=start, end=end or None, universe=universe, workers=workers, verbose=True)
     except Exception as e:
         typer.echo(f"更新失败：{e}", err=True)
         raise typer.Exit(1)

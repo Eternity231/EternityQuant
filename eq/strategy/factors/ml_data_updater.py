@@ -126,15 +126,17 @@ def update_qlib_data(
     end: str | None = None,
     universe: str = "csi300",
     instruments: list[str] | None = None,
+    workers: int = 10,
     verbose: bool = True,
 ) -> dict:
-    """把 qlib 本地数据从 start 续到 end（默认今天）。
+    """把 qlib 本地数据从 start 续到 end（默认今天）。支持多线程并行拉。
 
     Args:
         start: 续期起始日（YYYY-MM-DD），默认 2020-09-28（接 2020-09-25）
         end: 续期结束日，默认今天
         universe: csi300/csi500/all，成分股列表
         instruments: 显式指定代码列表，覆盖 universe
+        workers: 并行线程数（baostock IO 密集型，默认 10 线程）
         verbose: 打进度
     Returns:
         {"days_added": int, "instruments_updated": int, "features_per_inst": int}
@@ -142,7 +144,6 @@ def update_qlib_data(
     if end is None:
         end = dt.date.today().isoformat()
 
-    # 1. 拉交易日历（start~end）
     import baostock as bs
     bs.login()
     try:
@@ -155,7 +156,6 @@ def update_qlib_data(
         # 2. 续日历文件
         cal_path = _QLIB_DATA_DIR / "calendars" / "day.txt"
         existing_cal = cal_path.read_text().strip().split("\n") if cal_path.exists() else []
-        # 去重：新日历里可能和现有的末尾重叠
         new_cal_days = [d for d in new_days if d not in existing_cal]
         with open(cal_path, "a") as f:
             for d in new_cal_days:
@@ -167,42 +167,59 @@ def update_qlib_data(
         if instruments is None:
             instruments = _bs_instruments(universe)
         if verbose:
-            print(f"成分股 {len(instruments)} 只（universe={universe}）", flush=True)
+            print(f"成分股 {len(instruments)} 只（universe={universe}），{workers} 线程并行", flush=True)
 
-        # 4. 每只票拉日线 → 转 .bin 续期
+        # 4. 多线程并行拉日线 → 转 .bin 续期
         feats_dir = _QLIB_DATA_DIR / "features"
         feats_dir.mkdir(parents=True, exist_ok=True)
-        updated = 0
         total = len(instruments)
         import time as _time
+        import concurrent.futures as _cf
+        import threading as _threading
+
         _t0 = _time.time()
-        for i, code in enumerate(instruments):
-            # qlib 代码 SH600519 → features/sh600519/
+        _lock = _threading.Lock()
+        _completed = [0]
+        _failed = [0]
+
+        def _process_one(code: str) -> bool:
+            """处理一只票，返回 True 成功 False 失败。"""
             inst_dir = feats_dir / code.lower()
             inst_dir.mkdir(parents=True, exist_ok=True)
-            # 拉日线
-            df = _bs_query_k_data(code, start, end)
-            if df.empty:
-                continue
-            # 对齐日历：每个交易日一行，停牌写 NaN
-            df = df.reindex(new_days)
-            # 写每个特征的 .bin
-            for feat in _FEATURES:
-                bin_path = inst_dir / f"{feat}.day.bin"
-                vals = df[feat].tolist() if feat in df.columns else [float("nan")] * len(new_days)
-                # NaN 转 float32 nan
-                vals = [float("nan") if v != v or v is None else v for v in vals]
-                _append_bin(bin_path, vals)
-            updated += 1
-            if verbose:
-                _elapsed = _time.time() - _t0
-                _pct = (i + 1) / total * 100
-                _speed = (i + 1) / _elapsed if _elapsed > 0 else 0
-                _eta = (total - i - 1) / _speed if _speed > 0 else 0
-                print(f"\r  进度 {_pct:5.1f}%  ({i+1}/{total})  已用 {_elapsed:.0f}s  ETA {_eta:.0f}s  当前 {code}", end="", flush=True)
+            try:
+                df = _bs_query_k_data(code, start, end)
+                if df.empty:
+                    return False
+                df = df.reindex(new_days)
+                for feat in _FEATURES:
+                    bin_path = inst_dir / f"{feat}.day.bin"
+                    vals = df[feat].tolist() if feat in df.columns else [float("nan")] * len(new_days)
+                    vals = [float("nan") if v != v or v is None else v for v in vals]
+                    _append_bin(bin_path, vals)
+                return True
+            except Exception:
+                return False
+
+        with _cf.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_process_one, code): code for code in instruments}
+            done_count = 0
+            for f in _cf.as_completed(futures):
+                done_count += 1
+                if f.result():
+                    _completed[0] += 1
+                else:
+                    _failed[0] += 1
+                if verbose:
+                    _elapsed = _time.time() - _t0
+                    _pct = done_count / total * 100
+                    _speed = done_count / _elapsed if _elapsed > 0 else 0
+                    _eta = (total - done_count) / _speed if _speed > 0 else 0
+                    _cur_code = futures[f]
+                    print(f"\r  进度 {_pct:5.1f}%  ({done_count}/{total})  ✓{_completed[0]} ✗{_failed[0]}  已用 {_elapsed:.0f}s  ETA {_eta:.0f}s  当前 {_cur_code}", end="", flush=True)
+        updated = _completed[0]
         if verbose:
             _total_elapsed = _time.time() - _t0
-            print(f"\n完成：{updated} 只票 × {len(_FEATURES)} 特征 × {len(new_days)} 日  ({_total_elapsed:.0f}s)", flush=True)
+            print(f"\n完成：{updated} 只票 ✓，{_failed[0]} 只失败 ✗  × {len(_FEATURES)} 特征 × {len(new_days)} 日  ({_total_elapsed:.0f}s)", flush=True)
     finally:
         bs.logout()
 
