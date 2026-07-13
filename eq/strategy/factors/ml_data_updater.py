@@ -1,16 +1,11 @@
 """qlib A 股数据更新器：baostock 拉日线 → 转 qlib .bin 格式续期。
 
-qlib 本地数据集截至 2020-09-25，本更新器把数据续到最新（今天）：
-1. 日历续期：2020-09-26 ~ 今天 的交易日写入 calendars/day.txt
-2. 特征续期：每只票的 open/high/low/close/volume/factor/change 转 .day.bin 续期
-3. 成分股续期：csi300/csi500/all 的 instruments 列表更新
-
-.bin 格式：float32，无 header，按日历顺序。停牌日该位置写 NaN（float32 的 nan）。
-baostock 生命周期：login() → query → logout()，避免资源泄漏。
+qlib 本地数据集截至 2020-09-25，本更新器把数据续到最新（今天）。
+baostock 是 TCP 长连接（多线程不安全），用 multiprocessing.Pool 真并行，
+每个子进程独立 login/logout。
 
 用法：
-    from eq.strategy.factors.ml_data_updater import update_qlib_data
-    update_qlib_data(start="2020-09-28", end="2026-07-13", universe="csi300")
+    eq ml update-data --start 2020-09-28 --universe csi300 --workers 10
 """
 
 from __future__ import annotations
@@ -28,17 +23,106 @@ _FEATURES = ["open", "high", "low", "close", "volume", "factor", "change"]
 _FLOAT32_NAN = np.float32(np.nan)
 
 
+# ---------- 模块级工作函数（multiprocessing.Pool 在 Windows spawn 模式下必须可 pickle） ----------
+
+def _worker_init():
+    """每个子进程启动时 baostock login。"""
+    import baostock as _bs
+    _bs.login()
+
+
+def _worker_finish():
+    """每个子进程完成后 baostock logout。"""
+    import baostock as _bs
+    _bs.logout()
+
+
+def _proc_one_stock(code: str, start: str, end: str, new_days: tuple, qlib_feats_dir: str) -> bool:
+    """子进程内处理一只票。baostock 已 login，直接 query。
+    
+    返回 True=成功 False=失败（停牌或异常）。
+    """
+    import baostock as _bs
+    from pathlib import Path
+    import pandas as pd
+
+    inst_dir = Path(qlib_feats_dir) / code.lower()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if code.startswith("SH"):
+            bs_code = f"sh.{code[2:]}"
+        elif code.startswith("SZ"):
+            bs_code = f"sz.{code[2:]}"
+        else:
+            return False
+        rs = _bs.query_history_k_data_plus(
+            bs_code, "date,open,high,low,close,volume,preclose,adjustflag,turn",
+            start_date=start, end_date=end, frequency="d", adjustflag="2",
+        )
+        if rs.error_code != "0":
+            return False
+        rows_list = []
+        while rs.next():
+            rows_list.append(rs.get_row_data())
+        if not rows_list:
+            return False
+        df = pd.DataFrame(rows_list, columns=["date", "open", "high", "low", "close", "volume", "preclose", "adjustflag", "turn"])
+        for col in ["open", "high", "low", "close", "volume", "preclose"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["factor"] = 1.0
+        df["change"] = (df["close"] - df["preclose"]) / df["preclose"]
+        df = df.set_index("date")[["open", "high", "low", "close", "volume", "factor", "change"]]
+        # 对齐日历
+        days_list = list(new_days)
+        df = df.reindex(days_list)
+        # 写 .bin
+        for feat in _FEATURES:
+            bin_path = inst_dir / f"{feat}.day.bin"
+            vals = df[feat].tolist() if feat in df.columns else [float("nan")] * len(days_list)
+            vals = [float("nan") if v != v or v is None else v for v in vals]
+            _append_bin(bin_path, vals)
+        return True
+    except Exception:
+        return False
+
+
+def _proc_batch(args: tuple) -> tuple:
+    """子进程内处理一批代码，返回(成功数, 失败数)。
+    
+    args: (codes, start, end, new_days, feats_dir_str)
+    """
+    codes, start, end, new_days, feats_dir_str = args
+    _worker_init()
+    ok = fail = 0
+    for code in codes:
+        if _proc_one_stock(code, start, end, new_days, feats_dir_str):
+            ok += 1
+        else:
+            fail += 1
+    _worker_finish()
+    return ok, fail
+
+
+def _append_bin(bin_path: Path, new_values: list[float]) -> None:
+    """给 .bin 文件追加 float32 数据。停牌日写 NaN。"""
+    arr = np.array(new_values, dtype=np.float32)
+    with open(bin_path, "ab") as f:
+        f.write(arr.tobytes())
+
+
+# ---------- 内部工具函数 ----------
+
 def _bs_instruments(universe: str = "csi300") -> list[str]:
-    """baostock 拉成分股列表，返回 qlib 格式代码列表（SH600519/sz000001）。"""
+    """baostock 拉成分股列表，返回 qlib 格式代码列表（SH600000/sz000001）。"""
     import baostock as bs
     if universe == "csi300":
-        rs = bs.query_hs300_stocks()  # 沪深300
+        rs = bs.query_hs300_stocks()
     elif universe == "csi500":
         rs = bs.query_zz500_stocks()
     elif universe == "sz50":
         rs = bs.query_sz50_stocks()
     else:
-        # all：沪深京全 A，用 akshare 新浪源拉全市场代码
+        # all：沪深京全 A，用 akshare 新浪源
         import akshare as ak
         df = ak.stock_zh_a_spot()
         codes = []
@@ -53,48 +137,12 @@ def _bs_instruments(universe: str = "csi300") -> list[str]:
     rows = []
     while rs.next():
         rows.append(rs.get_row_data())
-    # row_data[1] 是代码如 "sh.600000"，转 "SH600000"
+    # row: [date, code, name] → code 如 "sh.600000" → "SH600000"
     return [r[1].replace(".", "").upper() for r in rows] if rows else []
 
 
-def _bs_query_k_data(code: str, start: str, end: str) -> pd.DataFrame:
-    """baostock 拉单只票日线，返回 DataFrame(open/high/low/close/volume/factor/change)。
-
-    baostock 代码格式：sh.600000 / sz.000001（qlib 是 SH600000/sz000001，转一下）。
-    """
-    import baostock as bs
-    # qlib SH600000 → baostock sh.600000
-    if code.startswith("SH"):
-        bs_code = f"sh.{code[2:]}"
-    elif code.startswith("SZ"):
-        bs_code = f"sz.{code[2:]}"
-    else:
-        return pd.DataFrame()
-    rs = bs.query_history_k_data_plus(
-        bs_code,
-        "date,open,high,low,close,volume,preclose,adjustflag,turn",
-        start_date=start, end_date=end, frequency="d", adjustflag="2",  # 前复权
-    )
-    if rs.error_code != "0":
-        return pd.DataFrame()
-    rows = []
-    while rs.next():
-        rows.append(rs.get_row_data())
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "preclose", "adjustflag", "turn"])
-    # 转 float，空字符串 → NaN
-    for col in ["open", "high", "low", "close", "volume", "preclose"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    # factor：复权因子，baostock adjustflag=2 前复权，factor 简化为 1.0（已复权）
-    df["factor"] = 1.0
-    # change：涨跌幅 = (close - preclose) / preclose
-    df["change"] = (df["close"] - df["preclose"]) / df["preclose"]
-    return df.set_index("date")[["open", "high", "low", "close", "volume", "factor", "change"]]
-
-
 def _trading_days(start: str, end: str) -> list[str]:
-    """拉 start~end 的交易日列表（baostock query_trade_base）。"""
+    """拉 start~end 的交易日列表（baostock query_trade_dates）。"""
     import baostock as bs
     rs = bs.query_trade_dates(start_date=start, end_date=end)
     if rs.error_code != "0":
@@ -102,24 +150,10 @@ def _trading_days(start: str, end: str) -> list[str]:
     rows = []
     while rs.next():
         rows.append(rs.get_row_data())
-    # row: [date, is_trading_day]，只取交易日
     return [r[0] for r in rows if r[1] == "1"]
 
 
-def _append_bin(bin_path: Path, new_values: list[float]) -> None:
-    """给 .bin 文件追加 float32 数据。停牌日写 NaN。"""
-    arr = np.array(new_values, dtype=np.float32)
-    with open(bin_path, "ab") as f:  # append binary
-        f.write(arr.tobytes())
-
-
-def _build_calendar_cache() -> list[str]:
-    """读现有 calendars/day.txt 全量日历。"""
-    p = _QLIB_DATA_DIR / "calendars" / "day.txt"
-    if not p.exists():
-        return []
-    return p.read_text().strip().split("\n")
-
+# ---------- 主入口 ----------
 
 def update_qlib_data(
     start: str = "2020-09-28",
@@ -129,14 +163,14 @@ def update_qlib_data(
     workers: int = 10,
     verbose: bool = True,
 ) -> dict:
-    """把 qlib 本地数据从 start 续到 end（默认今天）。支持多线程并行拉。
+    """把 qlib 本地数据从 start 续到 end（默认今天）。多进程并行拉。
 
     Args:
         start: 续期起始日（YYYY-MM-DD），默认 2020-09-28（接 2020-09-25）
         end: 续期结束日，默认今天
         universe: csi300/csi500/all，成分股列表
         instruments: 显式指定代码列表，覆盖 universe
-        workers: 并行线程数（baostock IO 密集型，默认 10 线程）
+        workers: 并行进程数（baostock TCP 长连接，多进程真并行，默认 10）
         verbose: 打进度
     Returns:
         {"days_added": int, "instruments_updated": int, "features_per_inst": int}
@@ -153,7 +187,7 @@ def update_qlib_data(
         if verbose:
             print(f"续期 {start} ~ {end}：{len(new_days)} 个交易日", flush=True)
 
-        # 2. 续日历文件
+        # 续日历文件
         cal_path = _QLIB_DATA_DIR / "calendars" / "day.txt"
         existing_cal = cal_path.read_text().strip().split("\n") if cal_path.exists() else []
         new_cal_days = [d for d in new_days if d not in existing_cal]
@@ -163,69 +197,54 @@ def update_qlib_data(
         if verbose:
             print(f"日历续 {len(new_cal_days)} 日（去重后）", flush=True)
 
-        # 3. 拉成分股列表
+        # 拉成分股
         if instruments is None:
             instruments = _bs_instruments(universe)
         if verbose:
-            print(f"成分股 {len(instruments)} 只（universe={universe}），{workers} 线程并行", flush=True)
+            print(f"成分股 {len(instruments)} 只（universe={universe}），{workers} 进程并行", flush=True)
 
-        # 4. 多线程并行拉日线 → 转 .bin 续期
+        # 多进程并行拉
         feats_dir = _QLIB_DATA_DIR / "features"
         feats_dir.mkdir(parents=True, exist_ok=True)
         total = len(instruments)
         import time as _time
-        import concurrent.futures as _cf
-        import threading as _threading
+        import multiprocessing as _mp
+
+        # 分批：每批 workers 个代码，每个子进程跑一批
+        batch_size = max(1, workers)
+        batches = [instruments[i:i + batch_size] for i in range(0, total, batch_size)]
+        batch_args = [(b, start, end, tuple(new_days), str(feats_dir)) for b in batches]
 
         _t0 = _time.time()
-        _lock = _threading.Lock()
-        _completed = [0]
-        _failed = [0]
+        done = _mp.Value("i", 0)
+        ok = _mp.Value("i", 0)
+        fail = _mp.Value("i", 0)
+        done_count = [0]  # 已返回批次计数
 
-        def _process_one(code: str) -> bool:
-            """处理一只票，返回 True 成功 False 失败。"""
-            inst_dir = feats_dir / code.lower()
-            inst_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                df = _bs_query_k_data(code, start, end)
-                if df.empty:
-                    return False
-                df = df.reindex(new_days)
-                for feat in _FEATURES:
-                    bin_path = inst_dir / f"{feat}.day.bin"
-                    vals = df[feat].tolist() if feat in df.columns else [float("nan")] * len(new_days)
-                    vals = [float("nan") if v != v or v is None else v for v in vals]
-                    _append_bin(bin_path, vals)
-                return True
-            except Exception:
-                return False
-
-        with _cf.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_process_one, code): code for code in instruments}
-            done_count = 0
-            for f in _cf.as_completed(futures):
-                done_count += 1
-                if f.result():
-                    _completed[0] += 1
-                else:
-                    _failed[0] += 1
+        with _mp.Pool(processes=workers) as pool:
+            results = pool.imap_unordered(_proc_batch, batch_args)
+            for ok_cnt, fail_cnt in results:
+                done_count[0] += 1
+                with ok.get_lock():
+                    ok.value += ok_cnt
+                    fail.value += fail_cnt
+                    done.value = ok.value + fail.value
                 if verbose:
                     _elapsed = _time.time() - _t0
-                    _pct = done_count / total * 100
-                    _speed = done_count / _elapsed if _elapsed > 0 else 0
-                    _eta = (total - done_count) / _speed if _speed > 0 else 0
-                    _cur_code = futures[f]
-                    print(f"\r  进度 {_pct:5.1f}%  ({done_count}/{total})  ✓{_completed[0]} ✗{_failed[0]}  已用 {_elapsed:.0f}s  ETA {_eta:.0f}s  当前 {_cur_code}", end="", flush=True)
-        updated = _completed[0]
+                    _pct = min(done.value / total * 100, 100.0)
+                    _speed = done.value / _elapsed if _elapsed > 0 else 0
+                    _eta = (total - done.value) / _speed if _speed > 0 else 0
+                    print(f"\r  进度 {_pct:5.1f}%  ({done.value}/{total})  ✓{ok.value} ✗{fail.value}  已用 {_elapsed:.0f}s  ETA {_eta:.0f}s", end="", flush=True)
+
         if verbose:
             _total_elapsed = _time.time() - _t0
-            print(f"\n完成：{updated} 只票 ✓，{_failed[0]} 只失败 ✗  × {len(_FEATURES)} 特征 × {len(new_days)} 日  ({_total_elapsed:.0f}s)", flush=True)
+            print(f"\n完成：{ok.value} 只票 ✓，{fail.value} 只失败 ✗  × {len(_FEATURES)} 特征 × {len(new_days)} 日  ({_total_elapsed:.0f}s)", flush=True)
     finally:
         bs.logout()
 
     return {
         "days_added": len(new_cal_days),
-        "instruments_updated": updated,
+        "instruments_updated": ok.value,
         "features_per_inst": len(_FEATURES),
         "trading_days": len(new_days),
     }
