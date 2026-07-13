@@ -12,14 +12,6 @@
 
 from __future__ import annotations
 
-# torch DLL 预热（Windows + cu132 坑：qlib �链触发 torch 延迟加载失败，先预热）
-try:
-    import torch as _torch
-    if _torch.cuda.is_available():
-        _torch.cuda.init()
-except ImportError:
-    pass
-
 import typer
 
 from eq.backtest import BacktestConfig, EventDrivenBacktester, VectorizedBacktester
