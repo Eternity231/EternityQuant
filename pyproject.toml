@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eternityquant"
+version = "0.1.0"
+description = "EternityQuant — 个人散户量化助手（CLI + 定时推送 + Streamlit 仪表盘）"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "EternityQuant" }]
+license = { text = "MIT" }
+dependencies = [
+    "typer>=0.12",
+    "pandas>=2.0",
+    "akshare>=1.12",
+    "yfinance>=0.2.40",
+    "baostock>=0.9.3",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+web = ["streamlit>=1.30", "plotly>=5.20"]
+ml = ["qlib>=0.9", "lightgbm>=4.0"]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+eq = "eq.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["eq*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

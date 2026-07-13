@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Env / secrets
+.env
+*.env
+
+# DB
+*.db
+*.db-journal
+
+# IDE
+.vscode/
+.idea/
+
+# Build
+dist/
+build/
+
+# MCP
+# .mcp.json  # 不忽略 — 团队共享
+
+# Personal skills library（含 grilling skill，个人配置不进仓库）
+skills/
