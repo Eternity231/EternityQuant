@@ -2,7 +2,7 @@
 
 个人散户量化助手 —— 不交易，只提醒和辅助决策。
 
-当前版本 **v0.11**（11 个 commit 全实测固化）。
+当前版本 **v0.15**（16 个 commit 全实测固化，35 单元测试）。
 
 ## 当前能力速览
 
@@ -18,9 +18,11 @@ eq backtest 600519.SH trend_ema --engine vectorized
 eq bt list / show <run_id> / remove <run_id>
 eq ml train csi300 5 --algo lightgbm --device cpu      # LightGBM CPU
 eq ml train csi300 5 --algo lightgbm --device gpu      # LightGBM GPU（OpenCL）
-eq ml train csi300 5 --algo mlp --device cuda          # 自写 MLP 走 3060 CUDA（IC 比 LightGBM 高 68%）
+eq ml train csi300 5 --algo mlp --device cuda          # 自写 MLP 走 3060 CUDA
+eq ml train csi300 5 --algo lstm --device cuda          # 自写 LSTM 走 CUDA（量化选股最佳，6×26 时序重塑）
+eq ml update-data --start 2020-09-28 --universe csi300  # qlib 数据续到最新（baostock）
 eq ml activate <model_id>
-eq ml predict-batch <model_id> --top 10                # 批量预测入 ml_predictions 表
+eq ml predict-batch <model_id> --top 10                # 批量预测入 ml_predictions 表（v0.14 支持自写模型）
 eq dash                                 # 启动 Streamlit 6 页看板
 eq --help                               # 看所有命令
 ```
@@ -64,7 +66,7 @@ eq --help                               # 看所有命令
 | `eq scheduler add/list/run/daemon` | 定时推送（APScheduler） | v0.2 |
 | `eq backtest ... --engine vectorized/event_driven` | 双引擎回测，自动外存 parquet | v0.1/v0.3 |
 | `eq bt list/show/remove` | 回测历史管理 | v0.3 |
-| `eq ml train/activate/list/info/predict/predict-batch` | ML 因子（LightGBM + PyTorch） | v0.6/v0.8/v0.9 |
+| `eq ml train/activate/list/info/predict/predict-batch/update-data` | ML 因子（LightGBM + PyTorch + 数据更新） | v0.6~v0.15 |
 | `eq dash` | Streamlit 6 页看板 | v0.1/v0.11 |
 
 ## 监控规则 10 种类型
@@ -83,15 +85,26 @@ eq --help                               # 看所有命令
 
 ## ML 因子层
 
-### 三条训练路径
+### 四条训练路径
 
-| algo | device | 说明 | IC（CSI300+Alpha158+5年） |
+| algo | device | 说明 | IC（CSI300+Alpha158+5年，2020-09 数据） |
 |------|--------|------|---------------------------|
 | `lightgbm` | `cpu` | 基线，qlib LGBModel | +0.0985 |
 | `lightgbm` | `gpu` | OpenCL 后端（默认编译含） | +0.0985 |
-| `mlp` | `cuda` | **自写 _SimpleMLP 走 3060 CUDA，绕开 qlib DNNModelPytorch nan 坑** | **+0.1654** |
+| `mlp` | `cuda` | 自写 _SimpleMLP（158→512→256→128→1），真 CUDA | +0.1654 |
+| `lstm` | `cuda` | **自写 _SimpleLSTM（6×26 时序重塑，2 层 hidden=128），量化选股最佳** | 待续数据后测 |
 
-MLP + CUDA 比 LightGBM 高 68%，3060 12GB CUDA 主场兑现。
+LSTM 路径把 Alpha158 的 158 维特征重塑成 (batch, seq_len=6, input_size=26) 的时序张量喂给 LSTM——这是量化选股的正确做法（学"过去 6 日形态"），比 MLP 把特征当独立向量强。3060 12GB CUDA 主场。
+
+### 数据更新器（v0.15）
+
+qlib 本地数据集截至 2020-09-25，`eq ml update-data` 续到最新：
+
+```bash
+eq ml update-data --start 2020-09-28 --universe csi300   # baostock 拉 6 年日线，约 30-60 分钟
+```
+
+baostock 拉日线 → 转 qlib .bin 格式（float32，按日历顺序）续期 + 日历续期。续完后 `eq ml train` 用最新数据训练，`predict-batch` 出的就是今天的分数。
 
 ### 环坑修复记录
 
@@ -140,12 +153,15 @@ eq dash --port 8501    # 启动本地看板
 9. ✅ qlib PyTorch CUDA 集成（v0.9，自写 MLP 走 3060）
 10. ✅ 个股深度研究（v0.10，跨市场 14 板块 + MCP 补全建议）
 11. ✅ Streamlit 看板加 ML 交互 + 深度研究页（v0.11）
+12. ✅ 单元测试固化 + CLI CUDA 泄漏修复（v0.12，35 测试）
+13. ✅ 自写 LSTM + CUDA 训练进度 log（v0.13，6×26 时序重塑）
+14. ✅ predict-batch 支持自写 LSTM/MLP 模型（v0.14，按 algo 分路）
+15. ✅ qlib 数据更新器（v0.15，baostock 续到最新）
 
 ## 剩余候选（未做）
 
-- predict-batch 支持自写 MLP 模型 + ALSTM/GRU feature reshape
-- 单元测试固化（当前全靠手动实测，11 个 commit 都靠实跑验证）
-- 打包 PyPI publish（让 `pip install eternityquant` 能装）
+- GRU/ALSTM 真单元差异（当前复用 LSTM 路径）
+- PyPI 打包 publish（让 `pip install eternityquant` 能装）
 
 ## License
 
