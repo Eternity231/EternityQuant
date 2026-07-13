@@ -364,7 +364,7 @@ _BUILTIN_STRATEGIES = {
 }
 
 
-@app.command("backtest", help="回测内置策略（双引擎可选）")
+@app.command("backtest", help="回测内置策略（双引擎可选，自动外存 parquet）")
 def backtest(
     symbol: str = typer.Argument(help="股票符号，如 600519.SH"),
     strategy: str = typer.Argument(help=f"策略名，可选：{','.join(sorted(_BUILTIN_STRATEGIES))}"),
@@ -373,6 +373,7 @@ def backtest(
     initial_cash: float = typer.Option(1_000_000, "--cash", "-c", help="初始现金"),
     commission_bps: float = typer.Option(2.5, "--commission", help="单边手续费（万分之）"),
     slippage_bps: float = typer.Option(5.0, "--slippage", help="单边滑点（万分之）"),
+    save: bool = typer.Option(True, "--save/--no-save", help="是否外存 parquet + 入 backtest_runs 表"),
 ):
     if strategy not in _BUILTIN_STRATEGIES:
         typer.echo(f"未知策略 {strategy}，可选：{','.join(sorted(_BUILTIN_STRATEGIES))}", err=True)
@@ -402,6 +403,69 @@ def backtest(
     if not result.trades.empty:
         typer.echo(f"\n交易明细（前 5 笔）：")
         print(result.trades.head(5).to_string(index=False))
+    if save:
+        from eq.backtest.store import save_result
+        run_id = save_result(result, symbol=symbol, strategy_name=strategy)
+        typer.echo(f"\n已外存：run_id={run_id}（用 `eq bt show {run_id}` 查完整结果）")
+
+
+# 子命令组：eq bt ... （回测历史管理，避免破坏 eq backtest 主命令）
+bt_app = typer.Typer(help="回测历史管理（list/show/remove）", no_args_is_help=True)
+app.add_typer(bt_app, name="bt")
+
+
+@bt_app.command("list", help="列出最近回测记录")
+def bt_list(
+    symbol: str = typer.Option(None, "--symbol", "-s", help="按标的过滤"),
+    limit: int = typer.Option(20, "--limit", "-n", help="最近 N 条"),
+):
+    from eq.backtest.store import list_runs
+    runs = list_runs(symbol=symbol, limit=limit)
+    if not runs:
+        typer.echo("无回测记录")
+        return
+    print(f"\n回测记录（最近 {len(runs)} 条）：\n")
+    print(f"{'run_id':<24} {'标的':<14} {'策略':<16} {'引擎':<14} {'总收益':>10} {'夏普':>8} {'时间'}")
+    print("-" * 110)
+    for r in runs:
+        m = r["metrics"]
+        print(
+            f"{r['id']:<24} {r['symbol']:<14} {r['strategy_name']:<16} {r['engine']:<14} "
+            f"{m.get('total_return', 0):>+9.2%} {m.get('sharpe', 0):>+8.2f} {str(r['created_at'])[:19]}"
+        )
+
+
+@bt_app.command("show", help="查某次回测的完整结果（metadata + 权益曲线 + 交易明细）")
+def bt_show(
+    run_id: str = typer.Argument(help="run_id"),
+    details: bool = typer.Option(False, "--details", "-d", help="显示权益曲线和交易明细完整数据"),
+):
+    from eq.backtest.store import load_result
+    try:
+        bundle = load_result(run_id)
+    except KeyError as e:
+        typer.echo(f"{e}", err=True)
+        raise typer.Exit(1)
+    meta = bundle["meta"]
+    m = meta["metrics"]
+    typer.echo(f"\n回测 {meta['symbol']} 用 {meta['strategy_name']}（{meta['engine']}）@ {meta['created_at']}")
+    typer.echo(f"  总收益 {m.get('total_return', 0):+.2%}  年化 {m.get('annual_return', 0):+.2%}  夏普 {m.get('sharpe', 0):+.2f}  最大回撤 {m.get('max_drawdown', 0):+.2%}  胜率 {m.get('win_rate', 0):.1%}  交易 {m.get('num_trades', 0)} 笔")
+    if details:
+        typer.echo(f"\n权益曲线（前 5 日）：")
+        print(bundle["equity"].head(5).to_string())
+        if not bundle["trades"].empty:
+            typer.echo(f"\n交易明细（前 5 笔）：")
+            print(bundle["trades"].head(5).to_string(index=False))
+
+
+@bt_app.command("remove", help="删除某次回测记录（SQLite metadata + parquet 文件）")
+def bt_remove(run_id: str = typer.Argument(help="run_id")):
+    from eq.backtest.store import remove_run
+    if remove_run(run_id):
+        typer.echo(f"已删除回测 {run_id}")
+    else:
+        typer.echo(f"回测 {run_id} 不存在", err=True)
+        raise typer.Exit(1)
 
 
 # 子命令组：eq ml ...

@@ -134,6 +134,20 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_enabled ON scheduled_jobs(enabled);
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id            TEXT    PRIMARY KEY,                  -- UUID
+    symbol        TEXT    NOT NULL,
+    strategy_name TEXT    NOT NULL,
+    engine        TEXT    NOT NULL,                     -- vectorized / event_driven
+    config        TEXT,                                  -- JSON BacktestConfig
+    metrics       TEXT,                                  -- JSON 关键指标
+    artifact_path TEXT,                                  -- ~/.eternityquant/backtests/<id>.parquet
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_symbol ON backtest_runs(symbol);
+CREATE INDEX IF NOT EXISTS idx_backtest_created ON backtest_runs(created_at);
 """
 
 _SCHEMA_CACHE = """
