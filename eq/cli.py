@@ -17,6 +17,7 @@ import typer
 from eq.backtest import BacktestConfig, EventDrivenBacktester, VectorizedBacktester
 from eq.core import monitor as mon_svc
 from eq.core import portfolio as pf_svc
+from eq.core import scheduler as sched_svc
 from eq.core import watchlist as wl_svc
 from eq.core.notifier import available_channels
 from eq.core.scanner import SortBy, format_scan, scan_a_share
@@ -42,6 +43,14 @@ app.add_typer(portfolio_app, name="portfolio")
 # 子命令组：eq monitor ...
 monitor_app = typer.Typer(help="监控规则（注册/启停/扫描触发）", no_args_is_help=True)
 app.add_typer(monitor_app, name="monitor")
+
+# 子命令组：eq ml ...
+ml_app = typer.Typer(help="qlib ML 模型管理（注册/激活/列表/预测）", no_args_is_help=True)
+app.add_typer(ml_app, name="ml")
+
+# 子命令组：eq scheduler ...
+scheduler_app = typer.Typer(help="定时推送服务（cron 表达式 + APScheduler）", no_args_is_help=True)
+app.add_typer(scheduler_app, name="scheduler")
 
 
 @app.command(help="看个股行情快照（最近一根日线 + 涨跌幅）")
@@ -467,6 +476,100 @@ def ml_predict(
 
 if __name__ == "__main__":
     app()
+
+
+# ---------- eq scheduler 子命令 ----------
+
+@scheduler_app.command("add", help="注册定时任务（cron 表达式）")
+def sched_add(
+    name: str = typer.Argument(help="任务名，唯一"),
+    cron_expr: str = typer.Argument(help="cron 表达式（分 时 日 月 周），如 '0 16 * * 1-5' = 工作日 16:00"),
+    action: str = typer.Argument(help=f"动作，可选：{','.join(sorted(sched_svc._ACTIONS))}"),
+    channels: str = typer.Option("desktop", "--channels", "-c", help="推送通道，逗号分隔"),
+    params_json: str = typer.Option("{}", "--params", "-p", help="参数 JSON，如 '{\"market\":\"A\",\"top_n\":20}'"),
+):
+    import json as _json
+    try:
+        params = _json.loads(params_json)
+    except _json.JSONDecodeError as e:
+        typer.echo(f"params JSON 解析失败：{e}", err=True)
+        raise typer.Exit(1)
+    try:
+        jid = sched_svc.add_job(
+            name=name, cron_expr=cron_expr, action=action,
+            params=params, channels=[c.strip() for c in channels.split(",") if c.strip()],
+        )
+    except ValueError as e:
+        typer.echo(f"注册失败：{e}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"已注册任务 #{jid}：{name}  {cron_expr}  {action}  {params}")
+
+
+@scheduler_app.command("remove", help="删除定时任务")
+def sched_remove(job_id: int = typer.Argument(help="任务 id")):
+    if sched_svc.remove_job(job_id):
+        typer.echo(f"已删除任务 #{job_id}")
+    else:
+        typer.echo(f"任务 #{job_id} 不存在", err=True)
+        raise typer.Exit(1)
+
+
+@scheduler_app.command("list", help="列出所有定时任务")
+def sched_list(enabled_only: bool = typer.Option(False, "--enabled", "-e", help="仅看 enabled")):
+    jobs = sched_svc.list_jobs(enabled_only=enabled_only)
+    if not jobs:
+        typer.echo("无定时任务")
+        return
+    print(f"\n定时任务（共 {len(jobs)} 个）：\n")
+    print(f"{'#':<4} {'名称':<20} {'cron':<18} {'动作':<14} {'启':<3} {'次数':<6} {'上次状态':<8} {'上次运行'}")
+    print("-" * 110)
+    for j in jobs:
+        last = str(j["last_run_at"] or "-")[:19]
+        status = j["last_run_status"] or "-"
+        enabled = "是" if j["enabled"] else "否"
+        print(f"{j['id']:<4} {j['name'][:18]:<20} {j['cron_expr']:<18} {j['action']:<14} {enabled:<3} {j['run_count']:<6} {status:<8} {last}")
+
+
+@scheduler_app.command("enable", help="启用定时任务")
+def sched_enable(job_id: int = typer.Argument(help="任务 id")):
+    if sched_svc.set_enabled(job_id, True):
+        typer.echo(f"已启用任务 #{job_id}")
+    else:
+        typer.echo(f"任务 #{job_id} 不存在", err=True)
+        raise typer.Exit(1)
+
+
+@scheduler_app.command("disable", help="停用定时任务")
+def sched_disable(job_id: int = typer.Argument(help="任务 id")):
+    if sched_svc.set_enabled(job_id, False):
+        typer.echo(f"已停用任务 #{job_id}")
+    else:
+        typer.echo(f"任务 #{job_id} 不存在", err=True)
+        raise typer.Exit(1)
+
+
+@scheduler_app.command("run", help="立即执行某任务一次（不等触发）")
+def sched_run(job_id: int = typer.Argument(help="任务 id")):
+    sched = sched_svc.get_scheduler()
+    sched.start()
+    if not sched.run_now(job_id):
+        typer.echo(f"任务 #{job_id} 不存在", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"任务 #{job_id} 已触发，查看状态用 eq scheduler list")
+
+
+@scheduler_app.command("daemon", help="启动调度器常驻进程（按 cron 定时执行任务）")
+def sched_daemon():
+    sched = sched_svc.get_scheduler()
+    sched.start()
+    typer.echo("调度器已启动，Ctrl+C 退出")
+    try:
+        import time
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        typer.echo("\n退出中...")
+        sched.stop()
 
 
 # ---------- eq dash 命令（放末尾，避免 streamlit 启动逻辑被其他装饰器干扰） ----------

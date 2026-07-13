@@ -117,6 +117,23 @@ CREATE TABLE IF NOT EXISTS ml_runs (
     error        TEXT,
     config       TEXT                                   -- JSON 训练配置
 );
+
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT    UNIQUE NOT NULL,              -- 用户起名，唯一
+    cron_expr     TEXT    NOT NULL,                     -- 标准 cron 表达式（分 时 日 月 周）
+    action        TEXT    NOT NULL,                     -- monitor_run / scan_report / custom
+    params        TEXT,                                 -- JSON 参数（如 scan 的 market/sort_by/top_n）
+    channels      TEXT    NOT NULL DEFAULT '[]',         -- JSON 推送通道列表
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_run_at   TIMESTAMP,
+    last_run_status TEXT,                               -- success / failed / timeout
+    last_run_error TEXT,
+    run_count     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_enabled ON scheduled_jobs(enabled);
 """
 
 _SCHEMA_CACHE = """
