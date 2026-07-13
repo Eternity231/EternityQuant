@@ -24,6 +24,16 @@ def _ensure_dir() -> Path:
     return _QLIB_MODELS_DIR
 
 
+def _qlib_init() -> None:
+    """qlib init + torch DLL 预热（Windows + cu132 坑：先 torch.cuda.init 再 qlib.init）。"""
+    import torch  # noqa: F401
+    if torch.cuda.is_available():
+        torch.cuda.init()  # 预热 DLL，避免 c10.dll 延迟加载失败
+    import qlib
+    from qlib.config import REG_CN
+    qlib.init(provider_uri="~/.qlib/qlib_data/cn_data", region=REG_CN)
+
+
 def train(
     universe: str = "csi300",
     train_start: str = "2015-01-01",
@@ -39,10 +49,8 @@ def train(
     Returns:
         {"model_id": str, "metrics": dict, "model_path": str}
     """
-    import qlib
-    from qlib.config import REG_CN
+    _qlib_init()
     from qlib.data import D
-    qlib.init(provider_uri="~/.qlib/qlib_data/cn_data", region=REG_CN)
 
     from qlib.contrib.data.handler import Alpha158
     from qlib.contrib.model import LGBModel
@@ -139,10 +147,8 @@ def predict_batch(
 
     predict_date 缺省用 qlib 数据末日 + 1 日（受数据集截至 2020-09 限制）。
     """
-    import qlib
-    from qlib.config import REG_CN
+    _qlib_init()
     from qlib.data import D
-    qlib.init(provider_uri="~/.qlib/qlib_data/cn_data", region=REG_CN)
 
     from qlib.contrib.data.handler import Alpha158
     from qlib.contrib.model import LGBModel
@@ -162,37 +168,43 @@ def predict_batch(
         # qlib 数据末日 2020-09-25，predict 用 2020-09-25
         predict_date = "2020-09-25"
 
-    # 重新构造 handler 取特征（infer only，infer_processors 必须为空）
+    # 重新构造 handler 取特征（predict 不需要真 label，用占位表达式避免 horizon 未来数据问题）
+    # label 用 Ref($close,-1)/Ref($close,-1)-1 恒为 0 的占位，handler 能跑通，predict 只用 feature
     handler = Alpha158(
         instruments=universe,
         start_time=predict_date,
         end_time=predict_date,
         fit_start_time="2015-01-01",
-        fit_end_time="2020-08-31",
+        fit_end_time=predict_date,
         infer_processors=[],
-        label=[f"Ref($close, -{horizon}) / Ref($close, -1) - 1"],
+        label=["Ref($close, -1) / Ref($close, -1) - 1"],
     )
     from qlib.data.dataset import DatasetH
     dataset = DatasetH(handler=handler, segments={"test": (predict_date, predict_date)})
-    test_data = dataset.prepare("test")
-    if test_data is None or not test_data[0]:
-        return pd.DataFrame(columns=["symbol", "score"])
 
-    # 加载模型并预测
-    model = LGBModel(loss="mse")
-    model.load(model_path)
+    # 加载模型并预测（pickle 直加载绕开 qlib LGBModel.load 触发的 torch DLL 链）
+    import pickle as _pkl
+    with open(model_path, "rb") as f:
+        model = _pkl.load(f)
     pred = model.predict(dataset, segment="test")
-    pred_df = pred if isinstance(pred, pd.DataFrame) else pd.DataFrame(pred)
-    if pred_df.empty:
+    # pred 是 pd.Series，index 是 MultiIndex(datetime, instrument)，values 是预测分数
+    if pred is None or (isinstance(pred, pd.Series) and pred.empty):
         return pd.DataFrame(columns=["symbol", "score"])
-
-    # pred_df 的 index 是 (instrument, datetime) 多级，取 predict_date 当日
+    # 转 DataFrame，取 predict_date 当日
+    pred_df = pred.to_frame("score") if isinstance(pred, pd.Series) else pred
     if isinstance(pred_df.index, pd.MultiIndex):
-        pred_df = pred_df.xs(predict_date, level=1) if predict_date in pred_df.index.get_level_values(1) else pred_df.groupby(level=0).last()
-    score_col = pred_df.columns[0]
-    pred_df = pred_df[[score_col]].rename(columns={score_col: "score"})
-    pred_df = pred_df.sort_values("score", ascending=False).head(top_n).reset_index()
-    pred_df.columns = ["symbol", "score"]
+        # level 0=datetime, level 1=instrument（qlib 0.9.7 顺序）
+        if predict_date in pred_df.index.get_level_values(0):
+            pred_df = pred_df.xs(predict_date, level=0)
+        else:
+            pred_df = pred_df.groupby(level=1).last()  # 取最近一日
+        pred_df = pred_df.reset_index()
+        # instrument 列名可能是 "instrument" 或 index 名
+        inst_col = "instrument" if "instrument" in pred_df.columns else pred_df.columns[0]
+        pred_df = pred_df.rename(columns={inst_col: "symbol"})
+    else:
+        pred_df = pred_df.reset_index()
+    pred_df = pred_df[["symbol", "score"]].sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
 
     # 转 EternityQuant 符号格式：SH600519 → 600519.SH
     def _to_eq_code(s: str) -> str:
