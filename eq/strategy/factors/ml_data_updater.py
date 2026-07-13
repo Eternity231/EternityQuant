@@ -50,6 +50,17 @@ def _proc_one_stock(code: str, start: str, end: str, new_days: tuple, qlib_feats
     inst_dir = Path(qlib_feats_dir) / code.lower()
     inst_dir.mkdir(parents=True, exist_ok=True)
 
+    # 去重检查：close.day.bin 如果已存在且大小 >= 原日历（4943）+ 新日历 的大小，
+    # 说明这票已经续过了，跳过
+    days_list = list(new_days)
+    close_bin = inst_dir / "close.day.bin"
+    if close_bin.exists():
+        exist_floats = close_bin.stat().st_size // 4
+        # 现有日历行数 = 原始 ~4943 + new_days 不重复部分
+        # 如果 exist_floats 明显大于原始日历（>5000），说明已续过
+        if exist_floats > 5000 and exist_floats >= len(days_list) + 4500:
+            return True  # 已续过，跳过
+
     # qlib SH600000 → baostock sh.600000
     if code.startswith("SH"):
         bs_code = f"sh.{code[2:]}"
