@@ -254,6 +254,11 @@ class _SimpleMLP:
                 score = torch.cov(torch.stack([vp, yv]))[0, 1].item() / (vp.std().item() * yv.std().item())
             else:
                 score = -float("inf")
+            # 每 10 步或新最佳打进度
+            mem_mb = torch.cuda.memory_allocated() / 1e6 if self.device.type == "cuda" else 0.0
+            if step % 10 == 0 or score > self.best_score:
+                best_mark = "✓" if score > self.best_score else " "
+                print(f"  [MLP step {step:3d}] loss={loss.item():.4f} valid_loss={vl:.4f} IC={score:+.4f} {best_mark} mem={mem_mb:.0f}MB", flush=True)
             if score > self.best_score:
                 self.best_score = score
                 self.best_step = step
@@ -265,6 +270,7 @@ class _SimpleMLP:
                     break
         if self.best_state is not None:
             self.net.load_state_dict(self.best_state)
+        print(f"  [MLP 训练完成] best IC={self.best_score:+.4f} @step {self.best_step} (early_stop={stop}/{early_stop})", flush=True)
 
     def predict(self, x):
         import torch
@@ -277,6 +283,132 @@ class _SimpleMLP:
                 pred = self.net(xt).squeeze(-1)[0:1]
             else:
                 pred = self.net(xt).squeeze(-1)
+            return pred.cpu().numpy()
+
+
+# ---------- 自写 LSTM（走 torch.cuda，绕开 qlib LSTM nan 坑） ----------
+
+class _SimpleLSTM:
+    """自写 LSTM：把 Alpha158 的 158 维特征重塑成 (batch, seq_len=6, input_size=26) 喂给 LSTM。
+
+    Alpha158 的 158 维特征按 qlib 命名规则是 6 组时序窗口（0/1/2/3/4/5 日前 + rolling），
+    每组约 26 维同型因子——这是 LSTM 要的时序结构。158 = 6*26 + 2（舍尾），重塑成 6×26。
+    走 torch.cuda，3060 10GB 富裕，hidden_size=128，2 层 LSTM，真吃显存。
+
+    qlib 原生 LSTM 在 torch 2.13 + Alpha158 默认配置下 loss 全 nan（feature 直接塞 LSTM 被错误解释成
+    seq_len=158, input_size=1），自写此绕开，正确重塑时序。
+    """
+
+    def __init__(self, input_dim: int = 158, seq_len: int = 6, input_size: int = 26, hidden_size: int = 128, num_layers: int = 2, lr: float = 1e-3, max_steps: int = 200, batch_size: int = 4000, device: str = "cuda", dropout: float = 0.1):
+        import torch
+        import torch.nn as nn
+        self.device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
+        self.seq_len = seq_len
+        self.input_size = input_size
+        self.lr = lr
+        self.max_steps = max_steps
+        self.batch_size = batch_size
+        # LSTM: (batch, seq_len, input_size) → hidden → Linear → 1
+        self.net = nn.Sequential(
+            nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, dropout=dropout),
+        ).to(self.device)
+        # LSTM 输出取最后一步 hidden，接全连接到 1
+        self.head = nn.Linear(hidden_size, 1).to(self.device)
+        self.opt = torch.optim.Adam(list(self.net.parameters()) + list(self.head.parameters()), lr=lr)
+        self.loss_fn = nn.MSELoss()
+        self.best_score = -float("inf")
+        self.best_state = None
+        self.best_step = 0
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+    def _reshape(self, x):
+        """把 (batch, 158) 重塑成 (batch, seq_len=6, input_size=26)。158=6*26+2，舍尾 2 维。"""
+        import torch
+        # x: (batch, input_dim) → 取前 seq_len*input_size=156 维，重塑成 (batch, 6, 26)
+        cut = self.seq_len * self.input_size
+        return x[:, :cut].view(x.size(0), self.seq_len, self.input_size)
+
+    def fit(self, x_train, y_train, x_valid, y_valid, early_stop: int = 20):
+        import torch
+        import numpy as np
+
+        def _to_tensor(df):
+            if hasattr(df, "values"):
+                return torch.from_numpy(df.values).float()
+            return torch.from_numpy(np.asarray(df)).float()
+
+        xt = _to_tensor(x_train).to(self.device)
+        yt = _to_tensor(y_train).squeeze(-1).to(self.device)
+        xv = _to_tensor(x_valid).to(self.device)
+        yv = _to_tensor(y_valid).squeeze(-1).to(self.device)
+
+        stop = 0
+        for step in range(self.max_steps):
+            self.net.train()
+            self.head.train()
+            idx = torch.randperm(len(xt), device=self.device)
+            for i in range(0, len(idx), self.batch_size):
+                b = idx[i:i + self.batch_size]
+                if len(b) < 2:
+                    break
+                xb = self._reshape(xt[b])
+                out, _ = self.net(xb)  # (batch, seq_len, hidden)
+                pred = self.head(out[:, -1, :]).squeeze(-1)  # 取最后一步
+                loss = self.loss_fn(pred, yt[b])
+                self.opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)  # 梯度裁剪防爆
+                self.opt.step()
+            # eval
+            self.net.eval()
+            self.head.eval()
+            with torch.no_grad():
+                xv_r = self._reshape(xv)
+                out, _ = self.net(xv_r)
+                vp = self.head(out[:, -1, :]).squeeze(-1)
+                if len(xv) >= 2 and vp.std().item() > 0 and yv.std().item() > 0:
+                    score = torch.cov(torch.stack([vp, yv]))[0, 1].item() / (vp.std().item() * yv.std().item())
+                else:
+                    score = -float("inf")
+            # 每 5 步或新最佳打进度（LSTM 训练慢，频次高些）
+            mem_mb = torch.cuda.memory_allocated() / 1e6 if self.device.type == "cuda" else 0.0
+            if step % 5 == 0 or score > self.best_score:
+                best_mark = "✓" if score > self.best_score else " "
+                print(f"  [LSTM step {step:3d}] IC={score:+.4f} {best_mark} best={self.best_score:+.4f}@{self.best_step} mem={mem_mb:.0f}MB", flush=True)
+            if score > self.best_score:
+                self.best_score = score
+                self.best_step = step
+                self.best_state = {
+                    "net": {k: v.clone() for k, v in self.net.state_dict().items()},
+                    "head": {k: v.clone() for k, v in self.head.state_dict().items()},
+                }
+                stop = 0
+            else:
+                stop += 1
+                if stop >= early_stop:
+                    break
+        if self.best_state is not None:
+            self.net.load_state_dict(self.best_state["net"])
+            self.head.load_state_dict(self.best_state["head"])
+        print(f"  [LSTM 训练完成] best IC={self.best_score:+.4f} @step {self.best_step} (early_stop={stop}/{early_stop})", flush=True)
+
+    def predict(self, x):
+        import torch
+        import numpy as np
+        self.net.eval()
+        self.head.eval()
+        with torch.no_grad():
+            xt = torch.from_numpy(np.asarray(x if not hasattr(x, "values") else x.values)).float().to(self.device)
+            if len(xt) < 2:
+                xt = xt.unsqueeze(0).repeat(2, 1)
+                xr = self._reshape(xt)
+                out, _ = self.net(xr)
+                pred = self.head(out[:, -1, :]).squeeze(-1)[0:1]
+            else:
+                xr = self._reshape(xt)
+                out, _ = self.net(xr)
+                pred = self.head(out[:, -1, :]).squeeze(-1)
             return pred.cpu().numpy()
 
 
@@ -320,8 +452,8 @@ def train_torch(
     segments = {"train": (train_start, train_end), "valid": (valid_start, valid_end)}
     dataset = DatasetH(handler=handler, segments=segments)
 
-    if algo == "mlp":
-        # 自写 MLP 路径：从 dataset 取 feature 和 label，用 torch.cuda 训练
+    if algo in ("mlp", "lstm", "gru", "alstm"):
+        # 自写 MLP/LSTM 路径：从 dataset 取 feature 和 label，用 torch.cuda 训练
         train_data = dataset.prepare("train", col_set=["feature", "label"])
         valid_data = dataset.prepare("valid", col_set=["feature", "label"])
         x_train, y_train = train_data["feature"], train_data["label"]
@@ -330,12 +462,21 @@ def train_torch(
             y_train = y_train.squeeze() if y_train.ndim > 1 else y_train
         if hasattr(y_valid, "values"):
             y_valid = y_valid.squeeze() if y_valid.ndim > 1 else y_valid
-        model = _SimpleMLP(input_dim=158, hidden=256, lr=1e-3, max_steps=300, batch_size=2000, device=device)
-        model.fit(x_train, y_train, x_valid, y_valid, early_stop=30)
+        if algo == "mlp":
+            model = _SimpleMLP(input_dim=158, hidden=(512, 256, 128), lr=1e-3, max_steps=300, batch_size=8000, device=device)
+            notes = f"自写 _SimpleMLP 真集成训练（{device}），绕开 qlib DNNModelPytorch nan 坑"
+        elif algo == "lstm":
+            model = _SimpleLSTM(input_dim=158, seq_len=6, input_size=26, hidden_size=128, num_layers=2, lr=1e-3, max_steps=200, batch_size=4000, device=device)
+            notes = f"自写 _SimpleLSTM 真集成训练（{device}），158 维重塑 6×26 时序，绕开 qlib LSTM nan 坑"
+        else:
+            # gru/alstm 暂复用 LSTM 路径（GRU 单元差异待后续）
+            model = _SimpleLSTM(input_dim=158, seq_len=6, input_size=26, hidden_size=128, num_layers=2, lr=1e-3, max_steps=200, batch_size=4000, device=device)
+            notes = f"自写 _SimpleLSTM（{algo} 路径）真集成训练（{device}），158 维重塑 6×26 时序"
+        model.fit(x_train, y_train, x_valid, y_valid, early_stop=20 if algo != "mlp" else 30)
         ic = float(model.best_score)
         epochs = model.best_step + 1
 
-        # 存盘（pickle 整个 _SimpleMLP 实例，含 net state_dict）
+        # 存盘（pickle 整个模型实例，含 net state_dict）
         import pickle as _pkl
         model_path = _ensure_dir() / f"torch_{algo}_{universe}_{horizon}d.pkl"
         with open(model_path, "wb") as f:
@@ -351,7 +492,7 @@ def train_torch(
             valid_period=f"{valid_start}~{valid_end}",
             metrics={"ic": ic, "algo": algo, "horizon": horizon, "device": device, "epochs": epochs},
             model_path=str(model_path),
-            notes=f"自写 _SimpleMLP 真集成训练（{device}），绕开 qlib DNNModelPytorch nan 坑",
+            notes=notes,
         )
         return {"model_id": model_id, "metrics": {"ic": ic, "epochs": epochs}, "model_path": str(model_path)}
 

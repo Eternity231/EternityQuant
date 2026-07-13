@@ -12,6 +12,16 @@
 
 from __future__ import annotations
 
+# torch DLL 预热（Windows + cu132 坑：qlib 集成链触发 torch 延迟加载 c10.dll 失败）
+# 放在所有 eq.* import 之前，否则 eq.strategy.factors.ml 会先拖 qlib 链触发 torch 延迟加载
+# 仅 cuda 可用时才 init，避免无 GPU 机器每次 CLI 都拉 CUDA driver
+try:
+    import torch as _torch
+    if _torch.cuda.is_available():
+        _torch.cuda.init()
+except (ImportError, OSError):
+    pass
+
 import typer
 
 from eq.backtest import BacktestConfig, EventDrivenBacktester, VectorizedBacktester
@@ -562,6 +572,13 @@ def ml_train(
     device: str = typer.Option("cpu", "--device", "-d", help="cpu | gpu | cuda（LightGBM gpu=OpenCL；PyTorch cuda=真CUDA，3060主场）"),
     name: str = typer.Option("", "--name", "-n", help="模型名，默认自动生成"),
 ):
+    # torch DLL 预热（Windows + cu132 坑：qlib 集成链触发 torch 延迟加载 c10.dll 失败，ml 命令才预热）
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _torch.cuda.init()
+    except ImportError:
+        pass
     from eq.strategy.factors.ml_workflow import train as wf_train, train_torch as wf_train_torch, _TORCH_ALGOS
     try:
         if algo in _TORCH_ALGOS:
