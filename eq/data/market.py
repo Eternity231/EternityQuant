@@ -151,13 +151,23 @@ def _fetch_akshare_a(symbol: str, start: dt.date, end: dt.date) -> pd.DataFrame:
 
 
 def _fetch_akshare_fallback(symbol: str, market: Market, start: dt.date, end: dt.date) -> pd.DataFrame:
-    """akshare 作为兜底源。第一版只实现 A 股和港股 fallback，其余抛 NotImplementedError。"""
+    """akshare 作为兜底源。A/HK/US fallback。"""
     if market == "A":
         return _fetch_akshare_a(symbol, start, end)
     if market == "HK":
         import akshare as ak
         code, _, _ = symbol.partition(".")
-        df = ak.stock_hk_hist(symbol_em=code, period="daily", start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"), adjust="qfq")
+        # akshare 港股：stock_hk_hist(symbol=...)，不是 symbol_em
+        df = ak.stock_hk_hist(symbol=code, period="daily", start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"), adjust="qfq")
+        df = df.rename(columns={"开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"})
+        df = df.set_index("日期")
+        df.index = pd.to_datetime(df.index)
+        return df[["open", "high", "low", "close", "volume"]]
+    if market == "US":
+        import akshare as ak
+        code, _, _ = symbol.partition(".")
+        # akshare 美股：stock_us_hist(symbol=..., adjust='qfq')
+        df = ak.stock_us_hist(symbol=code, period="daily", start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"), adjust="qfq")
         df = df.rename(columns={"开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"})
         df = df.set_index("日期")
         df.index = pd.to_datetime(df.index)

@@ -89,6 +89,21 @@ def scan(
         raise typer.Exit(1)
 
 
+@app.command("research", help="个股深度研究（按市场自动选数据源汇总基本面/资金/新闻/研报等）")
+def research(
+    symbol: str = typer.Argument(help="股票符号，如 600519.SH、AAPL.US、00700.HK"),
+    sections: str = typer.Option("", "--sections", "-s", help="指定板块，逗号分隔，如 financial,news；缺省按市场全拉"),
+):
+    from eq.core.research import format_research, research as do_research
+    secs = [s.strip() for s in sections.split(",") if s.strip()] or None
+    try:
+        report = do_research(symbol, sections=secs)
+        typer.echo(format_research(report))
+    except Exception as e:
+        typer.echo(f"研究失败：{e}", err=True)
+        raise typer.Exit(1)
+
+
 # ---------- eq watchlist 子命令 ----------
 
 @watchlist_app.command("add", help="加入自选股")
