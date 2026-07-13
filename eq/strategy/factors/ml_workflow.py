@@ -570,28 +570,56 @@ def predict_batch(
     from qlib.data.dataset import DatasetH
     dataset = DatasetH(handler=handler, segments={"test": (predict_date, predict_date)})
 
-    # 加载模型并预测（pickle 直加载绕开 qlib LGBModel.load 触发的 torch DLL 链）
+    # 加载模型（pickle 直加载绕开 qlib LGBModel.load 触发的 torch DLL 链）
     import pickle as _pkl
     with open(model_path, "rb") as f:
         model = _pkl.load(f)
-    pred = model.predict(dataset, segment="test")
-    # pred 是 pd.Series，index 是 MultiIndex(datetime, instrument)，values 是预测分数
-    if pred is None or (isinstance(pred, pd.Series) and pred.empty):
-        return pd.DataFrame(columns=["symbol", "score"])
-    # 转 DataFrame，取 predict_date 当日
-    pred_df = pred.to_frame("score") if isinstance(pred, pd.Series) else pred
-    if isinstance(pred_df.index, pd.MultiIndex):
-        # level 0=datetime, level 1=instrument（qlib 0.9.7 顺序）
-        if predict_date in pred_df.index.get_level_values(0):
-            pred_df = pred_df.xs(predict_date, level=0)
+
+    # 按 algo 分路预测：
+    # - LightGBM（qlib LGBModel）：model.predict(dataset, segment="test") 返回 pd.Series
+    # - 自写 LSTM/MLP（_SimpleLSTM/_SimpleMLP）：从 dataset 取 feature DataFrame，model.predict(x) 返回 ndarray
+    from eq.db import execute as _execute
+    algo_row = _execute("SELECT algo FROM ml_models WHERE id = ?", (model_id,))
+    algo = algo_row[0]["algo"] if algo_row else "lightgbm"
+
+    if algo in ("lstm", "gru", "alstm", "mlp"):
+        # 自写模型路径：取 feature，喂 model.predict(x)
+        test_data = dataset.prepare("test", col_set="feature")
+        # test_data 可能是 DataFrame（index 是 MultiIndex datetime, instrument）或 dict
+        if isinstance(test_data, dict):
+            test_data = test_data.get("feature", pd.DataFrame())
+        if test_data is None or test_data.empty:
+            return pd.DataFrame(columns=["symbol", "score"])
+        # 调自写模型 predict（接 DataFrame，返回 ndarray）
+        scores = model.predict(test_data)
+        # 构造 pred_df，index 复用 test_data 的 MultiIndex
+        pred_df = pd.DataFrame({"score": scores}, index=test_data.index)
+        if isinstance(pred_df.index, pd.MultiIndex):
+            if predict_date in pred_df.index.get_level_values(0):
+                pred_df = pred_df.xs(predict_date, level=0)
+            else:
+                pred_df = pred_df.groupby(level=1).last()
+            pred_df = pred_df.reset_index()
+            inst_col = "instrument" if "instrument" in pred_df.columns else pred_df.columns[0]
+            pred_df = pred_df.rename(columns={inst_col: "symbol"})
         else:
-            pred_df = pred_df.groupby(level=1).last()  # 取最近一日
-        pred_df = pred_df.reset_index()
-        # instrument 列名可能是 "instrument" 或 index 名
-        inst_col = "instrument" if "instrument" in pred_df.columns else pred_df.columns[0]
-        pred_df = pred_df.rename(columns={inst_col: "symbol"})
+            pred_df = pred_df.reset_index()
     else:
-        pred_df = pred_df.reset_index()
+        # LightGBM 路径：qlib LGBModel.predict(dataset, segment) 返回 pd.Series
+        pred = model.predict(dataset, segment="test")
+        if pred is None or (isinstance(pred, pd.Series) and pred.empty):
+            return pd.DataFrame(columns=["symbol", "score"])
+        pred_df = pred.to_frame("score") if isinstance(pred, pd.Series) else pred
+        if isinstance(pred_df.index, pd.MultiIndex):
+            if predict_date in pred_df.index.get_level_values(0):
+                pred_df = pred_df.xs(predict_date, level=0)
+            else:
+                pred_df = pred_df.groupby(level=1).last()
+            pred_df = pred_df.reset_index()
+            inst_col = "instrument" if "instrument" in pred_df.columns else pred_df.columns[0]
+            pred_df = pred_df.rename(columns={inst_col: "symbol"})
+        else:
+            pred_df = pred_df.reset_index()
     pred_df = pred_df[["symbol", "score"]].sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
 
     # 转 EternityQuant 符号格式：SH600519 → 600519.SH
