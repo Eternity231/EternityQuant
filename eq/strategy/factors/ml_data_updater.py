@@ -173,6 +173,9 @@ def update_qlib_data(
         feats_dir = _QLIB_DATA_DIR / "features"
         feats_dir.mkdir(parents=True, exist_ok=True)
         updated = 0
+        total = len(instruments)
+        import time as _time
+        _t0 = _time.time()
         for i, code in enumerate(instruments):
             # qlib 代码 SH600519 → features/sh600519/
             inst_dir = feats_dir / code.lower()
@@ -191,10 +194,15 @@ def update_qlib_data(
                 vals = [float("nan") if v != v or v is None else v for v in vals]
                 _append_bin(bin_path, vals)
             updated += 1
-            if verbose and (i + 1) % 50 == 0:
-                print(f"  已续 {i+1}/{len(instruments)} 只", flush=True)
+            if verbose:
+                _elapsed = _time.time() - _t0
+                _pct = (i + 1) / total * 100
+                _speed = (i + 1) / _elapsed if _elapsed > 0 else 0
+                _eta = (total - i - 1) / _speed if _speed > 0 else 0
+                print(f"\r  进度 {_pct:5.1f}%  ({i+1}/{total})  已用 {_elapsed:.0f}s  ETA {_eta:.0f}s  当前 {code}", end="", flush=True)
         if verbose:
-            print(f"完成：{updated} 只票 × {len(_FEATURES)} 特征 × {len(new_days)} 日", flush=True)
+            _total_elapsed = _time.time() - _t0
+            print(f"\n完成：{updated} 只票 × {len(_FEATURES)} 特征 × {len(new_days)} 日  ({_total_elapsed:.0f}s)", flush=True)
     finally:
         bs.logout()
 
