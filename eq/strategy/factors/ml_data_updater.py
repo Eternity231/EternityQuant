@@ -38,52 +38,64 @@ def _worker_finish():
 
 
 def _proc_one_stock(code: str, start: str, end: str, new_days: tuple, qlib_feats_dir: str) -> bool:
-    """子进程内处理一只票。baostock 已 login，直接 query。
-    
+    """子进程内处理一只票。失败自动重试最多 3 次（baostock 限流常见）。
+
     返回 True=成功 False=失败（停牌或异常）。
     """
     import baostock as _bs
     from pathlib import Path
     import pandas as pd
+    import time as _time
 
     inst_dir = Path(qlib_feats_dir) / code.lower()
     inst_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        if code.startswith("SH"):
-            bs_code = f"sh.{code[2:]}"
-        elif code.startswith("SZ"):
-            bs_code = f"sz.{code[2:]}"
-        else:
-            return False
-        rs = _bs.query_history_k_data_plus(
-            bs_code, "date,open,high,low,close,volume,preclose,adjustflag,turn",
-            start_date=start, end_date=end, frequency="d", adjustflag="2",
-        )
-        if rs.error_code != "0":
-            return False
-        rows_list = []
-        while rs.next():
-            rows_list.append(rs.get_row_data())
-        if not rows_list:
-            return False
-        df = pd.DataFrame(rows_list, columns=["date", "open", "high", "low", "close", "volume", "preclose", "adjustflag", "turn"])
-        for col in ["open", "high", "low", "close", "volume", "preclose"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["factor"] = 1.0
-        df["change"] = (df["close"] - df["preclose"]) / df["preclose"]
-        df = df.set_index("date")[["open", "high", "low", "close", "volume", "factor", "change"]]
-        # 对齐日历
-        days_list = list(new_days)
-        df = df.reindex(days_list)
-        # 写 .bin
-        for feat in _FEATURES:
-            bin_path = inst_dir / f"{feat}.day.bin"
-            vals = df[feat].tolist() if feat in df.columns else [float("nan")] * len(days_list)
-            vals = [float("nan") if v != v or v is None else v for v in vals]
-            _append_bin(bin_path, vals)
-        return True
-    except Exception:
+
+    # qlib SH600000 → baostock sh.600000
+    if code.startswith("SH"):
+        bs_code = f"sh.{code[2:]}"
+    elif code.startswith("SZ"):
+        bs_code = f"sz.{code[2:]}"
+    else:
         return False
+
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                _time.sleep(2 * attempt)  # 退避：2s, 4s
+            rs = _bs.query_history_k_data_plus(
+                bs_code, "date,open,high,low,close,volume,preclose,adjustflag,turn",
+                start_date=start, end_date=end, frequency="d", adjustflag="2",
+            )
+            if rs.error_code != "0":
+                if attempt < 2:
+                    continue
+                return False
+            rows_list = []
+            while rs.next():
+                rows_list.append(rs.get_row_data())
+            if not rows_list:
+                return False
+            df = pd.DataFrame(rows_list, columns=["date", "open", "high", "low", "close", "volume", "preclose", "adjustflag", "turn"])
+            for col in ["open", "high", "low", "close", "volume", "preclose"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["factor"] = 1.0
+            df["change"] = (df["close"] - df["preclose"]) / df["preclose"]
+            df = df.set_index("date")[["open", "high", "low", "close", "volume", "factor", "change"]]
+            # 对齐日历
+            days_list = list(new_days)
+            df = df.reindex(days_list)
+            # 写 .bin
+            for feat in _FEATURES:
+                bin_path = inst_dir / f"{feat}.day.bin"
+                vals = df[feat].tolist() if feat in df.columns else [float("nan")] * len(days_list)
+                vals = [float("nan") if v != v or v is None else v for v in vals]
+                _append_bin(bin_path, vals)
+            return True
+        except Exception:
+            if attempt >= 2:
+                return False
+            continue
+    return False
 
 
 def _proc_batch(args: tuple) -> tuple:

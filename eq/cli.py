@@ -628,7 +628,7 @@ def ml_update_data(
     start: str = typer.Option("2020-09-28", "--start", "-s", help="续期起始日，默认接 2020-09-25"),
     end: str = typer.Option("", "--end", "-e", help="续期结束日，默认今天"),
     universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all"),
-    workers: int = typer.Option(10, "--workers", "-w", help="并行线程数（IO 密集型，默认 10）"),
+    workers: int = typer.Option(3, "--workers", "-w", help="并行进程数（baostock 限流敏感，默认 3 最稳）"),
 ):
     from eq.strategy.factors.ml_data_updater import update_qlib_data
     try:
