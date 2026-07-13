@@ -46,13 +46,11 @@ def _action_monitor_run(params: dict, channels: list[str]) -> tuple[str, str]:
 
 def _action_scan_report(params: dict, channels: list[str]) -> tuple[str, str]:
     """生成每日扫描报告并推送。"""
-    from eq.core.scanner import scan_a_share
+    from eq.core.scanner import scan
     market = params.get("market", "A")
     sort_by = params.get("sort_by", "change_pct")
     top_n = params.get("top_n", 30)
-    if market != "A":
-        return "扫描报告", f"市场 {market} 待集成"
-    df = scan_a_share(sort_by=sort_by, top_n=top_n)
+    df = scan(market, sort_by=sort_by, top_n=top_n)
     title = "EternityQuant 每日扫描报告"
     body = f"按 {sort_by} 排序，前 {len(df)} 名：\n"
     for _, row in df.head(10).iterrows():

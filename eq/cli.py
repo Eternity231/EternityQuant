@@ -20,7 +20,7 @@ from eq.core import portfolio as pf_svc
 from eq.core import scheduler as sched_svc
 from eq.core import watchlist as wl_svc
 from eq.core.notifier import available_channels
-from eq.core.scanner import SortBy, format_scan, scan_a_share
+from eq.core.scanner import Market, SortBy, format_scan, scan as market_scan
 from eq.core.watcher import format_snapshot
 from eq.strategy.factors import ml as ml_svc
 from eq.strategy.signals import adx_trend, bollinger_break, ema_cross, rsi_reversal
@@ -64,21 +64,18 @@ def watch(
         raise typer.Exit(1)
 
 
-@app.command(help="扫全市场，按指定字段排序展示前 N 名（第一版仅 A 股）")
+@app.command(help="扫全市场，按指定字段排序展示前 N 名")
 def scan(
-    market: str = typer.Argument("A", help="市场：A=沪深京，HK/US/CRYPTO 待集成"),
+    market: Market = typer.Argument("A", help="市场：A=沪深京，HK=港股，US=美股，CRYPTO=加密"),
     sort_by: SortBy = typer.Option("change_pct", "--by", "-b", help="排序键：change_pct|volume|amount"),
     top_n: int = typer.Option(30, "--top", "-n", help="前 N 名"),
 ):
-    if market != "A":
-        typer.echo(f"市场 {market} 待集成，第一版只支持 A 股", err=True)
-        raise typer.Exit(1)
     try:
-        df = scan_a_share(sort_by=sort_by, top_n=top_n)
+        df = market_scan(market, sort_by=sort_by, top_n=top_n)
         if df.empty:
-            typer.echo("扫描结果为空")
+            typer.echo(f"{market} 扫描结果为空")
             raise typer.Exit(0)
-        typer.echo(format_scan(df, sort_by))
+        typer.echo(format_scan(df, sort_by, market=market))
     except Exception as e:
         typer.echo(f"扫描失败：{e}", err=True)
         raise typer.Exit(1)
