@@ -235,6 +235,151 @@ def _h_take_profit(rule: dict[str, Any]) -> tuple[bool, str, str]:
     return fired, title, body
 
 
+# ---------- indicator 处理器（无网络依赖，纯因子计算） ----------
+
+def _h_indicator(rule: dict[str, Any]) -> tuple[bool, str, str]:
+    """RSI/MACD/KDJ 因子触发。
+    params: {"name": "rsi"|"macd"|"kdj", "period": 14, "level": 30|70, "action": "buy"|"sell"}
+    """
+    from eq.strategy.factors.technical import kdj, macd, rsi
+
+    p = rule["params"]
+    name = p.get("name", "rsi")
+    action = p.get("action", "buy")
+    period = p.get("period", 14)
+    level = p.get("level", 30)  # RSI 30=超卖(buy), 70=超买(sell)
+    df = get_recent_bars(rule["symbol"], days=period + 10)
+    if len(df) < period + 2:
+        return False, "", ""
+    fired = False
+    cur_val = 0.0
+    prev_val = 0.0
+
+    if name == "rsi":
+        rsi_vals = rsi(df, period=period)
+        cur_val = float(rsi_vals.iloc[-1])
+        prev_val = float(rsi_vals.iloc[-2])
+        if action == "buy":
+            fired = prev_val <= level and cur_val > level  # 回升进入
+        else:
+            fired = prev_val >= level and cur_val < level  # 回落进入
+    elif name == "macd":
+        macd_df = macd(df, fast=12, slow=26, signal=9)
+        dif = macd_df["dif"]
+        dea = macd_df["dea"]
+        if action == "buy":
+            fired = dif.iloc[-2] <= dea.iloc[-2] and dif.iloc[-1] > dea.iloc[-1]  # 金叉
+        else:
+            fired = dif.iloc[-2] >= dea.iloc[-2] and dif.iloc[-1] < dea.iloc[-1]  # 死叉
+        cur_val = float(dif.iloc[-1])
+    elif name == "kdj":
+        kdj_df = kdj(df, n=9, m1=3, m2=3)
+        k = kdj_df["K"]
+        cur_val = float(k.iloc[-1])
+        prev_val = float(k.iloc[-2])
+        if action == "buy":
+            fired = prev_val <= level and cur_val > level
+        else:
+            fired = prev_val >= (100 - level) and cur_val < (100 - level)
+
+    if not fired:
+        return False, "", ""
+    action_label = "买入" if action == "buy" else "卖出"
+    title = f"指标触发 {rule['symbol']}"
+    body = f"{name.upper()} {action_label}信号\n当前值 {cur_val:.2f}  前值 {prev_val:.2f}  阈值 {level}"
+    return True, title, body
+
+
+# ---------- news 处理器（akshare 东财新闻） ----------
+
+def _h_news(rule: dict[str, Any]) -> tuple[bool, str, str]:
+    """个股新闻推送。symbol 必填。"""
+    if not rule["symbol"]:
+        return False, "", ""
+    import akshare as ak
+    try:
+        df = ak.stock_news_em(symbol=rule["symbol"])
+    except Exception:
+        return False, "", ""
+    if df.empty:
+        return False, "", ""
+    # 最近一条新闻
+    latest = df.iloc[0]
+    title = f"新闻推送 {rule['symbol']}"
+    body = f"{latest['新闻标题']}\n来源：{latest['文章来源']}  {latest['发布时间']}"
+    return True, title, body
+
+
+# ---------- event 处理器（事件日提醒） ----------
+
+def _h_event(rule: dict[str, Any]) -> tuple[bool, str, str]:
+    """事件日提醒。
+    params: {"event_type": "financial_report"|"lockup_expiry"|"dividend",
+             "date": "YYYY-MM-DD", "name": "中报披露"}
+    """
+    p = rule["params"]
+    event_date = p.get("date", "")
+    event_type = p.get("event_type", "")
+    event_name = p.get("name", event_type)
+    if not event_date:
+        return False, "", ""
+    try:
+        target = dt.date.fromisoformat(event_date)
+    except ValueError:
+        return False, "", ""
+    today = dt.date.today()
+    diff = (target - today).days
+    # 当天或明天触发
+    if diff < 0:
+        return False, "", ""  # 已过
+    if diff > 1:
+        return False, "", ""  # 还早
+    title = f"事件提醒 {rule['symbol']}" if rule["symbol"] else "事件提醒"
+    sym = f"{rule['symbol']} " if rule["symbol"] else ""
+    when = "今天" if diff == 0 else "明天"
+    body = f"{sym}{event_name} {when}（{event_date}）"
+    return True, title, body
+
+
+# ---------- flow 处理器（北向资金流异动） ----------
+
+def _h_flow(rule: dict[str, Any]) -> tuple[bool, str, str]:
+    """资金流异动。
+    params: {"source": "northbound", "threshold": 100000000}  # 北向净流入阈值（元）
+    """
+    p = rule["params"]
+    source = p.get("source", "northbound")
+    threshold = float(p.get("threshold", 100_000_000))  # 默认 1 亿
+    kwargs = {}
+
+    if source == "northbound":
+        import akshare as ak
+        try:
+            df = ak.stock_hsgt_hist_em(symbol="北向资金")
+        except Exception:
+            return False, "", ""
+        if df.empty or len(df) < 2:
+            return False, "", ""
+        # 最新一日
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        net_inflow = float(latest["当日成交净买额"]) * 1e4  # 亿元 → 元
+        prev_inflow = float(prev["当日成交净买额"]) * 1e4
+        fired = abs(net_inflow) >= threshold
+        direction = "流入" if net_inflow >= 0 else "流出"
+        title = f"北向资金异动"
+        body = (
+            f"当日净{direction} {abs(net_inflow) / 1e8:.2f}亿  "
+            f"（前日 {abs(prev_inflow) / 1e8:.2f}亿）\n"
+            f"阈值 {threshold / 1e8:.0f}亿  累计净买额 {float(latest['历史累计净买额']) * 1e4 / 1e8:.0f}亿"
+        )
+        return fired, title, body
+    elif source == "dragon":
+        # 龙虎榜（第一版占位）
+        return False, "", "龙虎榜 monitor 待集成"
+    return False, "", ""
+
+
 # 占位处理器（第一版返回 False，后续集成）
 def _h_noop(rule: dict[str, Any]) -> tuple[bool, str, str]:
     return False, "", ""
@@ -248,9 +393,8 @@ _HANDLERS = {
     "limit_down": _h_limit_down,
     "stop_loss": _h_stop_loss,
     "take_profit": _h_take_profit,
-    # 待集成：indicator / news / event / flow
-    "indicator": _h_noop,
-    "news": _h_noop,
-    "event": _h_noop,
-    "flow": _h_noop,
+    "indicator": _h_indicator,
+    "news": _h_news,
+    "event": _h_event,
+    "flow": _h_flow,
 }
