@@ -32,9 +32,11 @@ def _bs_instruments(universe: str = "csi300") -> list[str]:
     """baostock 拉成分股列表，返回 qlib 格式代码列表（SH600519/sz000001）。"""
     import baostock as bs
     if universe == "csi300":
-        rs = bs.query_zst50_stocks()  # 沪深300
+        rs = bs.query_hs300_stocks()  # 沪深300
     elif universe == "csi500":
         rs = bs.query_zz500_stocks()
+    elif universe == "sz50":
+        rs = bs.query_sz50_stocks()
     else:
         # all：沪深京全 A，用 akshare 新浪源拉全市场代码
         import akshare as ak
