@@ -42,10 +42,13 @@ def train(
     valid_end: str = "2020-09-25",
     horizon: int = 5,
     algo: str = "lightgbm",
+    device: str = "cpu",
     name: str | None = None,
 ) -> dict[str, Any]:
     """走 qlib 标准 pipeline 训练一个 LightGBM 模型。
 
+    Args:
+        device: "cpu" | "gpu" | "cuda"（cuda 需编译时开 USE_CUDA=1，本机不可用）
     Returns:
         {"model_id": str, "metrics": dict, "model_path": str}
     """
@@ -89,10 +92,13 @@ def train(
     }
     dataset = DatasetH(handler=handler, segments=segments)
 
-    # 4. 训练 LightGBM
+    # 4. 训练 LightGBM（device 透传：cpu|gpu|cuda）
     if algo != "lightgbm":
         raise NotImplementedError(f"algo {algo} 待集成，第一版只支持 lightgbm")
-    model = LGBModel(loss="mse", num_leaves=64, learning_rate=0.05, n_estimators=200, colsample_bytree=0.9)
+    model = LGBModel(
+        loss="mse", num_leaves=64, learning_rate=0.05, n_estimators=200, colsample_bytree=0.9,
+        device=device,
+    )
     model.fit(dataset)
 
     # 5. 评估（predict 直接接 dataset + segment="valid"）
@@ -130,7 +136,7 @@ def train(
         horizon=horizon,
         train_period=f"{train_start}~{train_end}",
         valid_period=f"{valid_start}~{valid_end}",
-        metrics={"ic": ic, "algo": algo, "horizon": horizon},
+        metrics={"ic": ic, "algo": algo, "horizon": horizon, "device": device},
         model_path=str(model_path),
         notes="qlib workflow 真集成训练",
     )
