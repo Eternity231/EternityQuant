@@ -543,30 +543,40 @@ def ml_predict(
     typer.echo(f"已写入预测：{model_id} / {symbol} / {d} / score={score}")
 
 
-@ml_app.command("train", help="走 qlib workflow 真训练（Alpha158 + LightGBM，可选 GPU）")
+@ml_app.command("train", help="走 qlib workflow 真训练（Alpha158 + LightGBM/PyTorch，可选 GPU/CUDA）")
 def ml_train(
     universe: str = typer.Argument("csi300", help="标的池，如 csi300/csi500"),
     horizon: int = typer.Argument(5, help="预测窗口（天）"),
+    algo: str = typer.Option("lightgbm", "--algo", "-a", help="lightgbm | alstm | gru | lstm | mlp"),
     train_start: str = typer.Option("2015-01-01", "--train-start", help="训练区间起"),
     train_end: str = typer.Option("2020-08-31", "--train-end", help="训练区间止"),
     valid_start: str = typer.Option("2020-09-01", "--valid-start", help="验证区间起"),
     valid_end: str = typer.Option("2020-09-25", "--valid-end", help="验证区间止（qlib 数据末日）"),
-    device: str = typer.Option("cpu", "--device", "-d", help="cpu | gpu | cuda（cuda 需编译时开 USE_CUDA=1，本机不可用）"),
+    device: str = typer.Option("cpu", "--device", "-d", help="cpu | gpu | cuda（LightGBM gpu=OpenCL；PyTorch cuda=真CUDA，3060主场）"),
     name: str = typer.Option("", "--name", "-n", help="模型名，默认自动生成"),
 ):
-    from eq.strategy.factors.ml_workflow import train as wf_train
+    from eq.strategy.factors.ml_workflow import train as wf_train, train_torch as wf_train_torch, _TORCH_ALGOS
     try:
-        result = wf_train(
-            universe=universe, horizon=horizon,
-            train_start=train_start, train_end=train_end,
-            valid_start=valid_start, valid_end=valid_end,
-            device=device, name=name or None,
-        )
+        if algo in _TORCH_ALGOS:
+            # PyTorch 模型默认 cuda（GPU 参数透传给 qlib，cuda → GPU=0）
+            result = wf_train_torch(
+                universe=universe, horizon=horizon, algo=algo,
+                train_start=train_start, train_end=train_end,
+                valid_start=valid_start, valid_end=valid_end,
+                device=device, name=name or None,
+            )
+        else:
+            result = wf_train(
+                universe=universe, horizon=horizon, algo=algo,
+                train_start=train_start, train_end=train_end,
+                valid_start=valid_start, valid_end=valid_end,
+                device=device, name=name or None,
+            )
     except Exception as e:
         typer.echo(f"训练失败：{e}", err=True)
         raise typer.Exit(1)
     typer.echo(f"\n训练完成：model_id={result['model_id']}")
-    typer.echo(f"  IC={result['metrics']['ic']:+.4f}  device={device}  模型文件={result['model_path']}")
+    typer.echo(f"  IC={result['metrics']['ic']:+.4f}  algo={algo}  device={device}  模型文件={result['model_path']}")
     typer.echo(f"  用 `eq ml activate {result['model_id']}` 激活，再 `eq ml predict-batch` 批量预测")
 
 

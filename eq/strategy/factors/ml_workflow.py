@@ -25,10 +25,26 @@ def _ensure_dir() -> Path:
 
 
 def _qlib_init() -> None:
-    """qlib init + torch DLL 预热（Windows + cu132 坑：先 torch.cuda.init 再 qlib.init）。"""
+    """qlib init + torch DLL 预热（Windows + cu132 坑：先 torch.cuda.init 再 qlib.init）。
+
+    还修 qlib 0.9.7 的 ReduceLROnPlateau 版本判断 bug：
+    qlib 用 `str(torch.__version__).split('+')[0] <= '2.6.0'` 做字符串比较，
+    对 torch 2.13.0 误判（'2.13.0' <= '2.6.0' 字典序为真），走错老分支传 verbose=True。
+    monkey patch 绕开：让 ReduceLROnPlateau 接受并忽略 verbose 参数。
+    """
     import torch  # noqa: F401
     if torch.cuda.is_available():
         torch.cuda.init()  # 预热 DLL，避免 c10.dll 延迟加载失败
+
+    # monkey patch ReduceLROnPlateau 接受 verbose 参数（qlib 0.9.7 版本判断 bug 绕开）
+    _orig_reduce_lr = torch.optim.lr_scheduler.ReduceLROnPlateau.__init__
+
+    def _patched_reduce_lr(self, *args, **kwargs):
+        kwargs.pop("verbose", None)  # 新版 torch 不再支持 verbose，忽略
+        return _orig_reduce_lr(self, *args, **kwargs)
+
+    torch.optim.lr_scheduler.ReduceLROnPlateau.__init__ = _patched_reduce_lr
+
     import qlib
     from qlib.config import REG_CN
     qlib.init(provider_uri="~/.qlib/qlib_data/cn_data", region=REG_CN)
@@ -141,6 +157,231 @@ def train(
         notes="qlib workflow 真集成训练",
     )
     return {"model_id": model_id, "metrics": {"ic": ic}, "model_path": str(model_path)}
+
+
+# ---------- qlib PyTorch 模型（走 CUDA，3060 主场） ----------
+
+_TORCH_ALGOS = {"alstm", "gru", "lstm", "mlp"}
+
+
+def _build_torch_model(algo: str, device: str):
+    """按 algo 名造一个 qlib PyTorch 模型实例。device='cuda' 时 GPU=0。
+
+    注意：qlib DNNModelPytorch/ALSTM/GRU 在 torch 2.13 + Alpha158 默认配置下 loss 全 nan
+    （BatchNorm1d 遇全 NaN 列梯度爆），所以这只返回 qlib 原生模型供尝试，主路径走自写 MLP。
+    """
+    from qlib.contrib.model import ALSTM, GRU, LSTM, DNNModelPytorch
+
+    gpu_id = 0 if device == "cuda" else -1  # GPU=-1 走 CPU
+    common = dict(
+        d_feat=6, hidden_size=64, num_layers=2, dropout=0.0,
+        n_epochs=50, lr=0.001, batch_size=2000, early_stop=10,
+        loss="mse", optimizer="adam", GPU=gpu_id,
+    )
+    if algo == "alstm":
+        return ALSTM(**common)
+    if algo == "gru":
+        return GRU(**common)
+    if algo == "lstm":
+        return LSTM(**common)
+    if algo == "mlp":
+        # 走自写 MLP 路径，不返 qlib DNNModelPytorch
+        return None
+    raise NotImplementedError(f"algo {algo} 待集成，可选：{sorted(_TORCH_ALGOS)}")
+
+
+# ---------- 自写最简 MLP（走 torch.cuda，绕开 qlib DNNModelPytorch nan 坑） ----------
+
+class _SimpleMLP:
+    """最简 MLP：158 -> 256 -> 1，走 BatchNorm1d + Adam，支持 CUDA。
+
+    qlib DNNModelPytorch 在 torch 2.13 + Alpha158 默认配置下 loss 全 nan（BatchNorm1d 坑），
+    自写此绕开，只取 qlib handler 的 feature 和 label 做数据，训练用原生 torch。
+    """
+
+    def __init__(self, input_dim: int = 158, hidden: int = 256, lr: float = 1e-3, max_steps: int = 300, batch_size: int = 2000, device: str = "cuda"):
+        import torch
+        import torch.nn as nn
+        self.device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
+        self.lr = lr
+        self.max_steps = max_steps
+        self.batch_size = batch_size
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden), nn.BatchNorm1d(hidden), nn.ReLU(), nn.Dropout(0.05),
+            nn.Linear(hidden, 1),
+        ).to(self.device)
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=lr)
+        self.loss_fn = nn.MSELoss()
+        self.best_score = -float("inf")
+        self.best_state = None
+        self.best_step = 0
+
+    def fit(self, x_train, y_train, x_valid, y_valid, early_stop: int = 30):
+        import torch
+        import numpy as np
+        from torch.utils.data import DataLoader, TensorDataset
+
+        def _to_tensor(df):
+            if hasattr(df, "values"):
+                return torch.from_numpy(df.values).float()
+            return torch.from_numpy(np.asarray(df)).float()
+
+        xt = _to_tensor(x_train).to(self.device)
+        yt = _to_tensor(y_train).squeeze(-1).to(self.device)
+        xv = _to_tensor(x_valid).to(self.device)
+        yv = _to_tensor(y_valid).squeeze(-1).to(self.device)
+
+        stop = 0
+        for step in range(self.max_steps):
+            self.net.train()
+            idx = torch.randperm(len(xt), device=self.device)
+            for i in range(0, len(idx), self.batch_size):
+                b = idx[i:i + self.batch_size]
+                if len(b) < 2:  # BatchNorm1d 需 >1 样本
+                    break
+                pred = self.net(xt[b]).squeeze(-1)
+                loss = self.loss_fn(pred, yt[b])
+                self.opt.zero_grad()
+                loss.backward()
+                self.opt.step()
+            # eval
+            self.net.eval()
+            with torch.no_grad():
+                vp = self.net(xv).squeeze(-1) if len(xv) >= 2 else torch.zeros(1, device=self.device)
+                vl = self.loss_fn(vp, yv).item() if len(xv) >= 2 else float("inf")
+            # IC 作 score（越高越好）
+            if len(xv) >= 2 and vp.std().item() > 0 and yv.std().item() > 0:
+                score = torch.cov(torch.stack([vp, yv]))[0, 1].item() / (vp.std().item() * yv.std().item())
+            else:
+                score = -float("inf")
+            if score > self.best_score:
+                self.best_score = score
+                self.best_step = step
+                self.best_state = {k: v.clone() for k, v in self.net.state_dict().items()}
+                stop = 0
+            else:
+                stop += 1
+                if stop >= early_stop:
+                    break
+        if self.best_state is not None:
+            self.net.load_state_dict(self.best_state)
+
+    def predict(self, x):
+        import torch
+        import numpy as np
+        self.net.eval()
+        with torch.no_grad():
+            xt = torch.from_numpy(np.asarray(x if not hasattr(x, "values") else x.values)).float().to(self.device)
+            if len(xt) < 2:
+                xt = xt.unsqueeze(0).repeat(2, 1)  # BatchNorm1d 需 >=2
+                pred = self.net(xt).squeeze(-1)[0:1]
+            else:
+                pred = self.net(xt).squeeze(-1)
+            return pred.cpu().numpy()
+
+
+def train_torch(
+    universe: str = "csi300",
+    train_start: str = "2015-01-01",
+    train_end: str = "2020-08-31",
+    valid_start: str = "2020-09-01",
+    valid_end: str = "2020-09-25",
+    horizon: int = 5,
+    algo: str = "gru",
+    device: str = "cuda",  # 默认 cuda（真 CUDA，3060 主场）
+    name: str | None = None,
+) -> dict[str, Any]:
+    """走 qlib PyTorch pipeline 训练 ALSTM/GRU/LSTM/MLP，用 CUDA。
+
+    Args:
+        algo: alstm | gru | lstm | mlp（mlp 走自写 _SimpleMLP 绕开 qlib nan 坑）
+        device: cuda | cpu
+    Returns:
+        {"model_id": str, "metrics": dict, "model_path": str}
+    """
+    _qlib_init()
+
+    # Alpha158 handler（feature 158 维）
+    # infer_processors 用默认（ProcessInf + ZScoreNorm + Fillna），跳过会让 feature 含 NaN/Inf 喂给 BatchNorm1d 梯度爆
+    from qlib.contrib.data.handler import Alpha158, _DEFAULT_INFER_PROCESSORS
+    label_expr = [f"Ref($close, -{horizon}) / Ref($close, -1) - 1"]
+    handler = Alpha158(
+        instruments=universe,
+        start_time=train_start,
+        end_time=valid_end,
+        fit_start_time=train_start,
+        fit_end_time=train_end,
+        infer_processors=_DEFAULT_INFER_PROCESSORS,
+        learn_processors=[{"class": "DropnaLabel"}, {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}}],
+        label=label_expr,
+    )
+
+    from qlib.data.dataset import DatasetH
+    segments = {"train": (train_start, train_end), "valid": (valid_start, valid_end)}
+    dataset = DatasetH(handler=handler, segments=segments)
+
+    if algo == "mlp":
+        # 自写 MLP 路径：从 dataset 取 feature 和 label，用 torch.cuda 训练
+        train_data = dataset.prepare("train", col_set=["feature", "label"])
+        valid_data = dataset.prepare("valid", col_set=["feature", "label"])
+        x_train, y_train = train_data["feature"], train_data["label"]
+        x_valid, y_valid = valid_data["feature"], valid_data["label"]
+        if hasattr(y_train, "values"):
+            y_train = y_train.squeeze() if y_train.ndim > 1 else y_train
+        if hasattr(y_valid, "values"):
+            y_valid = y_valid.squeeze() if y_valid.ndim > 1 else y_valid
+        model = _SimpleMLP(input_dim=158, hidden=256, lr=1e-3, max_steps=300, batch_size=2000, device=device)
+        model.fit(x_train, y_train, x_valid, y_valid, early_stop=30)
+        ic = float(model.best_score)
+        epochs = model.best_step + 1
+
+        # 存盘（pickle 整个 _SimpleMLP 实例，含 net state_dict）
+        import pickle as _pkl
+        model_path = _ensure_dir() / f"torch_{algo}_{universe}_{horizon}d.pkl"
+        with open(model_path, "wb") as f:
+            _pkl.dump(model, f)
+
+        model_id = register_model(
+            name=name or f"{universe}_{algo}_h{horizon}_{dt.date.today().strftime('%Y%m%d')}",
+            universe=universe,
+            features=["Alpha158(158 个 qlib 标准特征)"],
+            algo=algo,
+            horizon=horizon,
+            train_period=f"{train_start}~{train_end}",
+            valid_period=f"{valid_start}~{valid_end}",
+            metrics={"ic": ic, "algo": algo, "horizon": horizon, "device": device, "epochs": epochs},
+            model_path=str(model_path),
+            notes=f"自写 _SimpleMLP 真集成训练（{device}），绕开 qlib DNNModelPytorch nan 坑",
+        )
+        return {"model_id": model_id, "metrics": {"ic": ic, "epochs": epochs}, "model_path": str(model_path)}
+
+    # qlib 原生 ALSTM/GRU/LSTM 路径
+    model = _build_torch_model(algo, device)
+    if model is None:
+        raise NotImplementedError(f"algo {algo} 构造失败")
+    evals_result: dict = {}
+    model.fit(dataset, evals_result=evals_result)
+    valid_scores = evals_result.get("valid", [])
+    ic = float(valid_scores[-1]) if valid_scores else 0.0
+
+    import pickle as _pkl
+    model_path = _ensure_dir() / f"torch_{algo}_{universe}_{horizon}d.pkl"
+    with open(model_path, "wb") as f:
+        _pkl.dump(model, f)
+
+    model_id = register_model(
+        name=name or f"{universe}_{algo}_h{horizon}_{dt.date.today().strftime('%Y%m%d')}",
+        universe=universe,
+        features=["Alpha158(158 个 qlib 标准特征)"],
+        algo=algo,
+        horizon=horizon,
+        train_period=f"{train_start}~{train_end}",
+        valid_period=f"{valid_start}~{valid_end}",
+        metrics={"ic": ic, "algo": algo, "horizon": horizon, "device": device, "epochs": len(valid_scores)},
+        model_path=str(model_path),
+        notes=f"qlib PyTorch {algo} 真集成训练（{device}）",
+    )
+    return {"model_id": model_id, "metrics": {"ic": ic, "epochs": len(valid_scores)}, "model_path": str(model_path)}
 
 
 def predict_batch(
