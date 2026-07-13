@@ -623,6 +623,22 @@ def ml_predict_batch(
     print(df.to_string(index=False))
 
 
+@ml_app.command("update-data", help="更新 qlib 本地数据到最新（baostock 拉 A 股日线 → 续 .bin）")
+def ml_update_data(
+    start: str = typer.Option("2020-09-28", "--start", "-s", help="续期起始日，默认接 2020-09-25"),
+    end: str = typer.Option("", "--end", "-e", help="续期结束日，默认今天"),
+    universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all"),
+):
+    from eq.strategy.factors.ml_data_updater import update_qlib_data
+    try:
+        result = update_qlib_data(start=start, end=end or None, universe=universe, verbose=True)
+    except Exception as e:
+        typer.echo(f"更新失败：{e}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"\n更新完成：续 {result['trading_days']} 交易日，{result['instruments_updated']} 只票 × {result['features_per_inst']} 特征")
+    typer.echo(f"  日历新增 {result['days_added']} 行，现在可以 `eq ml train` 用最新数据训练了")
+
+
 if __name__ == "__main__":
     app()
 
