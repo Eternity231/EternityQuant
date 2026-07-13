@@ -46,8 +46,10 @@ def _qlib_init() -> None:
     torch.optim.lr_scheduler.ReduceLROnPlateau.__init__ = _patched_reduce_lr
 
     import qlib
+    from pathlib import Path as _P
     from qlib.config import REG_CN
-    qlib.init(provider_uri="~/.qlib/qlib_data/cn_data", region=REG_CN)
+    _qlib_uri = str(_P(__file__).resolve().parent.parent.parent.parent / ".qlib_data" / "cn_data")
+    qlib.init(provider_uri=_qlib_uri, region=REG_CN)
 
 
 def train(

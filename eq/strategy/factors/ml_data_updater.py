@@ -18,7 +18,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-_QLIB_DATA_DIR = Path.home() / ".qlib" / "qlib_data" / "cn_data"
+_QLIB_DATA_DIR = (Path(__file__).resolve().parent.parent.parent.parent / ".qlib_data" / "cn_data")
 _FEATURES = ["open", "high", "low", "close", "volume", "factor", "change"]
 _FLOAT32_NAN = np.float32(np.nan)
 

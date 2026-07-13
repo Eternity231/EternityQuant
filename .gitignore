@@ -24,6 +24,9 @@ build/
 # MCP
 # .mcp.json  # 不忽略 — 团队共享
 
+# qlib 本地数据（196MB+，每次 update-data 会增量续期）
+.qlib_data/
+
 # Personal skills library（含 grilling skill，个人配置不进仓库）
 skills/
 

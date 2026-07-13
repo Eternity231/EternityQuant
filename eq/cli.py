@@ -638,7 +638,7 @@ def ml_update_data(
         raise typer.Exit(1)
     typer.echo(f"\n更新完成：续 {result['trading_days']} 交易日，{result['instruments_updated']} 只票 × {result['features_per_inst']} 特征")
     from pathlib import Path
-    _qlib_dir = Path.home() / ".qlib" / "qlib_data" / "cn_data"
+    _qlib_dir = Path(__file__).resolve().parent.parent / ".qlib_data" / "cn_data"
     typer.echo(f"  数据目录：{_qlib_dir}")
     typer.echo(f"  日历新增 {result['days_added']} 行，现在可以 `eq ml train` 用最新数据训练了")
 
