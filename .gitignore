@@ -26,3 +26,7 @@ build/
 
 # Personal skills library（含 grilling skill，个人配置不进仓库）
 skills/
+
+# qlib/MLflow 训练元数据（每次训练产生，不进仓库）
+mlruns/
+.qlib/

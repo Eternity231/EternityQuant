@@ -522,7 +522,7 @@ def ml_list(
         )
 
 
-@ml_app.command("predict", help="对某标的写入一条预测分数（第一版手工录入，qlib workflow 集成待）")
+@ml_app.command("predict", help="对某标的写入一条预测分数（手工录入，用于测试或补漏）")
 def ml_predict(
     model_id: str = typer.Argument(help="模型 id"),
     symbol: str = typer.Argument(help="股票符号"),
@@ -533,6 +533,51 @@ def ml_predict(
     d = dt.date.fromisoformat(date) if date else dt.date.today()
     ml_svc.save_prediction(model_id, symbol, d, score)
     typer.echo(f"已写入预测：{model_id} / {symbol} / {d} / score={score}")
+
+
+@ml_app.command("train", help="走 qlib workflow 真训练（Alpha158 + LightGBM）")
+def ml_train(
+    universe: str = typer.Argument("csi300", help="标的池，如 csi300/csi500"),
+    horizon: int = typer.Argument(5, help="预测窗口（天）"),
+    train_start: str = typer.Option("2015-01-01", "--train-start", help="训练区间起"),
+    train_end: str = typer.Option("2020-08-31", "--train-end", help="训练区间止"),
+    valid_start: str = typer.Option("2020-09-01", "--valid-start", help="验证区间起"),
+    valid_end: str = typer.Option("2020-09-25", "--valid-end", help="验证区间止（qlib 数据末日）"),
+    name: str = typer.Option("", "--name", "-n", help="模型名，默认自动生成"),
+):
+    from eq.strategy.factors.ml_workflow import train as wf_train
+    try:
+        result = wf_train(
+            universe=universe, horizon=horizon,
+            train_start=train_start, train_end=train_end,
+            valid_start=valid_start, valid_end=valid_end,
+            name=name or None,
+        )
+    except Exception as e:
+        typer.echo(f"训练失败：{e}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"\n训练完成：model_id={result['model_id']}")
+    typer.echo(f"  IC={result['metrics']['ic']:+.4f}  模型文件={result['model_path']}")
+    typer.echo(f"  用 `eq ml activate {result['model_id']}` 激活，再 `eq ml predict-batch` 批量预测")
+
+
+@ml_app.command("predict-batch", help="用激活模型批量预测全 universe，写入 ml_predictions 表")
+def ml_predict_batch(
+    model_id: str = typer.Argument(help="模型 id"),
+    predict_date: str = typer.Option("", "--date", "-d", help="YYYY-MM-DD，默认 qlib 数据末日 2020-09-25"),
+    top_n: int = typer.Option(50, "--top", "-n", help="前 N 名"),
+):
+    from eq.strategy.factors.ml_workflow import predict_batch
+    try:
+        df = predict_batch(model_id, predict_date=predict_date or None, top_n=top_n)
+    except Exception as e:
+        typer.echo(f"预测失败：{e}", err=True)
+        raise typer.Exit(1)
+    if df.empty:
+        typer.echo("预测结果为空")
+        return
+    print(f"\n预测前 {len(df)} 名（已写入 ml_predictions 表）：\n")
+    print(df.to_string(index=False))
 
 
 if __name__ == "__main__":
