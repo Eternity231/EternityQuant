@@ -379,11 +379,11 @@ class SAM(torch.optim.Optimizer):
     """
     def __init__(self, params, base_optimizer: torch.optim.Optimizer, rho: float = 0.05, **kwargs):
         assert rho >= 0.0, f"rho 必须 >= 0, got {rho}"
-        defaults = dict(rho=rho, **kwargs)
-        super().__init__(params, defaults)
+        # 不调 super().__init__，直接用 base_optimizer 的 param_groups
         self.base_optimizer = base_optimizer
         self.param_groups = self.base_optimizer.param_groups
-        self.state = self.base_optimizer.state
+        self.defaults = self.base_optimizer.defaults
+        self.state = {}  # SAM 独立 state，存储 e_w（不共享 base_optimizer.state）
         self._rho = rho
 
     @torch.no_grad()
@@ -397,7 +397,7 @@ class SAM(torch.optim.Optimizer):
                     continue
                 e_w = p.grad * scale
                 p.add_(e_w)  # 临时上移
-                self.state[p]["e_w"] = e_w
+                self.state[p] = e_w  # 用参数 id 作为 key
         if zero_grad:
             self.zero_grad()
 
@@ -406,9 +406,9 @@ class SAM(torch.optim.Optimizer):
         """第二步：在扰动后的位置取梯度，回退到原始位置，用 base_optimizer 更新。"""
         for group in self.param_groups:
             for p in group["params"]:
-                if p.grad is None or "e_w" not in self.state[p]:
+                if p.grad is None or p not in self.state:
                     continue
-                p.sub_(self.state[p]["e_w"])  # 回退
+                p.sub_(self.state[p])  # 回退
         self.base_optimizer.step()
         if zero_grad:
             self.zero_grad()
