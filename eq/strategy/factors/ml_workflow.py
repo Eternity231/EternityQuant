@@ -642,3 +642,94 @@ def predict_batch(
         )
 
     return pred_df
+
+
+# ---------- LSTM 超参搜索 ----------
+
+_SEARCH_GRID = {
+    "hidden_size": [128, 256, 512],
+    "num_layers": [2, 3, 4],
+    "lr": [1e-3, 5e-4],
+    "batch_size": [2000, 4000],
+}
+
+
+def search_lstm(
+    universe: str = "csi300",
+    horizon: int = 5,
+    train_start: str = "2015-01-01",
+    train_end: str = "2020-08-31",
+    valid_start: str = "2020-09-01",
+    valid_end: str = "2020-09-25",
+    device: str = "cuda",
+    fast: bool = True,
+) -> list[dict]:
+    """网格搜索 LSTM 超参，每组合跑短训练（max_steps=50），返回按 IC 排序的结果。
+
+    Returns:
+        [{"hidden_size":128, "num_layers":2, "lr":0.001, "batch_size":2000,
+          "ic":0.12, "epochs":23, "model_id":"..."}, ...]
+    """
+    _qlib_init()
+    from qlib.contrib.data.handler import Alpha158, _DEFAULT_INFER_PROCESSORS
+    from qlib.data.dataset import DatasetH
+
+    # handler
+    learn_procs = [{"class": "DropnaLabel"}, {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}}]
+    label_expr = [f"Ref($close, -{horizon}) / Ref($close, -1) - 1"]
+    handler = Alpha158(
+        instruments=universe,
+        start_time=train_start, end_time=valid_end,
+        fit_start_time=train_start, fit_end_time=train_end,
+        infer_processors=_DEFAULT_INFER_PROCESSORS,
+        learn_processors=learn_procs,
+        label=label_expr,
+    )
+
+    segments = {"train": (train_start, train_end), "valid": (valid_start, valid_end)}
+    dataset = DatasetH(handler=handler, segments=segments)
+
+    results = []
+    total = len(_SEARCH_GRID["hidden_size"]) * len(_SEARCH_GRID["num_layers"]) * len(_SEARCH_GRID["lr"]) * len(_SEARCH_GRID["batch_size"])
+    idx = 0
+    for hidden_size in _SEARCH_GRID["hidden_size"]:
+        for num_layers in _SEARCH_GRID["num_layers"]:
+            for lr in _SEARCH_GRID["lr"]:
+                for batch_size in _SEARCH_GRID["batch_size"]:
+                    idx += 1
+                    max_steps = 50 if fast else 200
+                    early_stop = 10 if fast else 20
+                    print(f"[{idx}/{total}] hidden={hidden_size} layers={num_layers} lr={lr} batch={batch_size}", flush=True)
+                    try:
+                        model = _SimpleLSTM(
+                            input_dim=158, seq_len=6, input_size=26,
+                            hidden_size=hidden_size, num_layers=num_layers,
+                            lr=lr, max_steps=max_steps, batch_size=batch_size,
+                            device=device,
+                        )
+                        train_data = dataset.prepare("train", col_set=["feature", "label"])
+                        valid_data = dataset.prepare("valid", col_set=["feature", "label"])
+                        x_train, y_train = train_data["feature"], train_data["label"]
+                        x_valid, y_valid = valid_data["feature"], valid_data["label"]
+                        if hasattr(y_train, "values"): y_train = y_train.squeeze() if y_train.ndim > 1 else y_train
+                        if hasattr(y_valid, "values"): y_valid = y_valid.squeeze() if y_valid.ndim > 1 else y_valid
+                        model.fit(x_train, y_train, x_valid, y_valid, early_stop=early_stop)
+                        ic = float(model.best_score)
+                        results.append({
+                            "hidden_size": hidden_size, "num_layers": num_layers,
+                            "lr": lr, "batch_size": batch_size,
+                            "ic": ic, "epochs": model.best_step + 1,
+                        })
+                        print(f"  ✓ IC={ic:+.4f} @step {model.best_step+1}", flush=True)
+                    except Exception as e:
+                        print(f"  ✗ FAIL: {repr(e)[:100]}", flush=True)
+
+    results.sort(key=lambda r: r["ic"], reverse=True)
+    print(f"\n{'='*60}")
+    print(f"  搜索完成 {len(results)}/{total} 组合")
+    print(f"  Top3：")
+    for i, r in enumerate(results[:3]):
+        print(f"  #{i+1}: hidden={r['hidden_size']} layers={r['num_layers']} "
+              f"lr={r['lr']} batch={r['batch_size']}  IC={r['ic']:+.4f}")
+    print(f"{'='*60}\n")
+    return results

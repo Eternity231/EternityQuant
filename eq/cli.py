@@ -643,6 +643,24 @@ def ml_update_data(
     typer.echo(f"  日历新增 {result['days_added']} 行，现在可以 `eq ml train` 用最新数据训练了")
 
 
+@ml_app.command("search", help="LSTM 超参网格搜索（自动试 hidden/layers/lr/batch 组合，报告 Top3）")
+def ml_search(
+    universe: str = typer.Argument("csi300", help="标的池 csi300/csi500/all"),
+    horizon: int = typer.Argument(5, help="预测窗口（天）"),
+    fast: bool = typer.Option(True, "--fast/--full", help="快速模式 max_steps=50 还是完整模式 200"),
+    device: str = typer.Option("cuda", "--device", "-d", help="cuda/cpu"),
+):
+    from eq.strategy.factors.ml_workflow import search_lstm
+    try:
+        results = search_lstm(universe=universe, horizon=horizon, fast=fast, device=device)
+        if not results:
+            typer.echo("无有效结果")
+            raise typer.Exit(1)
+    except Exception as e:
+        typer.echo(f"搜索失败：{e}", err=True)
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()
 
