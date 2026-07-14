@@ -369,30 +369,17 @@ def update_qlib_data(
 
 
 def _generate_instruments(universe: str, instruments: list[str], verbose: bool = True) -> None:
-    """生成 qlib 所需的 instruments 文件（如 csi300.txt）。"""
+    """生成 qlib 所需的 instruments 文件（如 csi300.txt）。
+
+    qlib 格式：每行 code,start_date,end_date（3 列逗号分隔）。
+    """
+    import datetime as dt
+    end = dt.date.today().isoformat()
+    start = "2026-01-01"  # 与用户数据起始一致
     inst_dir = _QLIB_DATA_DIR / "instruments"
     inst_dir.mkdir(parents=True, exist_ok=True)
-    lines = [c.lower() for c in instruments]
+    lines = [f"{c.lower()},{start},{end}" for c in instruments]
     out_path = inst_dir / f"{universe}.txt"
     out_path.write_text("\n".join(lines))
-    # 如果是全量数据，也生成 csi300.txt 和 csi500.txt
-    if universe == "all":
-        # 从列表提取沪深 300 / 中证 500 成分股
-        try:
-            import akshare as ak
-            for name, key in [("csi300", "沪深300"), ("csi500", "中证500")]:
-                df = ak.index_stock_cons(symbol=key)
-                if df is not None and not df.empty:
-                    codes = []
-                    for c in df.iloc[:, 0].tolist():
-                        c = str(c).strip()
-                        if c.startswith("6"):
-                            codes.append(f"sh{c}")
-                        elif c.startswith(("0", "3")):
-                            codes.append(f"sz{c}")
-                    if codes:
-                        (inst_dir / f"{name}.txt").write_text("\n".join(codes))
-        except Exception:
-            pass
     if verbose:
-        print(f"  生成 instruments/{universe}.txt ({len(lines)} 只)", flush=True)
+        print(f"  生成 instruments/{universe}.txt ({len(lines)} 只, {start}~{end})", flush=True)
