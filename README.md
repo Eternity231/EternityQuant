@@ -5,7 +5,7 @@
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](notebooks/colab_eternityquant_train.ipynb)
 [![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](notebooks/kaggle_eternityquant_train.ipynb)
 
-当前版本 **v0.15**（16 个 commit 全实测固化，35 单元测试）。
+当前版本 **v0.18**（机构级深度学习模型 + 高级优化器 + 港股全链路）。
 
 ## 当前能力速览
 
@@ -23,6 +23,11 @@ eq ml train csi300 5 --algo lightgbm --device cpu      # LightGBM CPU
 eq ml train csi300 5 --algo lightgbm --device gpu      # LightGBM GPU（OpenCL）
 eq ml train csi300 5 --algo mlp --device cuda          # 自写 MLP 走 3060 CUDA
 eq ml train csi300 5 --algo lstm --device cuda          # 自写 LSTM 走 CUDA（量化选股最佳，6×26 时序重塑）
+eq ml train csi300 5 --algo deeplob --device cuda       # DeepLOB: CNN+BiLSTM+Attention（顶会论文复现）
+eq ml train csi300 5 --algo tft --device cuda           # Temporal Fusion Transformer（Google 多时间跨度预测）
+eq ml train csi300 5 --algo gru --device cuda --optimizer sam --loss sharpe  # SAM 优化器 + 可微夏普比率
+eq ml train csi300 5 --algo tft --device cuda --adversarial --orthogonalize   # 对抗训练 + 特征正交化
+eq ml train csi300 5 --algo gru --device cuda --optimizer lion --loss ic      # Lion 优化器（Google 进化发现）
 eq ml update-data --start 2020-09-28 --universe csi300  # qlib 数据续到最新（baostock）
 eq ml activate <model_id>
 eq ml predict-batch <model_id> --top 10                # 批量预测入 ml_predictions 表（v0.14 支持自写模型）
@@ -115,6 +120,85 @@ eq --help                               # 看所有命令
 | `lightgbm` | `gpu` | OpenCL 后端（默认编译含） | +0.0985 |
 | `mlp` | `cuda` | 自写 _SimpleMLP（158→512→256→128→1），真 CUDA | +0.1654 |
 | `lstm` | `cuda` | **自写 _SimpleLSTM（6×26 时序重塑，2 层 hidden=128），量化选股最佳** | 待续数据后测 |
+| `deeplob` | `cuda` | **DeepLOB: CNN(1×2)+BiLSTM(64)+Attention** — 顶会论文复现 | 见实盘结果 |
+| `tft` | `cuda` | **Temporal Fusion Transformer: 多头注意力+GRN** — Google 论文复现 | 快速测试 +0.2106 |
+
+### 高级训练参数（v0.16+）
+
+`eq ml train` 新增一系列机构级训练参数，对标华尔街量化团队：
+
+```bash
+# 优化器选择
+eq ml train csi300 5 --algo tft --optimizer adamw    # AdamW（解耦权重衰减，默认）
+eq ml train csi300 5 --algo gru  --optimizer sam      # SAM（Sharpness-Aware Minimization，平坦极小值搜索）
+eq ml train csi300 5 --algo mlp  --optimizer lookahead # Lookahead（k步前看，1步后收）
+eq ml train csi300 5 --algo lstm --optimizer lion      # Lion（Google 进化搜索，只看梯度符号）
+
+# 损失函数
+eq ml train csi300 5 --algo tft --loss sharpe   # 可微夏普比率（直接优化风险调整收益，默认）
+eq ml train csi300 5 --algo gru --loss mse      # 均方误差（传统回归损失）
+eq ml train csi300 5 --algo mlp --loss ic       # 负 IC 损失（最大化信息系数）
+
+# 对抗训练 + 特征正交化
+eq ml train csi300 5 --algo deeplob --adversarial          # FGSM 对抗训练（忽略微小价格波动）
+eq ml train csi300 5 --algo tft --orthogonalize             # 特征正交化去 Beta（学纯 Alpha）
+eq ml train csi300 5 --algo gru --adversarial --orthogonalize # 两者结合
+
+# 高级网络参数
+eq ml train csi300 5 --algo deeplob --dropout 0.4 --seq-len 120  # DeepLOB: 120 步窗口, 40% dropout
+eq ml train csi300 5 --algo tft --dropout 0.3 --heads 4 --hidden 256  # TFT: 4头注意力, 256隐藏
+```
+
+#### 优化器对比
+
+| 优化器 | 论文 | 核心思想 | 金融优势 | 推荐场景 |
+|--------|------|---------|---------|---------|
+| **AdamW** | Loshchilov & Hutter, 2019 | 解耦权重衰减 | 真正落实正则化，防止过拟合历史噪音 | 所有模型基线 |
+| **SAM** | Foret et al., ICLR 2021 | 寻找平坦极小值 (Flat Minima) | 市场环境漂移时损失仍保持低水平，防"见光死" | 实盘前最后优化 |
+| **Lookahead** | Zhang et al., NeurIPS 2019 | 双权重：快权探索，慢权稳定 | 极大降低局部噪音带偏概率，方差更稳定 | 训练过程不稳定时 |
+| **Lion** | Chen et al., NeurIPS 2023 | 只看梯度符号，忽略幅度 | 天然免疫闪崩等极端异常值，节省显存 | 大 Batch Size 训练 |
+
+### 机构级模型架构
+
+#### DeepLOB — CNN + BiLSTM + Attention
+
+论文 [Zhang et al., 2019]: 针对金融微观结构设计的专用架构。
+
+```
+Input(158) → Projection(120) → Conv3×2(16,16,16) → BiLSTM(64) → Attention → FC(1)
+```
+
+- CNN 1×2 卷积核：捕捉同档位买卖价差/量价不平衡的空间特征
+- BiLSTM：双向时序建模，捕捉过去 120 个时间步的微观动量
+- 注意力机制：自动加权重要时间步，而非简单取最后一步
+- 超参：`--seq-len 120 --dropout 0.3 --hidden 64`
+
+#### Temporal Fusion Transformer (TFT)
+
+论文 [Lim et al., 2019]: Google 多时间跨度预测，目前中低频时序最先进模型之一。
+
+```
+Input(158) → Linear(256) → LSTM Encoder → GRN → Multi-Head Attention(4) → FC(1)
+```
+
+- GRN (Gated Residual Network)：门控残差网络，特征选择+非线性变换
+- 多头注意力：4 头并行，捕捉不同周期的因子共振
+- 位置编码：可学习位置编码，建模时序顺序
+- 超参：`--hidden 256 --heads 4 --dropout 0.3`
+
+### 损失函数
+
+| 损失函数 | 公式 | 说明 |
+|---------|------|------|
+| **可微夏普比率** (Sharpe) | `-E[R] / sqrt(Var[R] + ε)` | 直接优化组合风险调整收益，默认推荐 |
+| 均方误差 (MSE) | `mean((pred - actual)²)` | 传统回归损失，不直接优化收益率 |
+| 负 IC (IC) | `-corr(pred, actual)` | 最大化信息系数，因子评价标准 |
+
+### 特征正交化 + 对抗训练
+
+**特征正交化**：将截面特征相对于市场基准回归取残差，确保模型学习纯 Alpha 而非 Beta。
+
+**FGSM 对抗训练**：在训练数据中注入梯度方向的微小扰动，强制模型忽略微小价格噪音，极大提升实盘异常行情鲁棒性。
 
 LSTM 路径把 Alpha158 的 158 维特征重塑成 (batch, seq_len=6, input_size=26) 的时序张量喂给 LSTM——这是量化选股的正确做法（学"过去 6 日形态"），比 MLP 把特征当独立向量强。3060 12GB CUDA 主场。
 

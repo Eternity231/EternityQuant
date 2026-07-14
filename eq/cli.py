@@ -563,20 +563,28 @@ def ml_predict(
     typer.echo(f"已写入预测：{model_id} / {symbol} / {d} / score={score}")
 
 
-@ml_app.command("train", help="走 qlib workflow 真训练（Alpha158 + LightGBM/PyTorch，可选 GPU/CUDA）")
+@ml_app.command("train", help="走 qlib workflow 真训练（Alpha158 + LightGBM/PyTorch/DeepLOB/TFT，可选 GPU/CUDA）")
 def ml_train(
     universe: str = typer.Argument("csi300", help="标的池，如 csi300/csi500"),
     horizon: int = typer.Argument(5, help="预测窗口（天）"),
-    algo: str = typer.Option("lightgbm", "--algo", "-a", help="lightgbm | alstm | gru | lstm | mlp"),
+    algo: str = typer.Option("lightgbm", "--algo", "-a", help="lightgbm | alstm | gru | lstm | mlp | deeplob | tft"),
     train_start: str = typer.Option("2015-01-01", "--train-start", help="训练区间起"),
     train_end: str = typer.Option("2020-08-31", "--train-end", help="训练区间止"),
     valid_start: str = typer.Option("2020-09-01", "--valid-start", help="验证区间起"),
     valid_end: str = typer.Option("2020-09-25", "--valid-end", help="验证区间止（qlib 数据末日）"),
     device: str = typer.Option("cpu", "--device", "-d", help="cpu | gpu | cuda（LightGBM gpu=OpenCL；PyTorch cuda=真CUDA，3060主场）"),
-    hidden: int = typer.Option(0, "--hidden", help="GRU/LSTM 隐藏层大小，0=自动（GRU=64，搜索结果建议 512）"),
-    layers: int = typer.Option(0, "--layers", help="GRU/LSTM 层数，0=自动（默认 2，搜索结果建议 4）"),
-    batch: int = typer.Option(0, "--batch", "-b", help="batch size，0=自动（默认 4000，搜索结果建议 2000）"),
+    hidden: int = typer.Option(0, "--hidden", help="RNN/Transformer 隐藏层大小，0=自动（GRU=64, DeepLOB=64, TFT=256）"),
+    layers: int = typer.Option(0, "--layers", help="RNN 层数，0=自动（默认 2）"),
+    batch: int = typer.Option(0, "--batch", "-b", help="batch size，0=自动（默认 4000，DeepLOB 建议 512，TFT 建议 256）"),
     name: str = typer.Option("", "--name", "-n", help="模型名，默认自动生成"),
+    # --- 高级参数 ---
+    optimizer: str = typer.Option("adamw", "--optimizer", "-o", help="优化器: adamw | sam | lookahead | lion"),
+    loss: str = typer.Option("sharpe", "--loss", "-l", help="损失函数: sharpe | mse | ic"),
+    dropout: float = typer.Option(0.3, "--dropout", help="Dropout 率（量化建议 0.3-0.4）"),
+    adversarial: bool = typer.Option(False, "--adversarial/--no-adv", help="FGSM 对抗训练（增强鲁棒性，训练时间翻倍）"),
+    orthogonalize: bool = typer.Option(False, "--orthogonalize/--no-orth", help="特征正交化去 Beta"),
+    seq_len: int = typer.Option(0, "--seq-len", help="DeepLOB/TFT 输入窗口，0=自动（DeepLOB=120, TFT=60）"),
+    heads: int = typer.Option(4, "--heads", help="TFT 注意力头数"),
 ):
     # torch DLL 预热（Windows + cu132 坑：qlib 集成链触发 torch 延迟加载 c10.dll 失败，ml 命令才预热）
     try:
@@ -586,8 +594,26 @@ def ml_train(
     except ImportError:
         pass
     from eq.strategy.factors.ml_workflow import train as wf_train, train_torch as wf_train_torch, _TORCH_ALGOS
+    _ADVANCED_ALGOS = {"deeplob", "tft"}
     try:
-        if algo in _TORCH_ALGOS:
+        if algo in _ADVANCED_ALGOS:
+            # 高级模型（DeepLOB / TFT）：用 AdvancedTrainer
+            from eq.strategy.factors.advanced_models import AdvancedTrainer, DeepLOB, TemporalFusionTransformer
+            kw = {}
+            if hidden > 0: kw["hidden_size"] = hidden
+            if batch > 0: kw["batch_size"] = batch
+            if seq_len > 0: kw["seq_len"] = seq_len
+            if heads > 0: kw["num_heads"] = heads
+            result = wf_train_torch(
+                universe=universe, horizon=horizon, algo=algo,
+                train_start=train_start, train_end=train_end,
+                valid_start=valid_start, valid_end=valid_end,
+                device=device, name=name or None,
+                optimizer=optimizer, loss_type=loss,
+                dropout=dropout, adversarial=adversarial,
+                orthogonalize=orthogonalize, **kw,
+            )
+        elif algo in _TORCH_ALGOS:
             # PyTorch 模型默认 cuda（GPU 参数透传给 qlib，cuda → GPU=0）
             kw = {}
             if hidden > 0: kw["hidden_size"] = hidden

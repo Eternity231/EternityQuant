@@ -67,8 +67,8 @@ def download_hk_stock(symbol: str, start: str, end: str) -> pd.DataFrame:
     # 检查缓存（避免反复拉 2-5s/只）
     if cache_path.exists():
         df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-        # 检查缓存是否已覆盖目标区间
-        if len(df) > 10 and df.index.min() <= pd.Timestamp(start) and df.index.max() >= pd.Timestamp(end):
+        if len(df) > 10:
+            # 只要缓存有数据就返回，不要求完全覆盖区间
             return df
     try:
         df = ak.stock_hk_hist(symbol=symbol, period="daily", start_date=start, end_date=end, adjust="qfq")
@@ -82,6 +82,11 @@ def download_hk_stock(symbol: str, start: str, end: str) -> pd.DataFrame:
         df.to_csv(cache_path)
         return df
     except Exception:
+        # 下载失败时，如果有缓存就返回缓存数据
+        if cache_path.exists():
+            df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            if len(df) > 10:
+                return df
         return pd.DataFrame()
 
 
@@ -144,6 +149,7 @@ def compute_features_hk(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
     close = df["close"]
+    open_ = df["open"]
     high = df["high"]
     low = df["low"]
     vol = df["volume"]
@@ -208,10 +214,10 @@ def compute_features_hk(df: pd.DataFrame) -> pd.DataFrame:
 
     # --- 形态特征 ---
     df["hl_ratio"] = (high - low) / close
-    df["co_ratio"] = (close - open) / (high - low + 1e-10)  # 实体占比
+    df["co_ratio"] = (close - open_) / (high - low + 1e-10)  # 实体占比
     df["up_shadow"] = (high - close) / (close - low + 1e-10)  # 上影线
-    df["low_shadow"] = (open - low) / (high - low + 1e-10)  # 下影线
-    df["body"] = abs(close - open) / (high - low + 1e-10)  # 实体比例
+    df["low_shadow"] = (open_ - low) / (high - low + 1e-10)  # 下影线
+    df["body"] = abs(close - open_) / (high - low + 1e-10)  # 实体比例
     # 连续涨跌
     df["up_count"] = (ret1 > 0).astype(int).rolling(5).sum()
     df["down_count"] = (ret1 < 0).astype(int).rolling(5).sum()
@@ -289,6 +295,17 @@ def train_hk(
     if not all_features:
         raise RuntimeError(f"特征计算后无有效样本（{len(symbols)} 只股票）")
 
+    # 转换为 numpy 数组
+    import numpy as _np
+    X = _np.array(all_features, dtype=_np.float32)
+    y = _np.array(all_labels, dtype=_np.float32)
+
+    seq_len = time_steps
+    input_size = len(feat_cols)
+
+    # 导入模型
+    from eq.strategy.factors.ml_workflow import _SimpleSeqModel
+
     # Walk-Forward Validation：滚动 60 天窗口，每滚一次训一次，取平均 IC
     if walk_forward and len(X) > 240:
         window = 60  # 验证窗口 60 天
@@ -328,10 +345,6 @@ def train_hk(
               f"（{len(symbols_ok)} 只股票，{len(feat_cols)} 维特征，dropout={dropout}）", flush=True)
 
     # 训练
-    from eq.strategy.factors.ml_workflow import _SimpleSeqModel
-
-    seq_len = time_steps
-    input_size = len(feat_cols)
     model = _SimpleSeqModel(
         input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
         hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,

@@ -163,7 +163,7 @@ def train(
 
 # ---------- qlib PyTorch 模型（走 CUDA，3060 主场） ----------
 
-_TORCH_ALGOS = {"alstm", "gru", "lstm", "mlp"}
+_TORCH_ALGOS = {"alstm", "gru", "lstm", "mlp", "deeplob", "tft"}
 
 
 def _build_torch_model(algo: str, device: str):
@@ -446,12 +446,27 @@ def train_torch(
     num_layers: int = 0,
     batch_size: int = 0,
     name: str | None = None,
+    # --- 高级参数（DeepLOB/TFT） ---
+    optimizer: str = "adamw",
+    loss_type: str = "sharpe",
+    dropout: float = 0.3,
+    adversarial: bool = False,
+    orthogonalize: bool = False,
+    seq_len: int = 0,
+    num_heads: int = 4,
 ) -> dict[str, Any]:
-    """走 qlib PyTorch pipeline 训练 ALSTM/GRU/LSTM/MLP，用 CUDA。
+    """走 qlib PyTorch pipeline 训练 ALSTM/GRU/LSTM/MLP/DeepLOB/TFT，用 CUDA。
 
     Args:
-        algo: alstm | gru | lstm | mlp（mlp 走自写 _SimpleMLP 绕开 qlib nan 坑）
+        algo: alstm | gru | lstm | mlp | deeplob | tft
         device: cuda | cpu
+        optimizer: adamw | sam | lookahead | lion（仅 DeepLOB/TFT）
+        loss_type: sharpe | mse | ic（仅 DeepLOB/TFT）
+        dropout: Dropout 率（量化建议 0.3-0.4）
+        adversarial: FGSM 对抗训练（仅 DeepLOB/TFT）
+        orthogonalize: 特征正交化去 Beta
+        seq_len: DeepLOB/TFT 输入窗口
+        num_heads: TFT 注意力头数
     Returns:
         {"model_id": str, "metrics": dict, "model_path": str}
     """
@@ -476,6 +491,89 @@ def train_torch(
     segments = {"train": (train_start, train_end), "valid": (valid_start, valid_end)}
     dataset = DatasetH(handler=handler, segments=segments)
 
+    # --- 高级模型路径：DeepLOB / TFT ---
+    if algo in ("deeplob", "tft"):
+        from eq.strategy.factors.advanced_models import (
+            AdvancedTrainer, DeepLOB, TemporalFusionTransformer,
+        )
+
+        train_data = dataset.prepare("train", col_set=["feature", "label"])
+        valid_data = dataset.prepare("valid", col_set=["feature", "label"])
+        x_train, y_train = train_data["feature"], train_data["label"]
+        x_valid, y_valid = valid_data["feature"], valid_data["label"]
+        if hasattr(y_train, "values"):
+            y_train = y_train.squeeze() if y_train.ndim > 1 else y_train
+        if hasattr(y_valid, "values"):
+            y_valid = y_valid.squeeze() if y_valid.ndim > 1 else y_valid
+
+        # 构建模型
+        input_dim = 158
+        _seq_len = seq_len if seq_len > 0 else (120 if algo == "deeplob" else 60)
+        _hidden = hidden_size if hidden_size > 0 else (64 if algo == "deeplob" else 256)
+        _batch = batch_size if batch_size > 0 else (512 if algo == "deeplob" else 256)
+        input_size = 26  # 6×26 时序重塑的每步维度
+        model_input_dim = _seq_len * input_size
+
+        if algo == "deeplob":
+            model = DeepLOB(
+                seq_len=_seq_len, input_dim=input_size,
+                lstm_hidden=_hidden, dropout=dropout,
+                raw_input_dim=158,  # Alpha158 原始 158 维 → 投影到 seq_len * input_size
+            )
+            notes = f"DeepLOB CNN+BiLSTM+Attention（seq={_seq_len}, hidden={_hidden}, dropout={dropout}）"
+        else:
+            model = TemporalFusionTransformer(
+                input_dim=158,  # Alpha158 原始 158 维
+                hidden_dim=_hidden,
+                num_heads=num_heads,
+                dropout=dropout,
+                max_seq_len=1,  # 单时间步，不做时序展开
+            )
+            notes = f"TFT（seq={_seq_len}, hidden={_hidden}, heads={num_heads}, dropout={dropout}）"
+
+        # 用 AdvancedTrainer 训练
+        trainer = AdvancedTrainer(
+            model=model,
+            optimizer_type=optimizer,
+            loss_type=loss_type,
+            learning_rate=1e-4,
+            weight_decay=0.01,
+            max_steps=300,
+            batch_size=_batch,
+            early_stop=30,
+            use_adversarial=adversarial,
+            adversarial_epsilon=0.01,
+            orthogonalize=orthogonalize,
+            use_scheduler=True,
+            device=device,
+            verbose=True,
+        )
+        result = trainer.fit(x_train, y_train, x_valid, y_valid)
+        ic = float(result["best_ic"])
+
+        # 存盘
+        import pickle as _pkl
+        model_path = _ensure_dir() / f"torch_{algo}_{universe}_{horizon}d.pkl"
+        with open(model_path, "wb") as f:
+            _pkl.dump(model, f)
+
+        model_id = register_model(
+            name=name or f"{universe}_{algo}_h{horizon}_{dt.date.today().strftime('%Y%m%d')}",
+            universe=universe,
+            features=["Alpha158(158 个 qlib 标准特征)"],
+            algo=algo,
+            horizon=horizon,
+            train_period=f"{train_start}~{train_end}",
+            valid_period=f"{valid_start}~{valid_end}",
+            metrics={"ic": ic, "algo": algo, "horizon": horizon, "device": device,
+                     "optimizer": optimizer, "loss": loss_type,
+                     "adversarial": adversarial, "orthogonalize": orthogonalize},
+            model_path=str(model_path),
+            notes=notes,
+        )
+        return {"model_id": model_id, "metrics": {"ic": ic, "epochs": result["best_step"] + 1}, "model_path": str(model_path)}
+
+    # --- 原有 PyTorch 模型路径（MLP / LSTM / GRU / ALSTM） ---
     if algo in ("mlp", "lstm", "gru", "alstm"):
         # 自写 MLP/LSTM 路径：从 dataset 取 feature 和 label，用 torch.cuda 训练
         train_data = dataset.prepare("train", col_set=["feature", "label"])
@@ -613,7 +711,7 @@ def predict_batch(
     algo_row = _execute("SELECT algo FROM ml_models WHERE id = ?", (model_id,))
     algo = algo_row[0]["algo"] if algo_row else "lightgbm"
 
-    if algo in ("lstm", "gru", "alstm", "mlp"):
+    if algo in ("lstm", "gru", "alstm", "mlp", "deeplob", "tft"):
         # 自写模型路径：取 feature，喂 model.predict(x)
         test_data = dataset.prepare("test", col_set="feature")
         # test_data 可能是 DataFrame（index 是 MultiIndex datetime, instrument）或 dict
