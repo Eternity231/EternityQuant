@@ -206,13 +206,7 @@ def update_qlib_data(
         if verbose:
             print(f"日历续 {len(new_cal_days)} 日（去重后）", flush=True)
 
-        # 如果没有新交易日，直接返回（数据已是最新）
-        if not new_cal_days:
-            if verbose:
-                print(f"数据已是最新（日历 {start} ~ {end} 已存在）", flush=True)
-            return {"days_added": 0, "instruments_updated": 0, "features_per_inst": 0, "trading_days": len(new_days)}
-
-        # 拉成分股
+        # 拉成分股（即使日历已最新，也要检查股票数据是否完整）
         if instruments is None:
             instruments = _bs_instruments(universe)
         if verbose:
