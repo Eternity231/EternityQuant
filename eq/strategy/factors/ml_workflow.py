@@ -295,7 +295,7 @@ class _SimpleLSTM:
 
     Alpha158 的 158 维特征按 qlib 命名规则是 6 组时序窗口（0/1/2/3/4/5 日前 + rolling），
     每组约 26 维同型因子——这是 LSTM 要的时序结构。158 = 6*26 + 2（舍尾），重塑成 6×26。
-    走 torch.cuda，3060 10GB 富裕，hidden_size=128，2 层 LSTM，真吃显存。
+    走 torch.cuda，3060 10GB 富裕，hidden_size=256，3 层 LSTM，真吃显存。
 
     qlib 原生 LSTM 在 torch 2.13 + Alpha158 默认配置下 loss 全 nan（feature 直接塞 LSTM 被错误解释成
     seq_len=158, input_size=1），自写此绕开，正确重塑时序。
@@ -468,11 +468,11 @@ def train_torch(
             model = _SimpleMLP(input_dim=158, hidden=(512, 256, 128), lr=1e-3, max_steps=300, batch_size=8000, device=device)
             notes = f"自写 _SimpleMLP 真集成训练（{device}），绕开 qlib DNNModelPytorch nan 坑"
         elif algo == "lstm":
-            model = _SimpleLSTM(input_dim=158, seq_len=6, input_size=26, hidden_size=128, num_layers=2, lr=1e-3, max_steps=200, batch_size=4000, device=device)
+            model = _SimpleLSTM(input_dim=158, seq_len=6, input_size=26, hidden_size=256, num_layers=3, lr=1e-3, max_steps=200, batch_size=4000, device=device)
             notes = f"自写 _SimpleLSTM 真集成训练（{device}），158 维重塑 6×26 时序，绕开 qlib LSTM nan 坑"
         else:
             # gru/alstm 暂复用 LSTM 路径（GRU 单元差异待后续）
-            model = _SimpleLSTM(input_dim=158, seq_len=6, input_size=26, hidden_size=128, num_layers=2, lr=1e-3, max_steps=200, batch_size=4000, device=device)
+            model = _SimpleLSTM(input_dim=158, seq_len=6, input_size=26, hidden_size=256, num_layers=3, lr=1e-3, max_steps=200, batch_size=4000, device=device)
             notes = f"自写 _SimpleLSTM（{algo} 路径）真集成训练（{device}），158 维重塑 6×26 时序"
         model.fit(x_train, y_train, x_valid, y_valid, early_stop=20 if algo != "mlp" else 30)
         ic = float(model.best_score)
