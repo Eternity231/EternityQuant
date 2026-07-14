@@ -38,7 +38,7 @@ def _worker_finish():
 
 
 def _proc_one_stock(code: str, start: str, end: str, new_days: tuple, qlib_feats_dir: str, expected_floats: int = 0) -> bool:
-    """子进程内处理一只票。失败自动重试最多 3 次（baostock 限流常见）。
+    """子进程内处理一只票。失败自动重试最多 5 次，每次独立 login（baostock TCP 连接断后不能复用）。
 
     返回 True=成功 False=失败（停牌或异常）。
     """
@@ -72,41 +72,45 @@ def _proc_one_stock(code: str, start: str, end: str, new_days: tuple, qlib_feats
         return False
 
     for attempt in range(5):  # 指数退避
+        if attempt > 0:
+            _time.sleep(2 ** attempt)  # 退避：2/4/8/16/32s
+        # 每次重试独立 login（断开的 TCP 连接不能复用）
+        import baostock as _bs2
         try:
-            if attempt > 0:
-                _time.sleep(2 ** attempt)  # 退避：2/4/8/16/32s
-            rs = _bs.query_history_k_data_plus(
-                bs_code, "date,open,high,low,close,volume,preclose,adjustflag,turn",
-                start_date=start, end_date=end, frequency="d", adjustflag="2",
-            )
-            if rs.error_code != "0":
-                if attempt >= 4:
+            _bs2.login()
+            try:
+                rs = _bs2.query_history_k_data_plus(
+                    bs_code, "date,open,high,low,close,volume,preclose,adjustflag,turn",
+                    start_date=start, end_date=end, frequency="d", adjustflag="2",
+                )
+                if rs.error_code != "0":
+                    continue
+                rows_list = []
+                while rs.next():
+                    rows_list.append(rs.get_row_data())
+                if not rows_list:
                     return False
-            rows_list = []
-            while rs.next():
-                rows_list.append(rs.get_row_data())
-            if not rows_list:
-                return False
-            df = pd.DataFrame(rows_list, columns=["date", "open", "high", "low", "close", "volume", "preclose", "adjustflag", "turn"])
-            for col in ["open", "high", "low", "close", "volume", "preclose"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["factor"] = 1.0
-            df["change"] = (df["close"] - df["preclose"]) / df["preclose"]
-            df = df.set_index("date")[["open", "high", "low", "close", "volume", "factor", "change"]]
-            # 对齐日历
-            days_list = list(new_days)
-            df = df.reindex(days_list)
-            # 写 .bin
-            for feat in _FEATURES:
-                bin_path = inst_dir / f"{feat}.day.bin"
-                vals = df[feat].tolist() if feat in df.columns else [float("nan")] * len(days_list)
-                vals = [float("nan") if v != v or v is None else v for v in vals]
-                _append_bin(bin_path, vals)
-            return True
+                df = pd.DataFrame(rows_list, columns=["date", "open", "high", "low", "close", "volume", "preclose", "adjustflag", "turn"])
+                for col in ["open", "high", "low", "close", "volume", "preclose"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df["factor"] = 1.0
+                df["change"] = (df["close"] - df["preclose"]) / df["preclose"]
+                df = df.set_index("date")[["open", "high", "low", "close", "volume", "factor", "change"]]
+                df = df.reindex(days_list)
+                for feat in _FEATURES:
+                    bin_path = inst_dir / f"{feat}.day.bin"
+                    vals = df[feat].tolist() if feat in df.columns else [float("nan")] * len(days_list)
+                    vals = [float("nan") if v != v or v is None else v for v in vals]
+                    _append_bin(bin_path, vals)
+                return True
+            finally:
+                try:
+                    _bs2.logout()
+                except Exception:
+                    pass
         except Exception:
-            if attempt >= 2:
+            if attempt >= 4:
                 return False
-            continue
     return False
 
 
@@ -116,7 +120,6 @@ def _proc_batch(args: tuple) -> tuple:
     args: (codes, start, end, new_days, feats_dir_str)
     """
     codes, start, end, new_days, feats_dir_str, expected_floats = args
-    _worker_init()
     ok = fail = 0
     for code in codes:
         if _proc_one_stock(code, start, end, new_days, feats_dir_str, expected_floats=expected_floats):
