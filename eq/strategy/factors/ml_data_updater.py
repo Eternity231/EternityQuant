@@ -39,12 +39,15 @@ def _worker_finish():
 
 
 def _proc_one_stock(bs_mod, code, start, end, new_days, qlib_feats_dir, expected_floats=0):
-    """用已有 baostock 连接处理一只。连接断返回 False 让 _proc_batch relogin。"""
+    """用已有 baostock 连接处理一只，查询失败自动 relogin + 重试。"""
     from pathlib import Path
     import pandas as pd
+    import time as _t
     inst_dir = Path(qlib_feats_dir) / code.lower()
     inst_dir.mkdir(parents=True, exist_ok=True)
     days_list = list(new_days)
+
+    # 断点续传检查
     close_bin = inst_dir / "close.day.bin"
     if close_bin.exists() and expected_floats > 0:
         actual = close_bin.stat().st_size // 4
@@ -53,58 +56,57 @@ def _proc_one_stock(bs_mod, code, start, end, new_days, qlib_feats_dir, expected
         for feat in _FEATURES:
             bp = inst_dir / f"{feat}.day.bin"
             if bp.exists(): bp.unlink()
+
     if code.startswith("SH"): bs_code = f"sh.{code[2:]}"
     elif code.startswith("SZ"): bs_code = f"sz.{code[2:]}"
     else: return False
-    rs = bs_mod.query_history_k_data_plus(bs_code, "date,open,high,low,close,volume,preclose,adjustflag,turn", start_date=start, end_date=end, frequency="d", adjustflag="2")
-    if rs.error_code != "0": raise RuntimeError(f"baostock error: {rs.error_msg}")
-    rows_list = []
-    while rs.next(): rows_list.append(rs.get_row_data())
-    if not rows_list: return False
-    df = pd.DataFrame(rows_list, columns=["date","open","high","low","close","volume","preclose","adjustflag","turn"])
-    for col in ["open","high","low","close","volume","preclose"]: df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["factor"] = 1.0
-    df["change"] = (df["close"] - df["preclose"]) / df["preclose"]
-    df = df.set_index("date")[["open","high","low","close","volume","factor","change"]]
-    df = df.reindex(days_list)
-    for feat in _FEATURES:
-        vals = df[feat].tolist() if feat in df.columns else [float("nan")] * len(days_list)
-        vals = [float("nan") if v != v or v is None else v for v in vals]
-        _append_bin(inst_dir / f"{feat}.day.bin", vals)
-    return True
+
+    # 查询 + 自动重试 5 次（连接断自动 relogin）
+    for attempt in range(5):
+        if attempt > 0:
+            _t.sleep(2 ** attempt)
+            try: bs_mod.logout()
+            except: pass
+            bs_mod.login()
+        try:
+            rs = bs_mod.query_history_k_data_plus(bs_code, "date,open,high,low,close,volume,preclose,adjustflag,turn", start_date=start, end_date=end, frequency="d", adjustflag="2")
+            if rs.error_code != "0":
+                continue  # 重试
+            rows_list = []
+            while rs.next(): rows_list.append(rs.get_row_data())
+            if not rows_list: return False
+            df = pd.DataFrame(rows_list, columns=["date","open","high","low","close","volume","preclose","adjustflag","turn"])
+            for col in ["open","high","low","close","volume","preclose"]: df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["factor"] = 1.0
+            df["change"] = (df["close"] - df["preclose"]) / df["preclose"]
+            df = df.set_index("date")[["open","high","low","close","volume","factor","change"]]
+            df = df.reindex(days_list)
+            for feat in _FEATURES:
+                vals = df[feat].tolist() if feat in df.columns else [float("nan")] * len(days_list)
+                vals = [float("nan") if v != v or v is None else v for v in vals]
+                _append_bin(inst_dir / f"{feat}.day.bin", vals)
+            return True
+        except Exception:
+            if attempt >= 4:
+                raise  # 5 次都失败，抛给 _proc_batch 统一处理
+    return False  # 不会到这儿
 
 
 def _proc_batch(args):
-    """login 一次 → 批量 query → logout（断线 relogin + 指数退避 2/4/8/16/32s）。"""
-    import baostock as _bs, time as _t
+    """login 一次 → 批量 query → logout。_proc_one_stock 内部自带重试 + relogin。"""
+    import baostock as _bs
     codes, start, end, new_days, qlib_feats_dir, expected_floats = args
     _bs.login()
     ok = fail = 0
     try:
         for code in codes:
-            # 先尝试断点续传（expected_floats > 0 时不 query，只检查 .bin 大小）
-            if expected_floats > 0 and _proc_one_stock(_bs, code, start, end, new_days, qlib_feats_dir, expected_floats):
-                ok += 1  # 跳过：已有完整数据
-                continue
-            # 需要真下载
-            downloaded = False
-            for attempt in range(5):
-                if attempt > 0: _t.sleep(2 ** attempt)
-                try:
-                    if _proc_one_stock(_bs, code, start, end, new_days, qlib_feats_dir, 0):  # expected=0 强制下载
-                        ok += 1
-                    else:
-                        fail += 1  # 合法失败
-                    downloaded = True
-                    break
-                except Exception:
-                    if attempt >= 4:
-                        fail += 1
-                        break
-                    print(f"  ⇢ 断线重连（{code} attempt {attempt+1}/5）", end="", flush=True)
-                    try: _bs.logout()
-                    except: pass
-                    _bs.login()
+            try:
+                if _proc_one_stock(_bs, code, start, end, new_days, qlib_feats_dir, expected_floats):
+                    ok += 1
+                else:
+                    fail += 1
+            except Exception:
+                fail += 1  # 5 次重试都失败
     finally:
         try: _bs.logout()
         except: pass
