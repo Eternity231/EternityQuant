@@ -774,11 +774,12 @@ def search_lstm(
     if auto_train and results:
         best = results[0]
         hs, nl, lr, bs = best["hidden_size"], best["num_layers"], best["lr"], best["batch_size"]
-        print(f"自动训练最佳参数: hidden={hs} layers={nl} lr={lr} batch={bs}\n", flush=True)
+        best_step = best["epochs"]
+        print(f"自动训练最佳参数: hidden={hs} layers={nl} lr={lr} batch={bs}  (搜索 best_step={best_step})", flush=True)
         model = _SimpleSeqModel(
             input_dim=158, seq_len=6, input_size=26,
             hidden_size=hs, num_layers=nl, cell_type="lstm" if algo == "lstm" else "gru",
-            lr=lr, max_steps=200, batch_size=bs, device=device,
+            lr=lr, max_steps=best_step + 10, batch_size=bs, device=device,  # 不多跑，留 10 步余量
             use_scheduler=True,
         )
         train_data = dataset.prepare("train", col_set=["feature", "label"])
