@@ -65,6 +65,10 @@ app.add_typer(scheduler_app, name="scheduler")
 hk_app = typer.Typer(help="港股数据管道（Sina 源）", no_args_is_help=True)
 app.add_typer(hk_app, name="hk")
 
+# 子命令组：eq data ...
+data_app = typer.Typer(help="数据收集（A股/港股日线/分钟线/美股）", no_args_is_help=True)
+app.add_typer(data_app, name="data")
+
 
 @app.command(help="看个股行情快照（最近一根日线 + 涨跌幅）")
 def watch(
@@ -866,6 +870,62 @@ def hk_predict(
 
 
 # ---------- eq dash 命令（放末尾，避免 streamlit 启动逻辑被其他装饰器干扰） ----------
+
+# ===== eq data 数据收集命令 =====
+
+@data_app.command("a", help="A 股日线（qlib/baostock）")
+def data_a(
+    start: str = typer.Option("2026-01-01", "--start", "-s", help="起始日"),
+    universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all"),
+    workers: int = typer.Option(10, "--workers", "-w", help="并行进程数"),
+):
+    from eq.data.collector import collect_a_share
+    collect_a_share(start=start, universe=universe, workers=workers)
+
+
+@data_app.command("hk", help="港股日线（yfinance）")
+def data_hk(
+    top_n: int = typer.Option(200, "--top", "-n", help="前 N 只"),
+    start: str = typer.Option("2024-01-01", "--start", "-s", help="起始日"),
+):
+    from eq.data.collector import collect_hk_daily
+    collect_hk_daily(top_n=top_n, start=start)
+
+
+@data_app.command("hk-5min", help="港股 5 分钟线（yfinance，最近 30 天）")
+def data_hk_5min(top_n: int = typer.Option(200, "--top", "-n", help="前 N 只")):
+    from eq.data.collector import collect_hk_minute
+    collect_hk_minute(top_n=top_n, interval="5m", period="1mo")
+
+
+@data_app.command("hk-1min", help="港股 1 分钟线（yfinance，最近 7 天）")
+def data_hk_1min(top_n: int = typer.Option(200, "--top", "-n", help="前 N 只")):
+    from eq.data.collector import collect_hk_minute
+    collect_hk_minute(top_n=top_n, interval="1m", period="7d")
+
+
+@data_app.command("us", help="美股日线（yfinance）")
+def data_us(
+    top_n: int = typer.Option(100, "--top", "-n", help="前 N 只"),
+    start: str = typer.Option("2024-01-01", "--start", "-s", help="起始日"),
+):
+    from eq.data.collector import collect_us_daily
+    collect_us_daily(top_n=top_n, start=start)
+
+
+@data_app.command("all", help="全量数据收集（A股+港股日线+5min+1min+美股）")
+def data_all(
+    top_n: int = typer.Option(200, "--top", "-n", help="港股/美股前 N 只"),
+):
+    from eq.data.collector import collect_a_share, collect_hk_daily, collect_hk_minute, collect_us_daily
+    print("\n===== 全量数据收集 =====\n")
+    collect_a_share()
+    collect_hk_daily(top_n=top_n)
+    collect_hk_minute(top_n=top_n, interval="5m", period="2mo")
+    collect_hk_minute(top_n=top_n, interval="1m", period="7d")
+    collect_us_daily(top_n=top_n)
+    print("\n===== 全部完成 =====\n")
+
 
 @app.command("dash", help="启动 Streamlit 仪表盘（本地网页看板）")
 def dash(
