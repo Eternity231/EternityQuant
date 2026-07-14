@@ -216,8 +216,11 @@ def _proc_one_stock(code, start, end, new_days, qlib_feats_dir, expected_floats=
 
     for attempt in range(3):
         if attempt > 0:
-            _t.sleep(1)
+            _t.sleep(2 ** attempt)  # 指数退避 2s, 4s
         try:
+            # 请求间隔，避免被限流
+            if attempt == 0:
+                _t.sleep(0.1)  # 每只股票间隔 100ms
             df = _tencent_daily(code, start, end)
             if df is None or df.empty:
                 if attempt >= 2:
@@ -269,7 +272,7 @@ def update_qlib_data(
     end: str | None = None,
     universe: str = "csi300",
     instruments: list[str] | None = None,
-    workers: int = 10,
+    workers: int = 5,  # 默认 5 进程，避免 API 限流和 CPU 爆满
     verbose: bool = True,
 ) -> dict:
     """把 qlib 本地数据从 start 续到 end（默认今天）。多进程并行拉。

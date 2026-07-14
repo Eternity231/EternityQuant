@@ -877,7 +877,7 @@ def hk_predict(
 def data_a(
     start: str = typer.Option("2026-01-01", "--start", "-s", help="起始日"),
     universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all"),
-    workers: int = typer.Option(10, "--workers", "-w", help="并行进程数"),
+    workers: int = typer.Option(5, "--workers", "-w", help="并行进程数（默认5，过大易被API限流）"),
 ):
     from eq.data.collector import collect_a_share
     collect_a_share(start=start, universe=universe, workers=workers)
