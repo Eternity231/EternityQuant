@@ -371,7 +371,7 @@ def mon_run():
 def mon_channels():
     chs = available_channels()
     if not chs:
-        typer.echo("无可用通道（请配置 ~/.eternityquant/.env）")
+        typer.echo("无可用通道（请配置 .eternityquant/.env）")
         return
     typer.echo("可用推送通道：" + ", ".join(chs))
 

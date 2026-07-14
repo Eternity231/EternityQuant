@@ -24,6 +24,9 @@ build/
 # MCP
 # .mcp.json  # 不忽略 — 团队共享
 
+# 项目级运行时数据（SQLite 状态库 + 缓存 + 模型文件 + 回测结果）
+.eternityquant/
+
 # qlib 本地数据（196MB+，每次 update-data 会增量续期）
 .qlib_data/
 

@@ -13,7 +13,9 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-DEFAULT_HOME = Path.home() / ".eternityquant"
+from eq.core.python_dotenv_loader import PROJECT_ROOT
+
+DEFAULT_HOME = PROJECT_ROOT / ".eternityquant"
 
 _SCHEMA_STATE = """
 CREATE TABLE IF NOT EXISTS watchlist (

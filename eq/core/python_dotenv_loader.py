@@ -1,11 +1,14 @@
-""".env 加载助手（不引入 python-dotenv 重依赖就解决 key=value 解析）。"""
+""".env 加载助手（不引入 python-dotenv 重依赖就解决 key=value 解析）。
+
+PROJECT_ROOT 基准目录，供 db.py/DEFAULT_HOME 等共用。"""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-DEFAULT_ENV = Path.home() / ".eternityquant" / ".env"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_ENV = PROJECT_ROOT / ".eternityquant" / ".env"
 
 
 def load_dotenv_if_present(path: Path | None = None) -> None:

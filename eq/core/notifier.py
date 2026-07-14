@@ -44,7 +44,7 @@ class WeChatWorkBot(Notifier):
         self.webhook = webhook or os.getenv("WECHAT_WORK_WEBHOOK")
         if not self.webhook:
             raise RuntimeError(
-                "WECHAT_WORK_WEBHOOK 未配置：在 ~/.eternityquant/.env 写 WECHAT_WORK_WEBHOOK=https://..."
+                "WECHAT_WORK_WEBHOOK 未配置：在 .eternityquant/.env 写 WECHAT_WORK_WEBHOOK=https://..."
             )
 
     def send(self, title: str, body: str, **kwargs: Any) -> bool:
