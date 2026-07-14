@@ -573,6 +573,9 @@ def ml_train(
     valid_start: str = typer.Option("2020-09-01", "--valid-start", help="验证区间起"),
     valid_end: str = typer.Option("2020-09-25", "--valid-end", help="验证区间止（qlib 数据末日）"),
     device: str = typer.Option("cpu", "--device", "-d", help="cpu | gpu | cuda（LightGBM gpu=OpenCL；PyTorch cuda=真CUDA，3060主场）"),
+    hidden: int = typer.Option(0, "--hidden", help="GRU/LSTM 隐藏层大小，0=自动（GRU=64，搜索结果建议 512）"),
+    layers: int = typer.Option(0, "--layers", help="GRU/LSTM 层数，0=自动（默认 2，搜索结果建议 4）"),
+    batch: int = typer.Option(0, "--batch", "-b", help="batch size，0=自动（默认 4000，搜索结果建议 2000）"),
     name: str = typer.Option("", "--name", "-n", help="模型名，默认自动生成"),
 ):
     # torch DLL 预热（Windows + cu132 坑：qlib 集成链触发 torch 延迟加载 c10.dll 失败，ml 命令才预热）
@@ -586,11 +589,15 @@ def ml_train(
     try:
         if algo in _TORCH_ALGOS:
             # PyTorch 模型默认 cuda（GPU 参数透传给 qlib，cuda → GPU=0）
+            kw = {}
+            if hidden > 0: kw["hidden_size"] = hidden
+            if layers > 0: kw["num_layers"] = layers
+            if batch > 0: kw["batch_size"] = batch
             result = wf_train_torch(
                 universe=universe, horizon=horizon, algo=algo,
                 train_start=train_start, train_end=train_end,
                 valid_start=valid_start, valid_end=valid_end,
-                device=device, name=name or None,
+                device=device, name=name or None, **kw,
             )
         else:
             result = wf_train(

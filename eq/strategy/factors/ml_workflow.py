@@ -442,6 +442,9 @@ def train_torch(
     horizon: int = 5,
     algo: str = "gru",
     device: str = "cuda",  # 默认 cuda（真 CUDA，3060 主场）
+    hidden_size: int = 0,
+    num_layers: int = 0,
+    batch_size: int = 0,
     name: str | None = None,
 ) -> dict[str, Any]:
     """走 qlib PyTorch pipeline 训练 ALSTM/GRU/LSTM/MLP，用 CUDA。
@@ -489,10 +492,14 @@ def train_torch(
         else:
             # 研究结论：GRU > LSTM（S&P 500 84%准确率），浅层 2-3 层最优
             cell = "lstm" if algo == "lstm" else "gru"
+            # 如果 CLI 指定了 hidden/layers/batch 则覆盖默认
+            _hs = hidden_size if hidden_size > 0 else 64
+            _nl = num_layers if num_layers > 0 else 2
+            _bs = batch_size if batch_size > 0 else 4000
             model = _SimpleSeqModel(
                 input_dim=158, seq_len=6, input_size=26,
-                hidden_size=64, num_layers=2, cell_type=cell,
-                lr=1e-3, max_steps=200, batch_size=4000, device=device,
+                hidden_size=_hs, num_layers=_nl, cell_type=cell,
+                lr=1e-3, max_steps=200, batch_size=_bs, device=device,
                 use_scheduler=True,
             )
             notes = f"自写 {cell.upper()} 真集成训练（{device}），ReduceLROnPlateau 动态学习率"

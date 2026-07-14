@@ -29,12 +29,18 @@ def _ensure_dirs() -> None:
 
 
 def _dl_one(code: str, start: str, end: str) -> tuple:
-    """模块级工作函数（multiprocessing 在 Windows spawn 模式必须模块级）。"""
-    try:
-        df = download_hk_stock(code, start, end)
-        return (code, len(df))
-    except:
-        return (code, 0)
+    """模块级工作函数，失败自动重试 3 次（Sina 源限流常见）。"""
+    import time as _t
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                _t.sleep(3 * attempt)  # 退避 3s, 6s
+            df = download_hk_stock(code, start, end)
+            if df is not None and len(df) > 5:
+                return (code, len(df))
+        except:
+            pass
+    return (code, 0)
 
 
 # ========== 第 1 步：数据下载 ==========
