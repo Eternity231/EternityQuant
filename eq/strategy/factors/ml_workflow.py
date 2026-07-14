@@ -674,11 +674,14 @@ def search_lstm(
     from qlib.contrib.data.handler import Alpha158, _DEFAULT_INFER_PROCESSORS
     from qlib.data.dataset import DatasetH
 
-    # handler
+    # handler（支持 csi300/csi500/all）
+    if universe not in ("csi300", "csi500", "all", "csi800"):
+        raise ValueError(f"universe {universe} 暂不支持，可选 csi300/csi500/all")
+    actual_univ = universe if universe != "all" else "csi500"  # all = csi500 + 中证1000
     learn_procs = [{"class": "DropnaLabel"}, {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}}]
     label_expr = [f"Ref($close, -{horizon}) / Ref($close, -1) - 1"]
     handler = Alpha158(
-        instruments=universe,
+        instruments=actual_univ,
         start_time=train_start, end_time=valid_end,
         fit_start_time=train_start, fit_end_time=train_end,
         infer_processors=_DEFAULT_INFER_PROCESSORS,
