@@ -794,8 +794,10 @@ def hk_train(
     top_n: int = typer.Option(100, "--top", "-n", help="前 N 只热门股"),
     horizon: int = typer.Option(5, "--horizon", "-h", help="预测窗口（天）"),
     cell_type: str = typer.Option("gru", "--cell", "-c", help="gru/lstm"),
-    hidden_size: int = typer.Option(64, "--hidden", help="隐藏层大小"),
+    hidden_size: int = typer.Option(128, "--hidden", help="隐藏层大小"),
     num_layers: int = typer.Option(2, "--layers", help="层数"),
+    dropout: float = typer.Option(0.3, "--dropout", help="Dropout 率（量化建议 0.3-0.4）"),
+    walk_forward: bool = typer.Option(True, "--walk-forward/--no-walk", help="Walk-Forward 滚动验证"),
     device: str = typer.Option("cuda", "--device", "-d", help="cuda/cpu"),
     name: str = typer.Option("", "--name", help="模型名"),
 ):
@@ -804,7 +806,8 @@ def hk_train(
         result = train_hk(
             top_n=top_n, horizon=horizon,
             cell_type=cell_type, hidden_size=hidden_size,
-            num_layers=num_layers, device=device,
+            num_layers=num_layers, dropout=dropout,
+            walk_forward=walk_forward, device=device,
             name=name or None,
         )
     except Exception as e:

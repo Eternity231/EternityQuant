@@ -227,16 +227,21 @@ def train_hk(
     start: str | None = None,
     end: str | None = None,
     horizon: int = 5,
-    hidden_size: int = 64,
+    hidden_size: int = 128,
     num_layers: int = 2,
     cell_type: str = "gru",
-    batch_size: int = 2000,
+    batch_size: int = 512,
     max_steps: int = 200,
     device: str = "cuda",
+    dropout: float = 0.3,
+    walk_forward: bool = True,
     name: str | None = None,
     verbose: bool = True,
 ) -> dict:
     """港股 GRU 训练（不走 qlib，自写特征 + _SimpleSeqModel）。
+
+    walk_forward=True 时用滚动前向验证（Walk-Forward Validation），
+    每 60 天滚动一次，模拟实盘。
 
     Returns:
         {"model_id": str, "ic": float, "model_path": str}
@@ -284,16 +289,43 @@ def train_hk(
     if not all_features:
         raise RuntimeError(f"特征计算后无有效样本（{len(symbols)} 只股票）")
 
-    # 切 train/valid
-    X = np.array(all_features, dtype=np.float32)
-    y = np.array(all_labels, dtype=np.float32)
+    # Walk-Forward Validation：滚动 60 天窗口，每滚一次训一次，取平均 IC
+    if walk_forward and len(X) > 240:
+        window = 60  # 验证窗口 60 天
+        step = 30    # 每 30 天滚一次
+        wf_ics = []
+        if verbose:
+            print(f"  Walk-Forward Validation: 窗口={window}天 步长={step}天", flush=True)
+        for wf_start in range(window, len(X) - window, step):
+            wf_train_x = X[:wf_start]
+            wf_train_y = y[:wf_start]
+            wf_valid_x = X[wf_start:wf_start + window]
+            wf_valid_y = y[wf_start:wf_start + window]
+            if len(wf_train_x) < 120 or len(wf_valid_x) < 10:
+                continue
+            wf_model = _SimpleSeqModel(
+                input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
+                hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
+                lr=1e-3, max_steps=100, batch_size=batch_size,
+                device=device, dropout=dropout, use_scheduler=True,
+            )
+            wf_model.fit(wf_train_x, wf_train_y, wf_valid_x, wf_valid_y, early_stop=15)
+            wf_ics.append(float(wf_model.best_score))
+        if wf_ics:
+            avg_ic = sum(wf_ics) / len(wf_ics)
+            if verbose:
+                print(f"  Walk-Forward IC: mean={avg_ic:+.4f}  "
+                      f"min={min(wf_ics):+.4f}  max={max(wf_ics):+.4f}  "
+                      f"({len(wf_ics)} 窗口)", flush=True)
+
+    # 固定切分验证（与 Walk-Forward 对比）
     split = int(len(X) * 0.8)
     x_train, y_train = X[:split], y[:split]
     x_valid, y_valid = X[split:], y[split:]
 
     if verbose:
         print(f"港股数据集：{len(x_train)} 训练 + {len(x_valid)} 验证  "
-              f"（{len(symbols_ok)} 只股票，{len(feat_cols)} 维特征）", flush=True)
+              f"（{len(symbols_ok)} 只股票，{len(feat_cols)} 维特征，dropout={dropout}）", flush=True)
 
     # 训练
     from eq.strategy.factors.ml_workflow import _SimpleSeqModel
@@ -304,7 +336,7 @@ def train_hk(
         input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
         hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
         lr=1e-3, max_steps=max_steps, batch_size=batch_size,
-        device=device, use_scheduler=True,
+        device=device, dropout=dropout, use_scheduler=True,
     )
     model.fit(x_train, y_train, x_valid, y_valid, early_stop=20)
     ic = float(model.best_score)

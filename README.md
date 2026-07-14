@@ -2,6 +2,9 @@
 
 个人散户量化助手 —— 不交易，只提醒和辅助决策。
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](notebooks/colab_eternityquant_train.ipynb)
+[![Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](notebooks/kaggle_eternityquant_train.ipynb)
+
 当前版本 **v0.15**（16 个 commit 全实测固化，35 单元测试）。
 
 ## 当前能力速览
@@ -85,6 +88,25 @@ eq --help                               # 看所有命令
 
 ## ML 因子层
 
+### IC 指标说明
+
+**IC（Information Coefficient，信息系数）** 是量化选股中最核心的因子评价指标，衡量**因子预测值**与**未来真实收益**之间的相关性。
+
+| 指标 | 公式 | 含义 |
+|------|------|------|
+| **Pearson IC** | `corr(pred, actual)` | 预测值与真实收益的线性相关系数。正值越大越好，+0.10 以上即有显著预测力 |
+| **Rank IC** | `corr(rank(pred), rank(actual))` | 秩相关系数（Spearman），更稳健，对异常值不敏感 |
+| **ICIR** | `mean(IC) / std(IC)` | IC 的稳定性指标，衡量因子预测力是否持续，> 0.5 为优秀 |
+| **Rank ICIR** | `mean(Rank IC) / std(Rank IC)` | Rank IC 的稳定性 |
+
+**IC 解读参考：**
+- `IC > 0.10`：因子有实际预测力，可用于选股
+- `IC > 0.15`：因子显著，Alpha 收益可观
+- `IC > 0.20`：因子非常强（量化私募竞赛级）
+- `IC 为负`：因子反向有效（可做反向信号）
+
+> 本框架在训练过程中每步都计算验证集 IC 并打印，训练结束后以最佳 IC 作为模型指标。LightGBM 基线 IC ≈ +0.0985，自写 MLP 可达 +0.1654。
+
 ### 四条训练路径
 
 | algo | device | 说明 | IC（CSI300+Alpha158+5年，2020-09 数据） |
@@ -105,6 +127,39 @@ eq ml update-data --start 2020-09-28 --universe csi300   # baostock 拉 6 年日
 ```
 
 baostock 拉日线 → 转 qlib .bin 格式（float32，按日历顺序）续期 + 日历续期。续完后 `eq ml train` 用最新数据训练，`predict-batch` 出的就是今天的分数。
+
+### Colab / Kaggle 云训练适配
+
+EternityQuant 支持在 **Google Colab** 和 **Kaggle** 的免费 GPU 上训练模型，利用 T4/P100 的 CUDA 加速。
+
+**📍 笔记本地址：**
+
+| 平台 | 笔记本 | GPU | 显存 |
+|------|--------|-----|------|
+| [Colab](https://colab.research.google.com) | [`notebooks/colab_eternityquant_train.ipynb`](notebooks/colab_eternityquant_train.ipynb) | T4 | 16 GB |
+| [Kaggle](https://kaggle.com) | [`notebooks/kaggle_eternityquant_train.ipynb`](notebooks/kaggle_eternityquant_train.ipynb) | T4/P100 | 16 GB |
+
+**云端 vs 本地训练对比：**
+
+| 维度 | 本地（3060 12GB） | Colab（T4 16GB） | Kaggle（T4/P100 16GB） |
+|------|-------------------|------------------|----------------------|
+| GPU | RTX 3060 | Tesla T4 | T4 / P100 |
+| 显存 | 12 GB | 16 GB | 16 GB |
+| CUDA 核心 | 3584 | 2560 | 2560 / 3584 |
+| 训练速度 | 1×（基准） | ~0.9× | ~0.9× / ~1.2× |
+| 使用限制 | 无限制 | 每天有限额 | 每周 30h GPU |
+| 数据持久化 | 本地磁盘 | Google Drive | Kaggle Dataset |
+
+**云训练流程：**
+
+1. **打开笔记本** → Colab 或 Kaggle
+2. **运行环境准备** → 安装依赖 + 克隆代码
+3. **准备数据** → 方案 A：从云存储挂载（推荐）/ 方案 B：在线拉取
+4. **训练模型** → LightGBM / MLP / GRU / LSTM
+5. **导出模型** → 下载 `.pkl` 文件
+6. **回本地导入** → `eq ml register` + `eq ml activate`
+
+**💡 建议：** 在 Colab 中训练 GRU/LSTM，在本地运行 `eq ml predict-batch` 做预测。训练好的模型文件通过 pickle 跨平台兼容。
 
 ### 环坑修复记录
 
