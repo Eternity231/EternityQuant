@@ -62,6 +62,9 @@ app.add_typer(ml_app, name="ml")
 scheduler_app = typer.Typer(help="定时推送服务（cron 表达式 + APScheduler）", no_args_is_help=True)
 app.add_typer(scheduler_app, name="scheduler")
 
+hk_app = typer.Typer(help="港股数据管道（Sina 源）", no_args_is_help=True)
+app.add_typer(hk_app, name="hk")
+
 
 @app.command(help="看个股行情快照（最近一根日线 + 涨跌幅）")
 def watch(
@@ -757,6 +760,66 @@ def sched_daemon():
     except KeyboardInterrupt:
         typer.echo("\n退出中...")
         sched.stop()
+
+
+# ---------- eq hk 子命令 ----------
+
+@hk_app.command("update-data", help="下载热门港股日线数据到本地缓存（Sina 源，200 只约 3 分钟）")
+def hk_update_data(
+    start: str = typer.Option("", "--start", "-s", help="起始日，默认 2 年前"),
+    end: str = typer.Option("", "--end", "-e", help="结束日，默认今天"),
+    top_n: int = typer.Option(200, "--top", "-n", help="前 N 只热门股"),
+    workers: int = typer.Option(3, "--workers", "-w", help="并行数"),
+):
+    from eq.data.hk_market import update_hk_data
+    try:
+        result = update_hk_data(start=start or None, end=end or None, top_n=top_n, workers=workers)
+    except Exception as e:
+        typer.echo(f"港股数据下载失败：{e}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"\n港股数据更新完成：{result['codes']} 只 ✓，缓存目录：{result.get('cache_dir','?')}")
+
+
+@hk_app.command("train", help="港股 GRU 训练（自写特征 ~60 维 + _SimpleSeqModel）")
+def hk_train(
+    top_n: int = typer.Option(100, "--top", "-n", help="前 N 只热门股"),
+    horizon: int = typer.Option(5, "--horizon", "-h", help="预测窗口（天）"),
+    cell_type: str = typer.Option("gru", "--cell", "-c", help="gru/lstm"),
+    hidden_size: int = typer.Option(64, "--hidden", help="隐藏层大小"),
+    num_layers: int = typer.Option(2, "--layers", help="层数"),
+    device: str = typer.Option("cuda", "--device", "-d", help="cuda/cpu"),
+    name: str = typer.Option("", "--name", help="模型名"),
+):
+    from eq.data.hk_market import train_hk
+    try:
+        result = train_hk(
+            top_n=top_n, horizon=horizon,
+            cell_type=cell_type, hidden_size=hidden_size,
+            num_layers=num_layers, device=device,
+            name=name or None,
+        )
+    except Exception as e:
+        typer.echo(f"港股训练失败：{e}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"\n港股训练完成：IC={result['ic']:+.4f}  模型：{result['model_path']}")
+
+
+@hk_app.command("predict", help="用港股模型批量预测 TopN")
+def hk_predict(
+    model_path: str = typer.Argument(help="模型文件路径"),
+    top_n: int = typer.Option(10, "--top", "-n", help="前 N 名"),
+):
+    from eq.data.hk_market import predict_hk_top
+    try:
+        df = predict_hk_top(model_path=model_path, top_n=top_n)
+    except Exception as e:
+        typer.echo(f"港股预测失败：{e}", err=True)
+        raise typer.Exit(1)
+    if df.empty:
+        typer.echo("预测结果为空")
+        return
+    print(f"\n港股预测 Top{top_n}：\n")
+    print(df.to_string(index=False))
 
 
 # ---------- eq dash 命令（放末尾，避免 streamlit 启动逻辑被其他装饰器干扰） ----------
