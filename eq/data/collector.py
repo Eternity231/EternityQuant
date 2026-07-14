@@ -41,13 +41,12 @@ def collect_hk_daily(
     start: str = "2024-01-01",
     end: str | None = None,
 ):
-    """港股日线（yfinance）。"""
-    import yfinance as yf
+    """港股日线（akshare 新浪源，有 VPN 时可用，全历史 2004~2026）。"""
+    import akshare as ak
 
     if end is None:
         end = dt.date.today().isoformat()
     if codes is None:
-        # 默认热门港股列表
         codes = [
             "00700", "09988", "01024", "01810", "09626", "09888", "09999",
             "03690", "01211", "02015", "02318", "02628", "01299", "00005",
@@ -56,29 +55,49 @@ def collect_hk_daily(
 
     out = _HK_DIR / "daily"
     _ensure_dir(out)
+    # 如果已有 yfinance 下载的旧数据，先迁移
+    _migrate_old_yf_data(out)
     ok = 0
     for code in codes[:top_n]:
         path = out / f"{code}.csv"
         if path.exists() and path.stat().st_size > 1000:
-            ok += 1
-            continue
+            # 检查是否已有足够数据（至少 300 行）
+            try:
+                df = pd.read_csv(path, index_col=0, parse_dates=True)
+                if len(df) >= 300:
+                    ok += 1
+                    continue
+            except:
+                pass
         try:
-            yf_code = _fmt_yf_hk(code)
-            df = yf.download(yf_code, start=start, end=end, progress=False)
+            df = ak.stock_hk_daily(symbol=code, adjust="qfq")
             if df.empty:
                 continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df[["Open", "High", "Low", "Close", "Volume"]].rename(
-                columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-            )
+            df = df.rename(columns={"date": "Date"}).set_index("Date")
+            df.index = pd.to_datetime(df.index)
+            df = df.sort_index()
+            df = df[["open", "high", "low", "close", "volume"]]
             df.to_csv(path)
             ok += 1
-            print(f"  ✓ 港股日线 {code}  {len(df)} 行", flush=True)
+            print(f"  ✓ 港股日线 {code}  {len(df)} 行  {df.index[0].date()}~{df.index[-1].date()}", flush=True)
         except Exception as e:
             print(f"  ✗ 港股日线 {code}  {str(e)[:50]}", flush=True)
-        time.sleep(0.3)
+        time.sleep(0.5)
     print(f"  港股日线完成: {ok}/{min(top_n, len(codes))}")
+
+
+def _migrate_old_yf_data(out: Path):
+    """如果旧的 yfinance 数据在 daily/ 下是空文件，删除重下。"""
+    import shutil
+    # 检查是否有旧版 features/ 目录数据
+    old_dir = out.parent / "features"
+    if old_dir.exists():
+        # 把旧数据移到 daily/
+        for f in old_dir.glob("*.csv"):
+            new_path = out / f.name
+            if not new_path.exists():
+                shutil.copy2(f, new_path)
+                print(f"  → 迁移旧数据 {f.name}", flush=True)
 
 
 def collect_hk_minute(
