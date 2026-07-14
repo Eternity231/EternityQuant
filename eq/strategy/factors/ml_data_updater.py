@@ -237,10 +237,9 @@ def update_qlib_data(
         # 分批：每批 workers 个代码，每个子进程跑一批
         batch_size = max(1, workers)
         batches = [instruments[i:i + batch_size] for i in range(0, total, batch_size)]
-        # 计算预期 float32 个数 = 现有日历行数 + new_days 数
-    base_floats = len(existing_cal) + len(new_cal_days)
-    expected_floats_val = base_floats + len(new_days)
-    batch_args = [(b, start, end, tuple(new_days), str(feats_dir), expected_floats_val) for b in batches]
+        # 预期 float32 个数 = 原始日历行数 + new_days（.bin 文件应含全部日历日的 float）
+        expected_floats_val = len(existing_cal) + len(new_days)
+        batch_args = [(b, start, end, tuple(new_days), str(feats_dir), expected_floats_val) for b in batches]
 
         _t0 = _time.time()
         done = _mp.Value("i", 0)
