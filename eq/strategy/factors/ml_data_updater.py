@@ -88,14 +88,13 @@ def _tencent_instruments(universe: str = "csi300") -> list[str]:
     if code_file.exists():
         return [c.strip() for c in code_file.read_text().strip().split(",") if c.strip()]
 
-    # 尝试从新浪获取
+    # 尝试从新浪/东财获取
     try:
         import akshare as ak
         name_map = {"csi300": "沪深300", "csi500": "中证500", "sz50": "上证50"}
         if universe in name_map:
             df = ak.index_stock_cons(symbol=name_map[universe])
             if df is not None and not df.empty:
-                # 取代码列，转 qlib 格式
                 codes = []
                 for c in df.iloc[:, 0].tolist():
                     c = str(c).strip()
@@ -104,7 +103,29 @@ def _tencent_instruments(universe: str = "csi300") -> list[str]:
                     elif c.startswith(("0", "3")):
                         codes.append(f"SZ{c}")
                 if codes:
-                    # 缓存到本地
+                    code_file.parent.mkdir(parents=True, exist_ok=True)
+                    code_file.write_text(",".join(codes))
+                    return codes
+        elif universe == "all":
+            # 全A股：从 akshare 实时行情获取所有股票代码
+            df = ak.stock_zh_a_spot()
+            if df is not None and not df.empty:
+                codes = []
+                for c in df["代码"].tolist():
+                    c = str(c).strip()
+                    if c.startswith("bj"):
+                        codes.append(f"BJ{c[2:]}")
+                    elif c.startswith(("sh", "SH")):
+                        codes.append(f"SH{c[2:]}")
+                    elif c.startswith(("sz", "SZ")):
+                        codes.append(f"SZ{c[2:]}")
+                    elif c.startswith("6"):
+                        codes.append(f"SH{c}")
+                    elif c.startswith(("0", "3")):
+                        codes.append(f"SZ{c}")
+                    elif c.startswith(("4", "8")):
+                        codes.append(f"BJ{c}")
+                if codes:
                     code_file.parent.mkdir(parents=True, exist_ok=True)
                     code_file.write_text(",".join(codes))
                     return codes
@@ -281,46 +302,52 @@ def update_qlib_data(
     if verbose:
         print(f"成分股 {len(instruments)} 只（universe={universe}），{workers} 进程并行", flush=True)
 
-    # 多进程并行拉
+    # 多进程并行拉（带超时，防止卡死）
     feats_dir = _QLIB_DATA_DIR / "features"
     feats_dir.mkdir(parents=True, exist_ok=True)
     total = len(instruments)
     import time as _time
-    import multiprocessing as _mp
-
-    batch_size = max(1, workers)
-    batches = [instruments[i:i + batch_size] for i in range(0, total, batch_size)]
-    expected_floats_val = len(new_days)
-    batch_args = [(b, start, end, tuple(new_days), str(feats_dir), expected_floats_val) for b in batches]
+    import concurrent.futures as _cf
 
     _t0 = _time.time()
-    done = _mp.Value("i", 0)
-    ok = _mp.Value("i", 0)
-    fail = _mp.Value("i", 0)
-    done_count = [0]
+    ok_count = 0
+    fail_count = 0
+    done_count = 0
+    # 每只股票单独提交任务，每任务超时 30 秒
+    timeout_per_stock = 30
 
-    with _mp.Pool(processes=workers) as pool:
-        results = pool.imap_unordered(_proc_batch, batch_args)
-        for ok_cnt, fail_cnt in results:
-            done_count[0] += 1
-            with ok.get_lock():
-                ok.value += ok_cnt
-                fail.value += fail_cnt
-                done.value = ok.value + fail.value
-            if verbose:
+    with _cf.ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        for code in instruments:
+            args = ([code], start, end, tuple(new_days), str(feats_dir), len(new_days))
+            fut = executor.submit(_proc_batch, args)
+            futures[fut] = code
+
+        for fut in _cf.as_completed(futures, timeout=3600):
+            code = futures[fut]
+            done_count += 1
+            try:
+                ok_cnt, fail_cnt = fut.result(timeout=5)
+                ok_count += ok_cnt
+                fail_count += fail_cnt
+            except Exception:
+                fail_count += 1
+                if verbose:
+                    print(f"\n  ✗ {code} 超时或失败", flush=True)
+            
+            if verbose and (done_count % 50 == 0 or done_count == total):
                 _elapsed = _time.time() - _t0
-                _pct = min(done.value / total * 100, 100.0)
-                _speed = done.value / _elapsed if _elapsed > 0 else 0
-                _eta = (total - done.value) / _speed if _speed > 0 else 0
-                print(f"\r  进度 {_pct:5.1f}%  ({done.value}/{total})  ✓{ok.value} ✗{fail.value}  已用 {_elapsed:.0f}s  ETA {_eta:.0f}s", end="", flush=True)
+                _pct = min(done_count / total * 100, 100.0)
+                _speed = done_count / _elapsed if _elapsed > 0 else 0
+                print(f"\r  进度 {_pct:5.1f}%  ({done_count}/{total})  ✓{ok_count} ✗{fail_count}  已用 {_elapsed:.0f}s", end="", flush=True)
 
     if verbose:
         _total_elapsed = _time.time() - _t0
-        print(f"\n完成：{ok.value} 只票 ✓，{fail.value} 只失败 ✗  × {len(_FEATURES)} 特征 × {len(new_days)} 日  ({_total_elapsed:.0f}s)", flush=True)
+        print(f"\n完成：{ok_count} 只票 ✓，{fail_count} 只失败 ✗  × {len(_FEATURES)} 特征 × {len(new_days)} 日  ({_total_elapsed:.0f}s)", flush=True)
 
     return {
         "days_added": len(new_cal_days),
-        "instruments_updated": ok.value,
+        "instruments_updated": ok_count,
         "features_per_inst": len(_FEATURES),
         "trading_days": len(new_days),
     }
