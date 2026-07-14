@@ -692,12 +692,15 @@ def search_lstm(
     valid_end: str = "2020-09-25",
     device: str = "cuda",
     fast: bool = True,
+    auto_train: bool = False,
 ) -> list[dict]:
-    """网格搜索 LSTM 超参，每组合跑短训练（max_steps=50），返回按 IC 排序的结果。
+    """网格搜索 LSTM/GRU 超参，每组合跑短训练（max_steps=50）。
+    
+    auto_train=True 时，搜索完成后自动用最佳参数全量训练并激活。
 
     Returns:
         [{"hidden_size":128, "num_layers":2, "lr":0.001, "batch_size":2000,
-          "ic":0.12, "epochs":23, "model_id":"..."}, ...]
+          "ic":0.12, "epochs":23}, ...]
     """
     _qlib_init()
     from qlib.contrib.data.handler import Alpha158, _DEFAULT_INFER_PROCESSORS
@@ -765,4 +768,25 @@ def search_lstm(
         print(f"  #{i+1}: hidden={r['hidden_size']} layers={r['num_layers']} "
               f"lr={r['lr']} batch={r['batch_size']}  IC={r['ic']:+.4f}")
     print(f"{'='*60}\n")
+
+    if auto_train and results:
+        best = results[0]
+        hs, nl, lr, bs = best["hidden_size"], best["num_layers"], best["lr"], best["batch_size"]
+        print(f"自动训练最佳参数: hidden={hs} layers={nl} lr={lr} batch={bs}\n", flush=True)
+        model = _SimpleSeqModel(
+            input_dim=158, seq_len=6, input_size=26,
+            hidden_size=hs, num_layers=nl, cell_type="gru",
+            lr=lr, max_steps=200, batch_size=bs, device=device,
+            use_scheduler=True,
+        )
+        train_data = dataset.prepare("train", col_set=["feature", "label"])
+        valid_data = dataset.prepare("valid", col_set=["feature", "label"])
+        x_tr, y_tr = train_data["feature"], train_data["label"]
+        x_va, y_va = valid_data["feature"], valid_data["label"]
+        if hasattr(y_tr, "values"): y_tr = y_tr.squeeze() if y_tr.ndim > 1 else y_tr
+        if hasattr(y_va, "values"): y_va = y_va.squeeze() if y_va.ndim > 1 else y_va
+        model.fit(x_tr, y_tr, x_va, y_va, early_stop=20)
+        ic_full = float(model.best_score)
+        print(f"\n全量训练完成: IC={ic_full:+.4f} (搜索阶段 IC={best['ic']:+.4f})", flush=True)
+
     return results
