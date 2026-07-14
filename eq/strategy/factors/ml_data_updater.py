@@ -197,6 +197,7 @@ def update_qlib_data(
 
         # 续日历文件
         cal_path = _QLIB_DATA_DIR / "calendars" / "day.txt"
+        cal_path.parent.mkdir(parents=True, exist_ok=True)
         existing_cal = cal_path.read_text().strip().split("\n") if cal_path.exists() else []
         new_cal_days = [d for d in new_days if d not in existing_cal]
         with open(cal_path, "a") as f:
