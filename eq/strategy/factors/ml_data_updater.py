@@ -48,13 +48,18 @@ def _tencent_daily(code: str, start: str, end: str) -> pd.DataFrame | None:
     try:
         url = f"{_TENCENT_KLINE}?param={tcode},day,{start},{end},640,qfq"
         resp = _req.get(url, timeout=15)
+        if resp.status_code != 200:
+            print(f"  [DEBUG] {code} HTTP {resp.status_code}", flush=True)
+            return None
         data = resp.json()
         if data.get("code") != 0:
+            print(f"  [DEBUG] {code} 腾讯返回错误: code={data.get('code')}, msg={data.get('msg','')}", flush=True)
             return None
         # 腾讯返回 "qfqday"（前复权）或 "day"（不复权）
         stock_data = data.get("data", {}).get(tcode, {})
         bars = stock_data.get("qfqday") or stock_data.get("day")
         if not bars:
+            print(f"  [DEBUG] {code} 腾讯返回空数据, keys={list(stock_data.keys()) if stock_data else 'no data'}", flush=True)
             return None
         # bars: [["date", "open", "close", "high", "low", "volume"], ...]
         rows = []
@@ -74,7 +79,8 @@ def _tencent_daily(code: str, start: str, end: str) -> pd.DataFrame | None:
         df.index = pd.to_datetime(df.index)
         df = df.sort_index()
         return df
-    except Exception:
+    except Exception as e:
+        print(f"  [DEBUG] {code} 异常: {e}", flush=True)
         return None
 
 
@@ -214,6 +220,8 @@ def _proc_one_stock(code, start, end, new_days, qlib_feats_dir, expected_floats=
         try:
             df = _tencent_daily(code, start, end)
             if df is None or df.empty:
+                if attempt >= 2:
+                    print(f"  [DEBUG] {code} 第{attempt+1}次尝试无数据", flush=True)
                 return False
             # 按交易日对齐
             df = df.reindex(pd.to_datetime(days_list))
@@ -225,8 +233,9 @@ def _proc_one_stock(code, start, end, new_days, qlib_feats_dir, expected_floats=
                 vals = [float("nan") if v != v or v is None else v for v in vals]
                 _append_bin(inst_dir / f"{feat}.day.bin", vals)
             return True
-        except Exception:
+        except Exception as e:
             if attempt >= 2:
+                print(f"  [DEBUG] {code} 第{attempt+1}次异常: {e}", flush=True)
                 return False
     return False
 
