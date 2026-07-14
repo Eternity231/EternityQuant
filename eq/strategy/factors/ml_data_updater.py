@@ -57,7 +57,7 @@ def _proc_one_stock(bs_mod, code, start, end, new_days, qlib_feats_dir, expected
     elif code.startswith("SZ"): bs_code = f"sz.{code[2:]}"
     else: return False
     rs = bs_mod.query_history_k_data_plus(bs_code, "date,open,high,low,close,volume,preclose,adjustflag,turn", start_date=start, end_date=end, frequency="d", adjustflag="2")
-    if rs.error_code != "0": return False
+    if rs.error_code != "0": raise RuntimeError(f"baostock error: {rs.error_msg}")
     rows_list = []
     while rs.next(): rows_list.append(rs.get_row_data())
     if not rows_list: return False
@@ -83,7 +83,6 @@ def _proc_batch(args):
     try:
         for code in codes:
             for attempt in range(5):
-                if attempt > 0: _t.sleep(2 ** attempt)
                 try:
                     if _proc_one_stock(_bs, code, start, end, new_days, qlib_feats_dir, expected_floats):
                         ok += 1
@@ -94,9 +93,11 @@ def _proc_batch(args):
                     if attempt >= 4:
                         fail += 1
                         break
+                    print(f"  ⇢ 断线重连（{code} attempt {attempt+1}/5）", end="", flush=True)
                     try: _bs.logout()
                     except: pass
                     _bs.login()
+                    _t.sleep(2 ** attempt)
     finally:
         try: _bs.logout()
         except: pass
@@ -212,7 +213,7 @@ def update_qlib_data(
         batch_size = max(1, workers)
         batches = [instruments[i:i + batch_size] for i in range(0, total, batch_size)]
         # 预期 float32 个数 = 原始日历行数 + new_days（.bin 文件应含全部日历日的 float）
-        expected_floats_val = len(existing_cal) + len(new_days)
+        expected_floats_val = len(existing_cal) + len(new_cal_days)
         batch_args = [(b, start, end, tuple(new_days), str(feats_dir), expected_floats_val) for b in batches]
 
         _t0 = _time.time()
