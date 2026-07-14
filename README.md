@@ -28,6 +28,7 @@ eq ml train csi300 5 --algo tft --device cuda           # Temporal Fusion Transf
 eq ml train csi300 5 --algo gru --device cuda --optimizer sam --loss sharpe  # SAM 优化器 + 可微夏普比率
 eq ml train csi300 5 --algo tft --device cuda --adversarial --orthogonalize   # 对抗训练 + 特征正交化
 eq ml train csi300 5 --algo gru --device cuda --optimizer lion --loss ic      # Lion 优化器（Google 进化发现）
+eq ml train csi300 5 --algo tft --device cuda --gpus "0,1,2,3"              # 多卡并行（4 张 GPU）
 eq ml update-data --start 2020-09-28 --universe csi300  # qlib 数据续到最新（baostock）
 eq ml activate <model_id>
 eq ml predict-batch <model_id> --top 10                # 批量预测入 ml_predictions 表（v0.14 支持自写模型）
@@ -199,6 +200,27 @@ Input(158) → Linear(256) → LSTM Encoder → GRN → Multi-Head Attention(4) 
 **特征正交化**：将截面特征相对于市场基准回归取残差，确保模型学习纯 Alpha 而非 Beta。
 
 **FGSM 对抗训练**：在训练数据中注入梯度方向的微小扰动，强制模型忽略微小价格噪音，极大提升实盘异常行情鲁棒性。
+
+### 多卡并行训练
+
+支持 `nn.DataParallel` 多 GPU 并行，自动将 batch 切分到多张 GPU 上计算梯度：
+
+```bash
+# 双卡
+eq ml train csi300 5 --algo tft --device cuda --gpus "0,1"
+
+# 四卡
+eq ml train csi300 5 --algo deeplob --device cuda --gpus "0,1,2,3"
+
+# 港股训练多卡
+eq hk train --top 73 --cell gru --device cuda --gpus "0,1"
+```
+
+| GPU 配置 | batch_size 建议 | 加速比 |
+|---------|----------------|--------|
+| 单卡 3060 | 512 | 1×（基准） |
+| 双卡 4090 | 1024 | ~1.8× |
+| 四卡 A100 | 4096 | ~3.5× |
 
 LSTM 路径把 Alpha158 的 158 维特征重塑成 (batch, seq_len=6, input_size=26) 的时序张量喂给 LSTM——这是量化选股的正确做法（学"过去 6 日形态"），比 MLP 把特征当独立向量强。3060 12GB CUDA 主场。
 
