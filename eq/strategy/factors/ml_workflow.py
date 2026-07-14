@@ -693,6 +693,7 @@ def search_lstm(
     device: str = "cuda",
     fast: bool = True,
     auto_train: bool = False,
+    algo: str = "gru",
 ) -> list[dict]:
     """网格搜索 LSTM/GRU 超参，每组合跑短训练（max_steps=50）。
     
@@ -736,10 +737,11 @@ def search_lstm(
                     early_stop = 10 if fast else 20
                     print(f"[{idx}/{total}] hidden={hidden_size} layers={num_layers} lr={lr} batch={batch_size}", flush=True)
                     try:
+                        cell = "lstm" if algo == "lstm" else "gru"
                         model = _SimpleSeqModel(
                             input_dim=158, seq_len=6, input_size=26,
                             hidden_size=hidden_size, num_layers=num_layers,
-                            cell_type="gru",
+                            cell_type=cell,
                             lr=lr, max_steps=max_steps, batch_size=batch_size,
                             device=device, use_scheduler=True,
                         )
@@ -775,7 +777,7 @@ def search_lstm(
         print(f"自动训练最佳参数: hidden={hs} layers={nl} lr={lr} batch={bs}\n", flush=True)
         model = _SimpleSeqModel(
             input_dim=158, seq_len=6, input_size=26,
-            hidden_size=hs, num_layers=nl, cell_type="gru",
+            hidden_size=hs, num_layers=nl, cell_type="lstm" if algo == "lstm" else "gru",
             lr=lr, max_steps=200, batch_size=bs, device=device,
             use_scheduler=True,
         )

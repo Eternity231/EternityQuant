@@ -657,13 +657,14 @@ def ml_update_data(
 def ml_search(
     universe: str = typer.Argument("csi300", help="标的池 csi300/csi500/all"),
     horizon: int = typer.Argument(5, help="预测窗口（天）"),
+    algo: str = typer.Option("gru", "--algo", "-a", help="gru | lstm"),
     fast: bool = typer.Option(True, "--fast/--full", help="快速模式 max_steps=50 还是完整模式 200"),
-    auto: bool = typer.Option(False, "--auto", "-a", help="搜索后自动用最佳参数全量训练"),
+    auto: bool = typer.Option(False, "--auto", help="搜索后自动用最佳参数全量训练（注意 -a 可能是 --algo）"),
     device: str = typer.Option("cuda", "--device", "-d", help="cuda/cpu"),
 ):
     from eq.strategy.factors.ml_workflow import search_lstm
     try:
-        results = search_lstm(universe=universe, horizon=horizon, fast=fast, device=device, auto_train=auto)
+        results = search_lstm(universe=universe, horizon=horizon, fast=fast, device=device, auto_train=auto, algo=algo)
         if not results:
             typer.echo("无有效结果")
             raise typer.Exit(1)
