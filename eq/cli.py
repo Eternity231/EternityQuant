@@ -572,7 +572,7 @@ def ml_train(
     train_end: str = typer.Option("2020-08-31", "--train-end", help="训练区间止"),
     valid_start: str = typer.Option("2020-09-01", "--valid-start", help="验证区间起"),
     valid_end: str = typer.Option("2020-09-25", "--valid-end", help="验证区间止（qlib 数据末日）"),
-    device: str = typer.Option("cpu", "--device", "-d", help="cpu | gpu | cuda（LightGBM gpu=OpenCL；PyTorch cuda=真CUDA，3060主场）"),
+    device: str = typer.Option("cpu", "--device", "-d", help="cpu | gpu | cuda（LightGBM gpu=OpenCL；PyTorch cuda=真CUDA，CUDA GPU主场）"),
     hidden: int = typer.Option(0, "--hidden", help="RNN/Transformer 隐藏层大小，0=自动（GRU=64, DeepLOB=64, TFT=256）"),
     layers: int = typer.Option(0, "--layers", help="RNN 层数，0=自动（默认 2）"),
     batch: int = typer.Option(0, "--batch", "-b", help="batch size，0=自动（默认 4000，DeepLOB 建议 512，TFT 建议 256）"),

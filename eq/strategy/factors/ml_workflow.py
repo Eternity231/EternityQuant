@@ -161,7 +161,7 @@ def train(
     return {"model_id": model_id, "metrics": {"ic": ic}, "model_path": str(model_path)}
 
 
-# ---------- qlib PyTorch 模型（走 CUDA，3060 主场） ----------
+# ---------- qlib PyTorch 模型（走 CUDA，CUDA GPU 主场） ----------
 
 _TORCH_ALGOS = {"alstm", "gru", "lstm", "mlp", "deeplob", "tft"}
 
@@ -441,7 +441,7 @@ def train_torch(
     valid_end: str = "2020-09-25",
     horizon: int = 5,
     algo: str = "gru",
-    device: str = "cuda",  # 默认 cuda（真 CUDA，3060 主场）
+    device: str = "cuda",  # 默认 cuda（真 CUDA，CUDA GPU 主场）
     hidden_size: int = 0,
     num_layers: int = 0,
     batch_size: int = 0,
