@@ -37,7 +37,7 @@ def _worker_finish():
     _bs.logout()
 
 
-def _proc_one_stock(code: str, start: str, end: str, new_days: tuple, qlib_feats_dir: str) -> bool:
+def _proc_one_stock(code: str, start: str, end: str, new_days: tuple, qlib_feats_dir: str, expected_floats: int = 0) -> bool:
     """子进程内处理一只票。失败自动重试最多 3 次（baostock 限流常见）。
 
     返回 True=成功 False=失败（停牌或异常）。
@@ -50,16 +50,18 @@ def _proc_one_stock(code: str, start: str, end: str, new_days: tuple, qlib_feats
     inst_dir = Path(qlib_feats_dir) / code.lower()
     inst_dir.mkdir(parents=True, exist_ok=True)
 
-    # 去重检查：close.day.bin 如果已存在且大小 >= 原日历（4943）+ 新日历 的大小，
-    # 说明这票已经续过了，跳过
+    # 断点续传检查：若已完整下载则跳过，不完整则清空重写（崩溃恢复）
     days_list = list(new_days)
     close_bin = inst_dir / "close.day.bin"
-    if close_bin.exists():
-        exist_floats = close_bin.stat().st_size // 4
-        # 现有日历行数 = 原始 ~4943 + new_days 不重复部分
-        # 如果 exist_floats 明显大于原始日历（>5000），说明已续过
-        if exist_floats > 5000 and exist_floats >= len(days_list) + 4500:
-            return True  # 已续过，跳过
+    if close_bin.exists() and expected_floats > 0:
+        actual = close_bin.stat().st_size // 4
+        if actual >= expected_floats:
+            return True
+        # 不完整（崩溃/断点）：清空重写
+        for feat in _FEATURES:
+            bp = inst_dir / f"{feat}.day.bin"
+            if bp.exists():
+                bp.unlink()
 
     # qlib SH600000 → baostock sh.600000
     if code.startswith("SH"):
@@ -69,18 +71,17 @@ def _proc_one_stock(code: str, start: str, end: str, new_days: tuple, qlib_feats
     else:
         return False
 
-    for attempt in range(3):
+    for attempt in range(5):  # 指数退避
         try:
             if attempt > 0:
-                _time.sleep(2 * attempt)  # 退避：2s, 4s
+                _time.sleep(2 ** attempt)  # 退避：2/4/8/16/32s
             rs = _bs.query_history_k_data_plus(
                 bs_code, "date,open,high,low,close,volume,preclose,adjustflag,turn",
                 start_date=start, end_date=end, frequency="d", adjustflag="2",
             )
             if rs.error_code != "0":
-                if attempt < 2:
-                    continue
-                return False
+                if attempt >= 4:
+                    return False
             rows_list = []
             while rs.next():
                 rows_list.append(rs.get_row_data())
@@ -114,11 +115,11 @@ def _proc_batch(args: tuple) -> tuple:
     
     args: (codes, start, end, new_days, feats_dir_str)
     """
-    codes, start, end, new_days, feats_dir_str = args
+    codes, start, end, new_days, feats_dir_str, expected_floats = args
     _worker_init()
     ok = fail = 0
     for code in codes:
-        if _proc_one_stock(code, start, end, new_days, feats_dir_str):
+        if _proc_one_stock(code, start, end, new_days, feats_dir_str, expected_floats=expected_floats):
             ok += 1
         else:
             fail += 1
@@ -236,7 +237,10 @@ def update_qlib_data(
         # 分批：每批 workers 个代码，每个子进程跑一批
         batch_size = max(1, workers)
         batches = [instruments[i:i + batch_size] for i in range(0, total, batch_size)]
-        batch_args = [(b, start, end, tuple(new_days), str(feats_dir)) for b in batches]
+        # 计算预期 float32 个数 = 现有日历行数 + new_days 数
+    base_floats = len(existing_cal) + len(new_cal_days)
+    expected_floats_val = base_floats + len(new_days)
+    batch_args = [(b, start, end, tuple(new_days), str(feats_dir), expected_floats_val) for b in batches]
 
         _t0 = _time.time()
         done = _mp.Value("i", 0)
