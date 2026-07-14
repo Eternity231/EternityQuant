@@ -585,6 +585,7 @@ def ml_train(
     orthogonalize: bool = typer.Option(False, "--orthogonalize/--no-orth", help="特征正交化去 Beta"),
     seq_len: int = typer.Option(0, "--seq-len", help="DeepLOB/TFT 输入窗口，0=自动（DeepLOB=120, TFT=60）"),
     heads: int = typer.Option(4, "--heads", help="TFT 注意力头数"),
+    gpus: str = typer.Option("", "--gpus", help="多卡并行GPU ID，如 '0,1,2,3'（默认单卡）"),
 ):
     # torch DLL 预热（Windows + cu132 坑：qlib 集成链触发 torch 延迟加载 c10.dll 失败，ml 命令才预热）
     try:
@@ -611,7 +612,8 @@ def ml_train(
                 device=device, name=name or None,
                 optimizer=optimizer, loss_type=loss,
                 dropout=dropout, adversarial=adversarial,
-                orthogonalize=orthogonalize, **kw,
+                orthogonalize=orthogonalize,
+                gpu_ids=gpus if gpus else None, **kw,
             )
         elif algo in _TORCH_ALGOS:
             # PyTorch 模型默认 cuda（GPU 参数透传给 qlib，cuda → GPU=0）
@@ -623,7 +625,8 @@ def ml_train(
                 universe=universe, horizon=horizon, algo=algo,
                 train_start=train_start, train_end=train_end,
                 valid_start=valid_start, valid_end=valid_end,
-                device=device, name=name or None, **kw,
+                device=device, name=name or None,
+                gpu_ids=gpus if gpus else None, **kw,
             )
         else:
             result = wf_train(
@@ -826,6 +829,7 @@ def hk_train(
     walk_forward: bool = typer.Option(True, "--walk-forward/--no-walk", help="Walk-Forward 滚动验证"),
     device: str = typer.Option("cuda", "--device", "-d", help="cuda/cpu"),
     name: str = typer.Option("", "--name", help="模型名"),
+    gpus: str = typer.Option("", "--gpus", help="多卡并行GPU ID，如 '0,1,2,3'（默认单卡）"),
 ):
     from eq.data.hk_market import train_hk
     try:
@@ -835,6 +839,7 @@ def hk_train(
             num_layers=num_layers, dropout=dropout,
             walk_forward=walk_forward, device=device,
             name=name or None,
+            gpu_ids=gpus if gpus else None,
         )
     except Exception as e:
         typer.echo(f"港股训练失败：{e}", err=True)

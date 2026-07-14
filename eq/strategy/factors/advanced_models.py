@@ -809,6 +809,7 @@ class AdvancedTrainer:
         orthogonalize: bool = False,
         use_scheduler: bool = True,
         device: str = "cuda",
+        gpu_ids: str | list[int] | None = None,  # 多卡: "0,1,2,3" 或 [0,1,2,3]
         verbose: bool = True,
     ):
         self.model = model
@@ -823,10 +824,24 @@ class AdvancedTrainer:
         self.adversarial_alpha = adversarial_alpha
         self.orthogonalize = orthogonalize
         self.use_scheduler = use_scheduler
-        self.device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
         self.verbose = verbose
 
-        self.model.to(self.device)
+        # ---- 多卡并行 ----
+        if gpu_ids is not None:
+            if isinstance(gpu_ids, str):
+                gpu_ids = [int(x) for x in gpu_ids.strip().split(",") if x.strip()]
+            self.gpu_ids = list(gpu_ids) if isinstance(gpu_ids, (list, tuple)) else [gpu_ids]
+            # device 取主卡
+            self.device = torch.device(f"cuda:{self.gpu_ids[0]}" if torch.cuda.is_available() else "cpu")
+            self.model.to(self.device)
+            if len(self.gpu_ids) > 1:
+                self.model = nn.DataParallel(self.model, device_ids=self.gpu_ids)
+                if self.verbose:
+                    print(f"  [多卡并行] {len(self.gpu_ids)} 张 GPU: {self.gpu_ids}", flush=True)
+        else:
+            self.gpu_ids = None
+            self.device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
+            self.model.to(self.device)
 
         # 损失函数
         if loss_type == "sharpe":
@@ -854,6 +869,18 @@ class AdvancedTrainer:
         self.best_score = -float("inf")
         self.best_state = None
         self.best_step = 0
+
+    # ---- 多卡辅助 ----
+    @property
+    def _raw_model(self) -> nn.Module:
+        """获取原始模型（去掉 DataParallel 包装）。"""
+        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+    def _raw_state_dict(self):
+        return self._raw_model.state_dict()
+
+    def _load_raw_state_dict(self, state_dict):
+        self._raw_model.load_state_dict(state_dict)
 
     def _get_base_optimizer(self):
         """获取基础优化器（SAM/Lookahead 内部包装的优化器）。"""
@@ -1022,7 +1049,7 @@ class AdvancedTrainer:
                 self.best_score = score
                 self.best_step = step
                 self.best_state = {
-                    k: v.clone() for k, v in self.model.state_dict().items()
+                    k: v.clone() for k, v in self._raw_state_dict().items()
                 }
                 stop = 0
             else:
@@ -1032,7 +1059,7 @@ class AdvancedTrainer:
 
         # 恢复最佳权重
         if self.best_state is not None:
-            self.model.load_state_dict(self.best_state)
+            self._load_raw_state_dict(self.best_state)
 
         if self.verbose:
             print(f"  [训练完成] best IC={self.best_score:+.4f} @step {self.best_step} "
@@ -1046,10 +1073,10 @@ class AdvancedTrainer:
 
     def predict(self, x) -> np.ndarray:
         """预测。"""
-        self.model.eval()
+        self._raw_model.eval()
         with torch.no_grad():
             xt = self._to_tensor(x).to(self.device)
             if self.orthogonalize:
                 xt = feature_orthogonalize_tensor(xt)
-            pred = self.model(xt)
+            pred = self._raw_model(xt)
             return pred.cpu().numpy()

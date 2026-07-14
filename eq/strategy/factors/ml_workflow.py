@@ -454,6 +454,7 @@ def train_torch(
     orthogonalize: bool = False,
     seq_len: int = 0,
     num_heads: int = 4,
+    gpu_ids: str | list[int] | None = None,  # 多卡并行
 ) -> dict[str, Any]:
     """走 qlib PyTorch pipeline 训练 ALSTM/GRU/LSTM/MLP/DeepLOB/TFT，用 CUDA。
 
@@ -546,6 +547,7 @@ def train_torch(
             orthogonalize=orthogonalize,
             use_scheduler=True,
             device=device,
+            gpu_ids=gpu_ids,
             verbose=True,
         )
         result = trainer.fit(x_train, y_train, x_valid, y_valid)

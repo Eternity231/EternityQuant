@@ -243,6 +243,7 @@ def train_hk(
     walk_forward: bool = True,
     name: str | None = None,
     verbose: bool = True,
+    gpu_ids: str | list[int] | None = None,  # 多卡并行
 ) -> dict:
     """港股 GRU 训练（不走 qlib，自写特征 + _SimpleSeqModel）。
 
