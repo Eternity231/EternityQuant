@@ -28,6 +28,15 @@ def _ensure_dirs() -> None:
     _HK_MODELS_DIR.mkdir(exist_ok=True)
 
 
+def _dl_one(code: str, start: str, end: str) -> tuple:
+    """模块级工作函数（multiprocessing 在 Windows spawn 模式必须模块级）。"""
+    try:
+        df = download_hk_stock(code, start, end)
+        return (code, len(df))
+    except:
+        return (code, 0)
+
+
 # ========== 第 1 步：数据下载 ==========
 
 def list_hk_stocks(limit: int = 200) -> list[str]:
@@ -93,17 +102,10 @@ def update_hk_data(
 
     import time as _t, multiprocessing as _mp
 
-    def _dl_one(code):
-        try:
-            df = download_hk_stock(code, start, end)
-            return (code, len(df))
-        except:
-            return (code, 0)
-
     _t0 = _t.time()
     ok = 0
     with _mp.Pool(processes=workers) as pool:
-        results = pool.map(_dl_one, codes)
+        results = pool.starmap(_dl_one, [(code, start, end) for code in codes])
         total_days = 0
         for i, (code, days) in enumerate(results):
             if days > 0:
