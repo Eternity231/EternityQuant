@@ -82,12 +82,20 @@ def _proc_batch(args):
     ok = fail = 0
     try:
         for code in codes:
+            # 先尝试断点续传（expected_floats > 0 时不 query，只检查 .bin 大小）
+            if expected_floats > 0 and _proc_one_stock(_bs, code, start, end, new_days, qlib_feats_dir, expected_floats):
+                ok += 1  # 跳过：已有完整数据
+                continue
+            # 需要真下载
+            downloaded = False
             for attempt in range(5):
+                if attempt > 0: _t.sleep(2 ** attempt)
                 try:
-                    if _proc_one_stock(_bs, code, start, end, new_days, qlib_feats_dir, expected_floats):
+                    if _proc_one_stock(_bs, code, start, end, new_days, qlib_feats_dir, 0):  # expected=0 强制下载
                         ok += 1
                     else:
-                        fail += 1
+                        fail += 1  # 合法失败
+                    downloaded = True
                     break
                 except Exception:
                     if attempt >= 4:
@@ -97,7 +105,6 @@ def _proc_batch(args):
                     try: _bs.logout()
                     except: pass
                     _bs.login()
-                    _t.sleep(2 ** attempt)
     finally:
         try: _bs.logout()
         except: pass
@@ -212,8 +219,8 @@ def update_qlib_data(
         # 分批：每批 workers 个代码，每个子进程跑一批
         batch_size = max(1, workers)
         batches = [instruments[i:i + batch_size] for i in range(0, total, batch_size)]
-        # 预期 float32 个数 = 原始日历行数 + new_days（.bin 文件应含全部日历日的 float）
-        expected_floats_val = len(existing_cal) + len(new_cal_days)
+        # 预期 float32 个数 = new_days 数（update-data 每次只写新增日的数据，不写全日历）
+        expected_floats_val = len(new_days)
         batch_args = [(b, start, end, tuple(new_days), str(feats_dir), expected_floats_val) for b in batches]
 
         _t0 = _time.time()
