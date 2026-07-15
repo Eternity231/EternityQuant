@@ -87,13 +87,119 @@ def collect_hk_minute(
     interval: str = "5m",
     period: str = "2mo",
 ):
-    """港股分钟线（yfinance）。
-    
+    """港股分钟线（东财 API + curl_cffi 浏览器指纹伪装，免翻墙免限流）。
+
     Args:
         interval: 1m | 5m | 15m | 30m | 60m
-        period: 1m=7d, 5m=2mo, 15m/30m/60m=6mo+
+        period: 仅兼容旧调用，实际由东财返回全部历史数据
         codes: 显式指定 5 位港股代码列表；传 None 则用内置热门榜
     """
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError:
+        print("  ⚠ curl_cffi 未安装，回退到 yfinance（pip install curl_cffi）", flush=True)
+        return _collect_hk_minute_yf(codes=codes, top_n=top_n, interval=interval, period=period)
+
+    if codes is None:
+        codes = [
+            "00700", "09988", "01024", "01810", "09626", "09888", "09999",
+            "03690", "01211", "02015", "02318", "02628", "01299", "00005",
+            "00011", "00388", "00883", "00941", "00981", "01347",
+        ]
+    else:
+        codes = [str(c).strip().zfill(5) for c in codes if str(c).strip()]
+
+    period_map = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "60m": "60"}
+    klt = period_map.get(interval, "5")
+
+    label = f"港股{interval}"
+    out = HK_5M_DIR if interval == "5m" else HK_1M_DIR
+    ensure_data_dirs()
+    ok = 0
+    failed = []
+
+    # 东财不限流，0.5s 间隔足够
+    for code in codes[:top_n]:
+        path = out / f"{code}.csv"
+        if path.exists() and path.stat().st_size > 1000:
+            ok += 1
+            continue
+
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "klt": klt,
+            "fqt": "0",
+            "secid": f"116.{code}",
+            "beg": "0",
+            "end": "20500000",
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "Referer": f"https://quote.eastmoney.com/hk/{code}.html",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+
+        try:
+            r = curl_requests.get(
+                url, params=params, headers=headers,
+                impersonate="chrome146", timeout=30,
+            )
+            r.raise_for_status()
+            data = r.json()
+            klines = data.get("data", {}).get("klines", [])
+            if not klines:
+                print(f"  ✗ {label} {code}  东财返回空数据", flush=True)
+                failed.append(code)
+                continue
+
+            # 解析东财格式：时间,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
+            rows = []
+            for item in klines:
+                cols = item.split(",")
+                if len(cols) >= 6:
+                    rows.append({
+                        "Date": cols[0],
+                        "open": float(cols[1]),
+                        "high": float(cols[3]),
+                        "low": float(cols[4]),
+                        "close": float(cols[2]),
+                        "volume": float(cols[5]),
+                    })
+            if not rows:
+                print(f"  ✗ {label} {code}  解析后无有效行", flush=True)
+                failed.append(code)
+                continue
+
+            df = pd.DataFrame(rows)
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.set_index("Date").sort_index()
+            df.to_csv(path)
+            ok += 1
+            print(f"  ✓ {label} {code}  {len(df)} 行  {df.index[0]}~{df.index[-1]}", flush=True)
+
+        except Exception as e:
+            print(f"  ✗ {label} {code}  {type(e).__name__}: {str(e)[:80]}", flush=True)
+            failed.append(code)
+
+        time.sleep(0.5)
+
+    print(f"  {label}完成: {ok}/{min(top_n, len(codes))}  失败 {len(failed)} 只")
+    if failed:
+        print(f"  失败清单: {','.join(failed[:20])}{'...' if len(failed) > 20 else ''}")
+
+
+def _collect_hk_minute_yf(
+    codes: list[str] | None = None,
+    top_n: int = 200,
+    interval: str = "5m",
+    period: str = "2mo",
+):
+    """港股分钟线 fallback：yfinance（Yahoo 源，限流严重）。"""
     import yfinance as yf
 
     if codes is None:
@@ -103,7 +209,6 @@ def collect_hk_minute(
             "00011", "00388", "00883", "00941", "00981", "01347",
         ]
     else:
-        # 显式清单：补 0 到 5 位
         codes = [str(c).strip().zfill(5) for c in codes if str(c).strip()]
 
     label = f"港股{interval}"
@@ -111,10 +216,8 @@ def collect_hk_minute(
     ensure_data_dirs()
     ok = 0
     failed = []
-    # Yahoo 限流非常严格，必须大幅降速
-    # 实测：单 IP 约 5-8 次/分钟，超过就 429
-    base_sleep = 6.0  # 基础间隔 6s，确保每分钟 < 10 次
-    consecutive_ok = 0  # 连续成功计数
+    base_sleep = 6.0
+    consecutive_ok = 0
     for code in codes[:top_n]:
         path = out / f"{code}.csv"
         if path.exists() and path.stat().st_size > 1000:
@@ -122,11 +225,10 @@ def collect_hk_minute(
             continue
         yf_code = _fmt_yf_hk(code)
         done = False
-        for attempt in range(4):  # 最多 4 次重试
+        for attempt in range(4):
             try:
                 df = yf.download(yf_code, period=period, interval=interval, progress=False)
                 if df.empty:
-                    # 退市/无数据，不重试直接跳
                     break
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
@@ -144,22 +246,18 @@ def collect_hk_minute(
                 msg = str(e)[:100]
                 is_rate_limit = "RateLimit" in msg or "Too Many" in msg or "429" in msg
                 if is_rate_limit and attempt < 3:
-                    wait = 30 * (attempt + 1)  # 30s, 60s, 90s 退避
+                    wait = 30 * (attempt + 1)
                     print(f"  ⏳ {label} {code} 限流，等 {wait}s 后重试（第 {attempt+1}/3 次）", flush=True)
                     time.sleep(wait)
-                    # 连续成功计数归零
                     consecutive_ok = 0
                     continue
-                # 非限流或重试耗尽
                 if not is_rate_limit:
-                    break  # 退市/无数据不重试
-                # 限流重试耗尽
+                    break
                 failed.append(code)
                 print(f"  ✗ {label} {code} 限流 4 次仍失败，跳过", flush=True)
                 break
         if not done:
             continue
-        # 动态间隔：连续成功 5 次后加速到 4s，但不超过这个速度
         dynamic_sleep = max(4.0, base_sleep - (consecutive_ok // 5) * 1.0)
         time.sleep(dynamic_sleep)
     print(f"  {label}完成: {ok}/{min(top_n, len(codes))}  失败 {len(failed)} 只")
