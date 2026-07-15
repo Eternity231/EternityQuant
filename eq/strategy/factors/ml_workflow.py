@@ -67,6 +67,7 @@ def _qlib_init() -> None:
     #
     # 修复: monkey patch LocalDatasetProvider.dataset() 接受 *args, 遇
     #   inst_processors 双重复值时丢弃位置参数，保留关键字参数。
+    from qlib.data.data import LocalDatasetProvider
     _orig_dataset = LocalDatasetProvider.dataset
 
     def _patched_dataset(self, *args, **kwargs):
