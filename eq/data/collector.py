@@ -87,18 +87,12 @@ def collect_hk_minute(
     interval: str = "5m",
     period: str = "2mo",
 ):
-    """港股分钟线（东财 API + curl_cffi 浏览器指纹伪装，免翻墙免限流）。
+    """港股分钟线（yfinance，8s 间隔防限流）。
 
     Args:
-        interval: 1m | 5m | 15m | 30m | 60m
-        period: 仅兼容旧调用，实际由东财返回全部历史数据
         codes: 显式指定 5 位港股代码列表；传 None 则用内置热门榜
     """
-    try:
-        from curl_cffi import requests as curl_requests
-    except ImportError:
-        print("  ⚠ curl_cffi 未安装，回退到 yfinance（pip install curl_cffi）", flush=True)
-        return _collect_hk_minute_yf(codes=codes, top_n=top_n, interval=interval, period=period)
+    return _collect_hk_minute_yf(codes=codes, top_n=top_n, interval=interval, period=period)
 
     if codes is None:
         codes = [
@@ -125,77 +119,96 @@ def collect_hk_minute(
             ok += 1
             continue
 
-        url = "https://push2delay.eastmoney.com/api/qt/stock/kline/get"
-        params = {
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "klt": klt,
-            "fqt": "0",
-            "secid": f"116.{code}",
-            "beg": "0",
-            "end": "20500000",
-        }
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            "Referer": f"https://quote.eastmoney.com/hk/{code}.html",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": "https://quote.eastmoney.com/hk/",
         }
+        ut = "fa5fd1943c7b386f172d6893dbfba10b"
 
-        # 东财偶有断连，最多 3 次退避重试
+        # 先确认股票存在
+        try:
+            r = curl_requests.get(
+                "https://push2.eastmoney.com/api/qt/ulist/get",
+                params={
+                    "fltt": "1", "invt": "2",
+                    "fields": "f14,f12,f13,f1,f2,f4,f3,f152",
+                    "secids": f"116.{code}",
+                    "ut": ut,
+                    "pn": "1", "np": "1", "pz": "20",
+                    "dect": "1", "wbp2u": "|0|0|0|web",
+                },
+                headers=headers, impersonate="chrome146", timeout=15,
+            )
+            diff = r.json().get("data", {}).get("diff", [])
+            if not diff:
+                print(f"  ✗ {label} {code}  东财查无此股", flush=True)
+                failed.append(code)
+                continue
+            name = diff[0].get("f14", "?")
+        except Exception as e:
+            print(f"  ✗ {label} {code}  查股票失败: {str(e)[:60]}", flush=True)
+            failed.append(code)
+            continue
+
+        # 用 trends2 获取 5 天分时数据，重采样为 K 线
         done = False
         for attempt in range(3):
             try:
                 r = curl_requests.get(
-                    url, params=params, headers=headers,
-                    impersonate="chrome146", timeout=30,
+                    "https://push2.eastmoney.com/api/qt/stock/trends2/get",
+                    params={
+                        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+                        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+                        "ut": ut,
+                        "iscr": "0",
+                        "ndays": "5",
+                        "secid": f"116.{code}",
+                    },
+                    headers=headers, impersonate="chrome146", timeout=15,
                 )
-                r.raise_for_status()
                 data = r.json()
-                klines = data.get("data", {}).get("klines", [])
-                if not klines:
-                    print(f"  ✗ {label} {code}  东财返回空数据", flush=True)
-                    failed.append(code)
-                    done = True
-                    break
+                trends = data.get("data", {}).get("trends", [])
+                if not trends:
+                    raise RuntimeError(f"分时数据为空")
 
+                # 解析分时数据：时间,价格,均价,最高,最低,成交量,成交额,最新价
                 rows = []
-                for item in klines:
+                for item in trends:
                     cols = item.split(",")
                     if len(cols) >= 6:
                         rows.append({
-                            "Date": cols[0],
-                            "open": float(cols[1]),
+                            "time": pd.to_datetime(cols[0]),
+                            "price": float(cols[1]),
                             "high": float(cols[3]),
                             "low": float(cols[4]),
-                            "close": float(cols[2]),
                             "volume": float(cols[5]),
                         })
-                if not rows:
-                    print(f"  ✗ {label} {code}  解析后无有效行", flush=True)
-                    failed.append(code)
-                    done = True
-                    break
 
-                df = pd.DataFrame(rows)
-                df["Date"] = pd.to_datetime(df["Date"])
-                df = df.set_index("Date").sort_index()
-                df.to_csv(path)
+                df = pd.DataFrame(rows).set_index("time").sort_index()
+
+                # 重采样为指定间隔 OHLCV
+                rule = interval.replace("m", "min")
+                df_out = df.resample(rule).agg({
+                    "price": "last", "high": "max", "low": "min", "volume": "sum",
+                }).dropna().rename(columns={"price": "close"})
+                df_out["open"] = df_out["close"].shift(1)
+                df_out.loc[df_out.index[0], "open"] = df_out["close"].iloc[0]
+                df_out = df_out[["open", "close", "high", "low", "volume"]]
+
+                df_out.to_csv(path)
                 ok += 1
-                print(f"  ✓ {label} {code}  {len(df)} 行  {df.index[0]}~{df.index[-1]}", flush=True)
+                print(f"  ✓ {label} {code} {name}  {len(df_out)} 行", flush=True)
                 done = True
                 break
 
             except Exception as e:
-                msg = str(e)[:100]
-                is_conn_closed = "Connection closed abruptly" in msg or "56" in msg
-                if is_conn_closed and attempt < 2:
-                    wait = 3 * (attempt + 1)  # 3s, 6s
-                    print(f"  ⏳ {label} {code} 断连，等 {wait}s 后重试（第 {attempt+1}/2 次）", flush=True)
-                    time.sleep(wait)
-                    continue
+                if "Connection closed" in str(e) or "56" in str(e):
+                    if attempt < 2:
+                        wait = 3 * (attempt + 1)
+                        print(f"  ⏳ {label} {code} 断连，等 {wait}s 后重试", flush=True)
+                        time.sleep(wait)
+                        continue
                 print(f"  ✗ {label} {code}  {type(e).__name__}: {str(e)[:80]}", flush=True)
                 failed.append(code)
                 done = True
@@ -203,8 +216,7 @@ def collect_hk_minute(
 
         if not done:
             failed.append(code)
-
-        time.sleep(2.0)  # 东财限流约 30 次/分钟，2s 间隔足够安全
+        time.sleep(2.0)
 
     print(f"  {label}完成: {ok}/{min(top_n, len(codes))}  失败 {len(failed)} 只")
     if failed:

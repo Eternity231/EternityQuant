@@ -1,72 +1,58 @@
-"""使用 curl_cffi 模拟浏览器 TLS 指纹请求东财港股分钟线"""
-import json, sys
+"""测试东财港股分时数据（用户抓包的正确格式）"""
+from curl_cffi import requests as curl_requests
+import json, pandas as pd
 
-try:
-    from curl_cffi import requests as curl_requests
-except ImportError:
-    print("✗ 需要安装 curl_cffi: pip install curl_cffi")
-    sys.exit(1)
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36",
+    "Referer": "https://quote.eastmoney.com/hk/",
+}
+ut = "fa5fd1943c7b386f172d6893dbfba10b"
 
+print("=== 测试用户抓包格式 ===")
 
-def fetch_eastmoney_hk_minute(symbol: str, period: str = "5"):
-    """用 curl_cffi 模拟 Chrome 浏览器 TLS 指纹请求东财 API"""
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-    params = {
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        "klt": period,
-        "fqt": "0",
-        "secid": f"116.{symbol}",
-        "beg": "0",
-        "end": "20500000",
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Referer": "https://quote.eastmoney.com/hk/00700.html",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
-    }
+# 1. ulist/get 确认股票存在
+r = curl_requests.get(
+    "https://push2.eastmoney.com/api/qt/ulist/get",
+    params={
+        "fltt": "1", "invt": "2",
+        "fields": "f14,f12,f13,f1,f2,f4,f3,f152",
+        "secids": "116.00700,116.09988,116.01810",
+        "ut": ut,
+        "pn": "1", "np": "1", "pz": "20",
+        "dect": "1", "wbp2u": "|0|0|0|web",
+    },
+    headers=headers, impersonate="chrome146", timeout=15,
+)
+data = r.json()
+diff = data.get("data", {}).get("diff", [])
+names = [f"{d['f12']} {d['f14']}" for d in diff]
+print(f"  ulist/get 3只: ✓ {', '.join(names)}")
 
-    # 使用 Chrome 浏览器指纹
-    r = curl_requests.get(
-        url,
-        params=params,
-        headers=headers,
-        impersonate="chrome146",
-        timeout=30,
-    )
-    r.raise_for_status()
-    data = r.json()
-    print(f"  [debug] dktotal={data.get('data',{}).get('dktotal','?')}, "
-          f"klines={len(data.get('data',{}).get('klines',[]))} 根", flush=True)
+# 2. trends2 分时数据
+for code in ["00700", "09988", "01810"]:
+    try:
+        r = curl_requests.get(
+            "https://push2.eastmoney.com/api/qt/stock/trends2/get",
+            params={
+                "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+                "ut": ut,
+                "iscr": "0",
+                "ndays": "5",
+                "secid": f"116.{code}",
+            },
+            headers=headers, impersonate="chrome146", timeout=15,
+        )
+        data = r.json()
+        trends = data.get("data", {}).get("trends")
+        if trends:
+            print(f"  trends2 {code}: ✓ {len(trends)} 条分时")
+            print(f"    首条: {trends[0]}")
+            print(f"    末条: {trends[-1]}")
+        else:
+            print(f"  trends2 {code}: rc={data.get('rc')}, data=null, full={json.dumps(data, ensure_ascii=False)[:200]}")
+    except Exception as e:
+        print(f"  trends2 {code}: FAIL {type(e).__name__}: {str(e)[:60]}")
 
-    klines = data.get("data", {}).get("klines", [])
-    if not klines:
-        print(f"  [debug] 完整响应: {json.dumps(data, ensure_ascii=False)[:600]}", flush=True)
-        raise RuntimeError("klines 为空")
-
-    return klines
-
-
-def main():
-    for code in ["00700", "09988", "01024"]:
-        print(f"\n正在请求 {code} 的 5 分钟线...")
-        try:
-            klines = fetch_eastmoney_hk_minute(code, period="5")
-            print(f"  ✓ {code}: {len(klines)} 根K线")
-            print(f"  首条: {klines[0]}")
-            print(f"  末条: {klines[-1]}")
-            break
-        except Exception as e:
-            print(f"  ✗ {code}: {type(e).__name__}: {str(e)[:120]}")
-
-
-if __name__ == "__main__":
-    main()
+# 3. 如果 trends2 通，试重采样为 5 分钟 K 线
+print("\n=== 如果 trends2 通了，重采样为 5 分钟 K 线 ===")
