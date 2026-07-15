@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 import requests as _req
 
-_QLIB_DATA_DIR = (Path(__file__).resolve().parent.parent.parent.parent / ".qlib_data" / "cn_data")
+from eq.data.paths import QLIB_CN_DATA_DIR as _QLIB_DATA_DIR, ensure_data_dirs
+
 _FEATURES = ["open", "high", "low", "close", "volume", "factor", "change"]
 _FLOAT32_NAN = np.float32(np.nan)
 
@@ -85,71 +86,99 @@ def _tencent_daily(code: str, start: str, end: str) -> pd.DataFrame | None:
 
 
 def _tencent_instruments(universe: str = "csi300") -> list[str]:
-    """获取成分股列表（腾讯 API 或静态列表）。
+    """获取成分股列表。
 
-    腾讯没有直接的成分股 API，使用 akshare 或预置列表。
+    优先级：
+    1. 本地缓存 ``{universe}_codes.txt``（逗号分隔的 qlib 代码如 ``SH600000``）
+    2. akshare ``index_stock_cons_csindex``（中证指数公司官方源，最稳定）
+    3. akshare ``index_stock_cons``（新浪源，老版 akshare 可用）
+    4. 全 A 股：``stock_zh_a_spot``
+    5. fallback：从已有 features/ 目录扫描
+
+    Args:
+        universe: csi300 | csi500 | sz50 | all
+    Returns:
+        qlib 格式代码列表，如 ``["SH600000", "SZ000001"]``
     """
-    # 预置沪深 300 / 中证 500 成分股（从新浪获取或本地缓存）
     code_file = _QLIB_DATA_DIR / f"{universe}_codes.txt"
     if code_file.exists():
-        return [c.strip() for c in code_file.read_text().strip().split(",") if c.strip()]
+        codes = [c.strip() for c in code_file.read_text().strip().split(",") if c.strip()]
+        if codes:
+            return codes
 
-    # 尝试从新浪/东财获取
-    try:
-        import akshare as ak
-        name_map = {"csi300": "沪深300", "csi500": "中证500", "sz50": "上证50"}
-        if universe in name_map:
-            df = ak.index_stock_cons(symbol=name_map[universe])
+    # akshare 指数代码映射
+    name_map = {"csi300": "000300", "csi500": "000905", "sz50": "000016"}
+    codes: list[str] = []
+
+    # 2. 中证指数公司源（最稳定）
+    if universe in name_map:
+        try:
+            import akshare as ak
+            df = ak.index_stock_cons_csindex(symbol=name_map[universe])
             if df is not None and not df.empty:
-                codes = []
-                for c in df.iloc[:, 0].tolist():
-                    c = str(c).strip()
-                    if c.startswith("6"):
-                        codes.append(f"SH{c}")
-                    elif c.startswith(("0", "3")):
-                        codes.append(f"SZ{c}")
-                if codes:
-                    code_file.parent.mkdir(parents=True, exist_ok=True)
-                    code_file.write_text(",".join(codes))
-                    return codes
-        elif universe == "all":
-            # 全A股：从 akshare 实时行情获取所有股票代码
-            df = ak.stock_zh_a_spot()
-            if df is not None and not df.empty:
-                codes = []
-                for c in df["代码"].tolist():
-                    c = str(c).strip()
-                    if c.startswith("bj"):
-                        codes.append(f"BJ{c[2:]}")
-                    elif c.startswith(("sh", "SH")):
-                        codes.append(f"SH{c[2:]}")
-                    elif c.startswith(("sz", "SZ")):
-                        codes.append(f"SZ{c[2:]}")
-                    elif c.startswith("6"):
+                # 列名可能是「成分券代码」或「代码」
+                code_col = "成分券代码" if "成分券代码" in df.columns else df.columns[0]
+                for c in df[code_col].astype(str).str.zfill(6).tolist():
+                    if c.startswith("6") or c.startswith("9"):
                         codes.append(f"SH{c}")
                     elif c.startswith(("0", "3")):
                         codes.append(f"SZ{c}")
                     elif c.startswith(("4", "8")):
                         codes.append(f"BJ{c}")
-                if codes:
-                    code_file.parent.mkdir(parents=True, exist_ok=True)
-                    code_file.write_text(",".join(codes))
-                    return codes
-    except Exception:
-        pass
+        except Exception as e:
+            print(f"  [warn] index_stock_cons_csindex 失败: {e}", flush=True)
 
-    # 最后 fallback：从用户已有特征目录中取
-    feats_dir = _QLIB_DATA_DIR / "features"
-    if feats_dir.exists():
-        codes = [d.name.upper() for d in feats_dir.iterdir() if d.is_dir() and d.name.startswith(("sh", "sz"))]
-        if codes:
-            return codes
+    # 3. 新浪源 fallback
+    if not codes and universe in name_map:
+        try:
+            import akshare as ak
+            name_zh = {"csi300": "沪深300", "csi500": "中证500", "sz50": "上证50"}[universe]
+            df = ak.index_stock_cons(symbol=name_zh)
+            if df is not None and not df.empty:
+                for c in df.iloc[:, 0].astype(str).str.zfill(6).tolist():
+                    if c.startswith("6") or c.startswith("9"):
+                        codes.append(f"SH{c}")
+                    elif c.startswith(("0", "3")):
+                        codes.append(f"SZ{c}")
+                    elif c.startswith(("4", "8")):
+                        codes.append(f"BJ{c}")
+        except Exception as e:
+            print(f"  [warn] index_stock_cons 新浪源失败: {e}", flush=True)
 
-    raise RuntimeError(
-        f"无法获取 {universe} 成分股列表。\n"
-        f"请先手动创建 {code_file}，内容为逗号分隔的股票代码，如：\n"
-        f"SH600000,SZ000001,SH600004,..."
-    )
+    # 4. 全 A 股
+    if universe == "all":
+        try:
+            import akshare as ak
+            df = ak.stock_zh_a_spot()
+            if df is not None and not df.empty:
+                for c in df["代码"].astype(str).str.zfill(6).tolist():
+                    if c.startswith(("4", "8", "9")):
+                        codes.append(f"BJ{c}")
+                    elif c.startswith("6"):
+                        codes.append(f"SH{c}")
+                    elif c.startswith(("0", "3")):
+                        codes.append(f"SZ{c}")
+        except Exception as e:
+            print(f"  [warn] stock_zh_a_spot 失败: {e}", flush=True)
+
+    # 5. 已有 features/ 目录扫描
+    if not codes:
+        feats_dir = _QLIB_DATA_DIR / "features"
+        if feats_dir.exists():
+            codes = [d.name.upper() for d in feats_dir.iterdir()
+                     if d.is_dir() and d.name.startswith(("sh", "sz", "bj"))]
+
+    if not codes:
+        raise RuntimeError(
+            f"无法获取 {universe} 成分股列表。\n"
+            f"请先手动创建 {code_file}，内容为逗号分隔的股票代码，如：\n"
+            f"SH600000,SZ000001,SH600004,..."
+        )
+
+    # 缓存到本地
+    code_file.parent.mkdir(parents=True, exist_ok=True)
+    code_file.write_text(",".join(codes))
+    return codes
 
 
 def _tencent_trading_days(start: str, end: str) -> list[str]:
@@ -228,6 +257,13 @@ def _proc_one_stock(code, start, end, new_days, qlib_feats_dir, expected_floats=
                 return False
             # 按交易日对齐
             df = df.reindex(pd.to_datetime(days_list))
+            # 前向填充 NaN（停牌日沿用上一交易日数据）
+            df = df.ffill()
+            # 如果开头还有 NaN，用后续第一个有效值填充
+            df = df.bfill()
+            # 如果全部是 NaN，放弃这只股票
+            if df["close"].isna().all():
+                return False
             df["factor"] = 1.0
             df["change"] = df["close"].pct_change(fill_method=None).fillna(0.0)
             # 转 .bin
@@ -289,6 +325,8 @@ def update_qlib_data(
     """
     if end is None:
         end = dt.date.today().isoformat()
+
+    ensure_data_dirs()
 
     # 获取交易日
     new_days = _tencent_trading_days(start, end)
@@ -371,15 +409,15 @@ def update_qlib_data(
 def _generate_instruments(universe: str, instruments: list[str], verbose: bool = True) -> None:
     """生成 qlib 所需的 instruments 文件（如 csi300.txt）。
 
-    qlib 格式：每行 code,start_date,end_date（3 列逗号分隔）。
+    qlib 格式：每行 code\\tstart_date\\tend_date（3 列 TAB 分隔，无表头）。
     """
     import datetime as dt
     end = dt.date.today().isoformat()
-    start = "2026-01-01"  # 与用户数据起始一致
+    start = "2026-01-01"
     inst_dir = _QLIB_DATA_DIR / "instruments"
     inst_dir.mkdir(parents=True, exist_ok=True)
-    lines = [f"{c.lower()},{start},{end}" for c in instruments]
+    lines = [f"{c.lower()}\t{start}\t{end}" for c in instruments]
     out_path = inst_dir / f"{universe}.txt"
     out_path.write_text("\n".join(lines))
     if verbose:
-        print(f"  生成 instruments/{universe}.txt ({len(lines)} 只, {start}~{end})", flush=True)
+        print(f"  生成 instruments/{universe}.txt ({len(lines)} 只, TAB分隔)", flush=True)

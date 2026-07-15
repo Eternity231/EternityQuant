@@ -680,9 +680,8 @@ def ml_update_data(
         typer.echo(f"更新失败：{e}", err=True)
         raise typer.Exit(1)
     typer.echo(f"\n更新完成：续 {result['trading_days']} 交易日，{result['instruments_updated']} 只票 × {result['features_per_inst']} 特征")
-    from pathlib import Path
-    _qlib_dir = Path(__file__).resolve().parent.parent / ".qlib_data" / "cn_data"
-    typer.echo(f"  数据目录：{_qlib_dir}")
+    from eq.data.paths import QLIB_CN_DATA_DIR
+    typer.echo(f"  数据目录：{QLIB_CN_DATA_DIR}")
     typer.echo(f"  日历新增 {result['days_added']} 行，现在可以 `eq ml train` 用最新数据训练了")
 
 
@@ -925,6 +924,39 @@ def data_all(
     collect_hk_minute(top_n=top_n, interval="1m", period="7d")
     collect_us_daily(top_n=top_n)
     print("\n===== 全部完成 =====\n")
+
+
+@data_app.command("migrate", help="把旧散落目录（.qlib_data、hk_data、us_data）的数据迁移到统一 data/ 目录")
+def data_migrate(
+    dry_run: bool = typer.Option(False, "--dry-run", help="只打印将做什么，不真正复制"),
+):
+    from eq.data.paths import migrate_legacy_data_layout
+    result = migrate_legacy_data_layout(dry_run=dry_run, verbose=True)
+    typer.echo(f"\n迁移完成：复制 {len(result['copied'])} 项，跳过 {len(result['skipped'])} 项")
+    typer.echo("旧目录保留，可手动删除：.qlib_data/、.eternityquant/hk_data/、.eternityquant/us_data/")
+
+
+@data_app.command("paths", help="显示统一数据目录结构")
+def data_paths():
+    from eq.data.paths import (
+        A_DIR, QLIB_CN_DATA_DIR,
+        HK_DIR, HK_DAILY_DIR, HK_5M_DIR, HK_1M_DIR, HK_FEAT_DIR, HK_MODELS_DIR,
+        US_DIR, US_DAILY_DIR,
+    )
+    typer.echo("\n统一数据目录结构：\n")
+    for label, d in [
+        ("A 股 qlib", QLIB_CN_DATA_DIR),
+        ("港股 根目录", HK_DIR),
+        ("  日线", HK_DAILY_DIR),
+        ("  5 分钟", HK_5M_DIR),
+        ("  1 分钟", HK_1M_DIR),
+        ("  特征", HK_FEAT_DIR),
+        ("  模型", HK_MODELS_DIR),
+        ("美股 根目录", US_DIR),
+        ("  日线", US_DAILY_DIR),
+    ]:
+        n = len(list(d.iterdir())) if d.exists() else "不存在"
+        typer.echo(f"  {label:16s} {n:>4} 项  {d}")
 
 
 @app.command("dash", help="启动 Streamlit 仪表盘（本地网页看板）")

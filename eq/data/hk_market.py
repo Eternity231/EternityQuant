@@ -17,15 +17,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-_HK_DATA_DIR = Path(__file__).resolve().parent.parent.parent / ".eternityquant" / "hk_data"
-_HK_FEAT_DIR = _HK_DATA_DIR / "features"
-_HK_MODELS_DIR = _HK_DATA_DIR / "models"
+from eq.data.paths import (
+    HK_FEAT_DIR as _HK_FEAT_DIR,
+    HK_MODELS_DIR as _HK_MODELS_DIR,
+    ensure_data_dirs,
+)
 
 
 def _ensure_dirs() -> None:
-    _HK_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _HK_FEAT_DIR.mkdir(exist_ok=True)
-    _HK_MODELS_DIR.mkdir(exist_ok=True)
+    ensure_data_dirs()
 
 
 def _dl_one(code: str, start: str, end: str) -> tuple:

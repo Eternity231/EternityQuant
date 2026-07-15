@@ -18,13 +18,10 @@ from pathlib import Path
 
 import pandas as pd
 
-# 缓存目录
-_HK_DIR = Path(__file__).resolve().parent.parent.parent / ".eternityquant" / "hk_data"
-_US_DIR = Path(__file__).resolve().parent.parent.parent / ".eternityquant" / "us_data"
-
-
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+from eq.data.paths import (
+    HK_DAILY_DIR, HK_5M_DIR, HK_1M_DIR,
+    US_DAILY_DIR, ensure_data_dirs,
+)
 
 
 def _fmt_yf_hk(code: str) -> str:
@@ -53,10 +50,8 @@ def collect_hk_daily(
             "00011", "00388", "00883", "00941", "00981", "01347",
         ]
 
-    out = _HK_DIR / "daily"
-    _ensure_dir(out)
-    # 如果已有 yfinance 下载的旧数据，先迁移
-    _migrate_old_yf_data(out)
+    out = HK_DAILY_DIR
+    ensure_data_dirs()
     ok = 0
     for code in codes[:top_n]:
         path = out / f"{code}.csv"
@@ -86,20 +81,6 @@ def collect_hk_daily(
     print(f"  港股日线完成: {ok}/{min(top_n, len(codes))}")
 
 
-def _migrate_old_yf_data(out: Path):
-    """如果旧的 yfinance 数据在 daily/ 下是空文件，删除重下。"""
-    import shutil
-    # 检查是否有旧版 features/ 目录数据
-    old_dir = out.parent / "features"
-    if old_dir.exists():
-        # 把旧数据移到 daily/
-        for f in old_dir.glob("*.csv"):
-            new_path = out / f.name
-            if not new_path.exists():
-                shutil.copy2(f, new_path)
-                print(f"  → 迁移旧数据 {f.name}", flush=True)
-
-
 def collect_hk_minute(
     codes: list[str] | None = None,
     top_n: int = 200,
@@ -122,8 +103,8 @@ def collect_hk_minute(
         ]
 
     label = f"港股{interval}"
-    out = _HK_DIR / interval
-    _ensure_dir(out)
+    out = HK_5M_DIR if interval == "5m" else HK_1M_DIR
+    ensure_data_dirs()
     ok = 0
     for code in codes[:top_n]:
         path = out / f"{code}.csv"
@@ -163,8 +144,8 @@ def collect_us_daily(
     if codes is None:
         codes = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "QQQ", "SPY"]
 
-    out = _US_DIR / "daily"
-    _ensure_dir(out)
+    out = US_DAILY_DIR
+    ensure_data_dirs()
     ok = 0
     for code in codes[:top_n]:
         path = out / f"{code}.csv"

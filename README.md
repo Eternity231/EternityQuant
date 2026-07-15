@@ -66,7 +66,30 @@ eq --help                               # 看所有命令
 - `~/.eternityquant/market_cache.db`：行情缓存（可随时删）
 - `~/.eternityquant/backtests/<run_id>.parquet`：回测详细数据外存
 - `~/.eternityquant/ml_models/*.pkl`：ML 模型文件
-- `~/.qlib/qlib_data/cn_data`：qlib A 股本地数据集（2001~2020-09，196MB）
+
+### 统一数据目录（v0.20）
+
+**所有市场数据集中在 `~/.eternityquant/data/` 下**，按市场分子目录：
+
+```
+.eternityquant/data/
+├─ a/                          # A 股（qlib .bin 格式）
+│  └─ qlib_cn_data/            # qlib provider_uri
+│     ├─ calendars/day.txt     # 交易日历
+│     ├─ features/sh600000/    # 每只股票一个目录，含 {open,high,low,close,volume,factor,change}.day.bin
+│     ├─ instruments/csi300.txt # 成分股列表
+│     └─ all_codes.txt
+├─ hk/                         # 港股
+│  ├─ daily/                   # 日线 CSV（akshare Sina 源，2004~2026 全历史）
+│  ├─ 5m/                      # 5 分钟线 CSV（yfinance，最近 30 天）
+│  ├─ 1m/                      # 1 分钟线 CSV（yfinance，最近 7 天）
+│  ├─ features/                # 计算后的特征 CSV（训练用）
+│  └─ models/                  # 港股模型 pkl
+└─ us/                         # 美股
+   └─ daily/                   # 日线 CSV（yfinance）
+```
+
+**旧目录自动迁移**：第一次访问时 `eq.data.paths.migrate_legacy_data_layout()` 会把散落的 `.qlib_data/cn_data`、`.eternityquant/hk_data`、`.eternityquant/us_data` 复制到统一目录（旧目录保留，不破坏现有脚本）。
 
 ## CLI 命令全貌
 
@@ -87,23 +110,57 @@ eq --help                               # 看所有命令
 
 ## 数据收集
 
-`eq data` 命令组统一管理多市场数据收集：
+`eq data` 命令组统一管理多市场数据收集。**所有数据落到 `~/.eternityquant/data/{a,hk,us}/` 下统一目录**（v0.20 起取代散落的 `.qlib_data/cn_data`、`.eternityquant/hk_data`、`.eternityquant/us_data`）。
 
 ```bash
-eq data a --start 2026-01-01 --universe csi300 --workers 10   # A 股日线（baostock）
-eq data a --start 2026-01-01 --universe csi500 --workers 10   # A 股中证500
-eq data hk --top 73                    # 港股日线（akshare，2004~2026 全历史）
-eq data hk-5min --top 73               # 港股 5 分钟线（yfinance，最近 30 天）
-eq data hk-1min --top 73               # 港股 1 分钟线（yfinance，最近 7 天）
-eq data us --top 31                    # 美股日线（yfinance）
+# === A 股（qlib 本地数据集，baostock/腾讯 API 续期） ===
+eq data a --start 2026-01-01 --universe csi300 --workers 10   # 沪深 300
+eq data a --start 2026-01-01 --universe csi500 --workers 10   # 中证 500
+# 首次使用需先解压 qlib_cn_data 到 data/a/qlib_cn_data/，再续期：
+eq ml update-data --start 2020-09-28 --universe csi300        # baostock 拉 6 年日线
+
+# === 港股（akshare Sina 源，全历史 2004~2026） ===
+eq data hk --top 73                    # 港股日线 → data/hk/daily/
+eq data hk-5min --top 73               # 港股 5 分钟线 → data/hk/5m/（yfinance，最近 30 天）
+eq data hk-1min --top 73               # 港股 1 分钟线 → data/hk/1m/（yfinance，最近 7 天）
+
+# === 美股（yfinance） ===
+eq data us --top 31                    # 美股日线 → data/us/daily/
+
+# === 全量（按上面顺序串行） ===
 eq data all --top 73                   # 全量收集
 ```
 
-| 数据源 | 市场 | 类型 | 历史长度 |
-|--------|------|------|---------|
-| baostock | A 股 | 日线 | 2001~2026 |
-| akshare `stock_hk_daily` | 港股 | 日线 | 2004~2026 |
-| yfinance | 港股/美股 | 日线/分钟线 | 日线~2年，5m~30天，1m~7天 |
+| 数据源 | 市场 | 类型 | 历史长度 | 落盘位置 |
+|--------|------|------|---------|---------|
+| baostock / 腾讯 API | A 股 | 日线 | 2001~2026 | `data/a/qlib_cn_data/` |
+| akshare `stock_hk_daily` | 港股 | 日线 | 2004~2026 | `data/hk/daily/` |
+| yfinance | 港股 | 5m/1m | 30天/7天 | `data/hk/{5m,1m}/` |
+| yfinance | 美股 | 日线 | ~2年 | `data/us/daily/` |
+
+### 从零开始的完整数据流程
+
+```bash
+# 1. A 股：先准备 qlib 数据集（解压 cn_data.tar.gz 或下载官方 datasets）
+#    放到 ~/.eternityquant/data/a/qlib_cn_data/
+#    再续期到最新：
+eq ml update-data --start 2020-09-28 --universe csi300 --workers 5
+
+# 2. 港股：拉日线 + 分钟线
+eq data hk --top 73
+eq data hk-5min --top 73
+eq data hk-1min --top 73
+
+# 3. 美股：拉日线
+eq data us --top 31
+
+# 4. 验证：查看统一数据目录
+ls ~/.eternityquant/data/a/qlib_cn_data/features/ | head    # A 股 .bin
+ls ~/.eternityquant/data/hk/daily/ | wc -l                  # 港股日线文件数
+ls ~/.eternityquant/data/us/daily/ | wc -l                  # 美股日线文件数
+```
+
+> 💡 **旧数据自动迁移**：第一次运行任何 `eq data` 或 `eq ml` 命令时，`eq.data.paths.migrate_legacy_data_layout()` 会自动把旧散落目录的数据复制到统一目录，旧目录保留不破坏现有脚本。
 
 ## 监控规则 10 种类型
 
@@ -150,6 +207,37 @@ eq data all --top 73                   # 全量收集
 | `lstm` | `cuda` | **自写 _SimpleLSTM（6×26 时序重塑，2 层 hidden=128），量化选股最佳** | 待续数据后测 |
 | `deeplob` | `cuda` | **DeepLOB: CNN(1×2)+BiLSTM(64)+Attention** — 顶会论文复现 | 见实盘结果 |
 | `tft` | `cuda` | **Temporal Fusion Transformer: 多头注意力+GRN** — Google 论文复现 | 快速测试 +0.2106 |
+
+### 数据标准化（v0.20，对标 qlib 官方 benchmarks）
+
+**为什么必须标准化**：Alpha158 的 158 维原始特征尺度差异巨大（价格元级、成交量千万级、收益率百分比级），不标准化会污染 LightGBM 的树分裂、让 BatchNorm1d 梯度爆。这是之前 `train()` 路径 `infer_processors=[]` 的核心 bug。
+
+本框架采用 qlib 官方 benchmarks（GRU/ALSTM/LightGBM）同款处理器链，参考 [microsoft/qlib examples/benchmarks](https://github.com/microsoft/qlib/tree/main/examples/benchmarks)：
+
+**特征处理器（`infer_processors`）**：
+
+| 处理器 | 作用 | 权威依据 |
+|--------|------|---------|
+| `ProcessInf` | 把 Inf 替换为列均值 | qlib `_DEFAULT_INFER_PROCESSORS` |
+| `RobustZScoreNorm(clip_outlier=True)` | **MAD（中位绝对偏差）z-score**，截断 3σ 外极值 | qlib GRU benchmark；MAD 比 std 抗异常 |
+| `Fillna` | NaN 填 0 | qlib Fillna processor |
+
+**标签处理器（`learn_processors`）**：
+
+| 路径 | 标签处理 | 权威依据 |
+|------|---------|---------|
+| `train()` (LightGBM) | `DropnaLabel` → `CSZScoreNorm` | qlib LightGBM benchmark 配置 |
+| `train_torch()` (GRU/ALSTM/LSTM/MLP/TFT/DeepLOB) | `DropnaLabel` → **`CSRankNorm`** | qlib GRU/ALSTM benchmark 标准配置 |
+
+**为什么 `train_torch` 用 `CSRankNorm` 而非 `CSZScoreNorm`**：
+- `CSZScoreNorm`（横截面 z-score）对异常值敏感，一只暴涨股会拉偏全截面均值
+- `CSRankNorm`（横截面排序归一化）把未来收益转成 `[0, 1]` 均匀分布，**天然免疫异常值**
+- qlib 官方 GRU/ALSTM/LSTM benchmark 全部用 `CSRankNorm`，这是社区验证的最佳实践
+
+**标准化三原则**（webfetch 权威资料综合）：
+1. **只用训练集统计量**：`fit_start_time` / `fit_end_time` 限定处理器学习参数的范围，绝不能用测试集均值/方差（数据泄露）
+2. **横截面优先**：跨股票比较时用横截面 z-score（`CSZScoreNorm`）或横截面排序（`CSRankNorm`），而非时序 z-score
+3. **抗异常值**：用 MAD（`RobustZScoreNorm`）替代 std（`ZScoreNorm`），或用 rank 替代 magnitude
 
 ### 高级训练参数（v0.16+）
 

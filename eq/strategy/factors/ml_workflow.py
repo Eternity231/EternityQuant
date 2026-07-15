@@ -48,7 +48,9 @@ def _qlib_init() -> None:
     import qlib
     from pathlib import Path as _P
     from qlib.config import REG_CN
-    _qlib_uri = str(_P(__file__).resolve().parent.parent.parent.parent / ".qlib_data" / "cn_data")
+    from eq.data.paths import QLIB_CN_DATA_DIR, ensure_data_dirs
+    ensure_data_dirs()
+    _qlib_uri = str(QLIB_CN_DATA_DIR)
     qlib.init(provider_uri=_qlib_uri, region=REG_CN)
 
 
@@ -88,8 +90,24 @@ def train(
         raise ValueError(f"qlib instruments 拉取失败：{e}") from e
 
     # 2. Alpha158 handler
-    # infer_processors 必须为空或只含 inference-safe processor，learn_processors 才加归一化
-    learn_procs = [{"class": "DropnaLabel"}, {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}}]
+    # 权威处理器链（qlib benchmarks/LightGBM 同款配置，参考
+    # examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml）：
+    #   infer_processors (特征):
+    #     ProcessInf → RobustZScoreNorm(clip_outlier=True) → Fillna
+    #     - ProcessInf: 处理 Inf（替换为列均值），避免 BatchNorm1d 梯度爆
+    #     - RobustZScoreNorm: MAD（中位绝对偏差）抗异常 z-score，clip_outlier 截断 3σ 外
+    #     - Fillna: NaN 填 0
+    #   learn_processors (标签):
+    #     DropnaLabel → CSZScoreNorm (横截面 z-score，去截面均值/方差影响)
+    infer_procs = [
+        {"class": "ProcessInf", "kwargs": {}},
+        {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
+        {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
+    ]
+    learn_procs = [
+        {"class": "DropnaLabel"},
+        {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
+    ]
     label_expr = [f"Ref($close, -{horizon}) / Ref($close, -1) - 1"]
     handler = Alpha158(
         instruments=universe,
@@ -97,7 +115,7 @@ def train(
         end_time=valid_end,
         fit_start_time=train_start,
         fit_end_time=train_end,
-        infer_processors=[],
+        infer_processors=infer_procs,
         learn_processors=learn_procs,
         label=label_expr,
     )
@@ -474,8 +492,23 @@ def train_torch(
     _qlib_init()
 
     # Alpha158 handler（feature 158 维）
-    # infer_processors 用默认（ProcessInf + ZScoreNorm + Fillna），跳过会让 feature 含 NaN/Inf 喂给 BatchNorm1d 梯度爆
-    from qlib.contrib.data.handler import Alpha158, _DEFAULT_INFER_PROCESSORS
+    # 权威处理器链（对标 qlib examples/benchmarks/GRU/workflow_config_gru_Alpha158.yaml）：
+    #   infer_processors (特征): ProcessInf → RobustZScoreNorm(clip) → Fillna
+    #     - RobustZScoreNorm 用 MAD（中位绝对偏差）抗异常，比 ZScoreNorm 稳
+    #     - clip_outlier=True 截断 3σ 外的极值
+    #   learn_processors (标签): DropnaLabel → CSRankNorm
+    #     - CSRankNorm 横截面排序归一化，把未来收益转成 [0,1] 均匀分布
+    #     - 这是官方 GRU/ALSTM/LSTM benchmark 的标准配置，比 CSZScoreNorm 更抗异常
+    from qlib.contrib.data.handler import Alpha158
+    infer_procs = [
+        {"class": "ProcessInf", "kwargs": {}},
+        {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
+        {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
+    ]
+    learn_procs = [
+        {"class": "DropnaLabel"},
+        {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
+    ]
     label_expr = [f"Ref($close, -{horizon}) / Ref($close, -1) - 1"]
     handler = Alpha158(
         instruments=universe,
@@ -483,8 +516,8 @@ def train_torch(
         end_time=valid_end,
         fit_start_time=train_start,
         fit_end_time=train_end,
-        infer_processors=_DEFAULT_INFER_PROCESSORS,
-        learn_processors=[{"class": "DropnaLabel"}, {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}}],
+        infer_processors=infer_procs,
+        learn_processors=learn_procs,
         label=label_expr,
     )
 
