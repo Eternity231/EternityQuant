@@ -55,6 +55,26 @@ def _qlib_init() -> None:
     _qlib_uri = {"day": str(QLIB_CN_DATA_DIR)}
     qlib.init(provider_uri=_qlib_uri, region=REG_CN)
 
+    # monkey patch: 修 qlib 0.9.7 LocalDatasetProvider.features() bug
+    # 它把 disk_cache 当第6个位置参数传给 DatasetD.dataset()，
+    # 但 dataset() 签名是 (self, instruments, fields, ..., inst_processors=[])，
+    # disk_cache 被当作 inst_processors，然后 inst_processors=inst_processors
+    # 又作为关键字参数传入——双重复值报错 (issue #1949)。
+    try:
+        from qlib.data.data import LocalDatasetProvider, DatasetD as _DatasetD
+        _orig_features = LocalDatasetProvider.features
+
+        def _patched_features(self, instruments, fields, start_time=None, end_time=None,
+                             freq="day", disk_cache=None, inst_processors=None):
+            disk_cache = _DatasetD.default_disk_cache if disk_cache is None else disk_cache
+            fields = list(fields)
+            return _DatasetD.dataset(
+                instruments, fields, start_time, end_time, freq, inst_processors=inst_processors or []
+            )
+        LocalDatasetProvider.features = _patched_features
+    except Exception:
+        pass
+
 
 def train(
     universe: str = "csi300",
