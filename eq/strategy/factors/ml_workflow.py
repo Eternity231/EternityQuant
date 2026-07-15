@@ -50,7 +50,9 @@ def _qlib_init() -> None:
     from qlib.config import REG_CN
     from eq.data.paths import QLIB_CN_DATA_DIR, ensure_data_dirs
     ensure_data_dirs()
-    _qlib_uri = str(QLIB_CN_DATA_DIR)
+    # qlib 0.9.7 要求 provider_uri 是 dict（key=freq），传字符串会报
+    # "does not contain data for day"——内部按 freq 查 key 找不到。
+    _qlib_uri = {"day": str(QLIB_CN_DATA_DIR)}
     qlib.init(provider_uri=_qlib_uri, region=REG_CN)
 
 
