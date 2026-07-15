@@ -79,6 +79,27 @@ def _qlib_init() -> None:
 
     LocalDatasetProvider.dataset = _patched_dataset
 
+    # monkey patch: 修 qlib Corr._load_internal 中 series_right 为空 (0,) 的 bug
+    # Corr._load_internal 在 super()._load_internal() 之后重新加载
+    # feature_left/feature_right，但第二次加载时 series_right 返回空数组，
+    # 导致 np.isclose 广播失败 (632,) vs (0,)。
+    from qlib.data.ops import Corr as _Corr
+    _orig_corr_load = _Corr._load_internal
+
+    def _patched_corr_load(self, instrument, start_index, end_index, *args):
+        res = _orig_corr_load(self, instrument, start_index, end_index, *args)
+        series_left = self.feature_left.load(instrument, start_index, end_index, *args)
+        series_right = self.feature_right.load(instrument, start_index, end_index, *args)
+        if len(series_right) == 0:
+            return res  # 无法过滤，直接返回原始结果
+        res.loc[
+            np.isclose(series_left.rolling(self.N, min_periods=1).std(), 0, atol=2e-05)
+            | np.isclose(series_right.rolling(self.N, min_periods=1).std(), 0, atol=2e-05)
+        ] = np.nan
+        return res
+
+    _Corr._load_internal = _patched_corr_load
+
 
 def train(
     universe: str = "csi300",
