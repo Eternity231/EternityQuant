@@ -111,8 +111,10 @@ def collect_hk_minute(
     ensure_data_dirs()
     ok = 0
     failed = []
-    # yfinance 对 Yahoo 限流敏感，间隔要够大 + 限流退避重试
-    base_sleep = 2.0  # 基础间隔 2s（比旧 0.3s 慢但稳）
+    # Yahoo 限流非常严格，必须大幅降速
+    # 实测：单 IP 约 5-8 次/分钟，超过就 429
+    base_sleep = 6.0  # 基础间隔 6s，确保每分钟 < 10 次
+    consecutive_ok = 0  # 连续成功计数
     for code in codes[:top_n]:
         path = out / f"{code}.csv"
         if path.exists() and path.stat().st_size > 1000:
@@ -134,31 +136,32 @@ def collect_hk_minute(
                 )
                 df.to_csv(path)
                 ok += 1
+                consecutive_ok += 1
                 print(f"  ✓ {label} {code}  {len(df)} 行", flush=True)
                 done = True
                 break
             except Exception as e:
-                msg = str(e)[:80]
+                msg = str(e)[:100]
                 is_rate_limit = "RateLimit" in msg or "Too Many" in msg or "429" in msg
                 if is_rate_limit and attempt < 3:
-                    wait = 5 * (attempt + 1)  # 5s, 10s, 15s 退避
+                    wait = 30 * (attempt + 1)  # 30s, 60s, 90s 退避
                     print(f"  ⏳ {label} {code} 限流，等 {wait}s 后重试（第 {attempt+1}/3 次）", flush=True)
                     time.sleep(wait)
+                    # 连续成功计数归零
+                    consecutive_ok = 0
                     continue
                 # 非限流或重试耗尽
                 if not is_rate_limit:
                     break  # 退市/无数据不重试
                 # 限流重试耗尽
-                if attempt == 3:
-                    failed.append(code)
-                    print(f"  ✗ {label} {code} 限流 4 次仍失败，跳过", flush=True)
-                else:
-                    failed.append(code)
-                    print(f"  ✗ {label} {code}  {msg}", flush=True)
+                failed.append(code)
+                print(f"  ✗ {label} {code} 限流 4 次仍失败，跳过", flush=True)
                 break
         if not done:
             continue
-        time.sleep(base_sleep)
+        # 动态间隔：连续成功 5 次后加速到 4s，但不超过这个速度
+        dynamic_sleep = max(4.0, base_sleep - (consecutive_ok // 5) * 1.0)
+        time.sleep(dynamic_sleep)
     print(f"  {label}完成: {ok}/{min(top_n, len(codes))}  失败 {len(failed)} 只")
     if failed:
         print(f"  失败清单: {','.join(failed[:20])}{'...' if len(failed) > 20 else ''}")
