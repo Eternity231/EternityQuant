@@ -144,49 +144,67 @@ def collect_hk_minute(
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
-        try:
-            r = curl_requests.get(
-                url, params=params, headers=headers,
-                impersonate="chrome146", timeout=30,
-            )
-            r.raise_for_status()
-            data = r.json()
-            klines = data.get("data", {}).get("klines", [])
-            if not klines:
-                print(f"  ✗ {label} {code}  东财返回空数据", flush=True)
+        # 东财偶有断连，最多 3 次退避重试
+        done = False
+        for attempt in range(3):
+            try:
+                r = curl_requests.get(
+                    url, params=params, headers=headers,
+                    impersonate="chrome146", timeout=30,
+                )
+                r.raise_for_status()
+                data = r.json()
+                klines = data.get("data", {}).get("klines", [])
+                if not klines:
+                    print(f"  ✗ {label} {code}  东财返回空数据", flush=True)
+                    failed.append(code)
+                    done = True
+                    break
+
+                rows = []
+                for item in klines:
+                    cols = item.split(",")
+                    if len(cols) >= 6:
+                        rows.append({
+                            "Date": cols[0],
+                            "open": float(cols[1]),
+                            "high": float(cols[3]),
+                            "low": float(cols[4]),
+                            "close": float(cols[2]),
+                            "volume": float(cols[5]),
+                        })
+                if not rows:
+                    print(f"  ✗ {label} {code}  解析后无有效行", flush=True)
+                    failed.append(code)
+                    done = True
+                    break
+
+                df = pd.DataFrame(rows)
+                df["Date"] = pd.to_datetime(df["Date"])
+                df = df.set_index("Date").sort_index()
+                df.to_csv(path)
+                ok += 1
+                print(f"  ✓ {label} {code}  {len(df)} 行  {df.index[0]}~{df.index[-1]}", flush=True)
+                done = True
+                break
+
+            except Exception as e:
+                msg = str(e)[:100]
+                is_conn_closed = "Connection closed abruptly" in msg or "56" in msg
+                if is_conn_closed and attempt < 2:
+                    wait = 3 * (attempt + 1)  # 3s, 6s
+                    print(f"  ⏳ {label} {code} 断连，等 {wait}s 后重试（第 {attempt+1}/2 次）", flush=True)
+                    time.sleep(wait)
+                    continue
+                print(f"  ✗ {label} {code}  {type(e).__name__}: {str(e)[:80]}", flush=True)
                 failed.append(code)
-                continue
+                done = True
+                break
 
-            # 解析东财格式：时间,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
-            rows = []
-            for item in klines:
-                cols = item.split(",")
-                if len(cols) >= 6:
-                    rows.append({
-                        "Date": cols[0],
-                        "open": float(cols[1]),
-                        "high": float(cols[3]),
-                        "low": float(cols[4]),
-                        "close": float(cols[2]),
-                        "volume": float(cols[5]),
-                    })
-            if not rows:
-                print(f"  ✗ {label} {code}  解析后无有效行", flush=True)
-                failed.append(code)
-                continue
-
-            df = pd.DataFrame(rows)
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df.set_index("Date").sort_index()
-            df.to_csv(path)
-            ok += 1
-            print(f"  ✓ {label} {code}  {len(df)} 行  {df.index[0]}~{df.index[-1]}", flush=True)
-
-        except Exception as e:
-            print(f"  ✗ {label} {code}  {type(e).__name__}: {str(e)[:80]}", flush=True)
+        if not done:
             failed.append(code)
 
-        time.sleep(0.5)
+        time.sleep(2.0)  # 东财限流约 30 次/分钟，2s 间隔足够安全
 
     print(f"  {label}完成: {ok}/{min(top_n, len(codes))}  失败 {len(failed)} 只")
     if failed:
