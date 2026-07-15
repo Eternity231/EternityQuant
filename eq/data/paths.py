@@ -34,18 +34,14 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path
 
-# ~/.eternityquant 根目录（与 eq.db.DEFAULT_HOME 对齐）
-_HOME = Path.home() / ".eternityquant"
-# 项目内 .eternityquant 兼容旧脚本（collector.py 之前用这个）
+# 项目内 .eternityquant 根目录（统一所有数据，避免散落到 ~/.eternityquant）
 _PROJECT_HOME = Path(__file__).resolve().parent.parent.parent / ".eternityquant"
 
-# 数据根目录：EQ_HOME 环境变量优先（Colab/Kaggle 用），否则项目内 .eternityquant/data
-_DATA_HOME = Path(os.environ.get("EQ_HOME", _PROJECT_HOME))
-DATA_ROOT = _DATA_HOME / "data"
+# 数据根目录：始终用项目内 .eternityquant/data
+DATA_ROOT = _PROJECT_HOME / "data"
 
 
 # A 股 qlib 数据
