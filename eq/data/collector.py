@@ -110,28 +110,58 @@ def collect_hk_minute(
     out = HK_5M_DIR if interval == "5m" else HK_1M_DIR
     ensure_data_dirs()
     ok = 0
+    failed = []
+    # yfinance 对 Yahoo 限流敏感，间隔要够大 + 限流退避重试
+    base_sleep = 2.0  # 基础间隔 2s（比旧 0.3s 慢但稳）
     for code in codes[:top_n]:
         path = out / f"{code}.csv"
         if path.exists() and path.stat().st_size > 1000:
             ok += 1
             continue
-        try:
-            yf_code = _fmt_yf_hk(code)
-            df = yf.download(yf_code, period=period, interval=interval, progress=False)
-            if df.empty:
-                continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df[["Open", "High", "Low", "Close", "Volume"]].rename(
-                columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-            )
-            df.to_csv(path)
-            ok += 1
-            print(f"  ✓ {label} {code}  {len(df)} 行", flush=True)
-        except Exception as e:
-            print(f"  ✗ {label} {code}  {str(e)[:50]}", flush=True)
-        time.sleep(0.3)
-    print(f"  {label}完成: {ok}/{min(top_n, len(codes))}")
+        yf_code = _fmt_yf_hk(code)
+        done = False
+        for attempt in range(4):  # 最多 4 次重试
+            try:
+                df = yf.download(yf_code, period=period, interval=interval, progress=False)
+                if df.empty:
+                    # 退市/无数据，不重试直接跳
+                    break
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df = df[["Open", "High", "Low", "Close", "Volume"]].rename(
+                    columns={"Open": "open", "High": "high", "Low": "low",
+                             "Close": "close", "Volume": "volume"}
+                )
+                df.to_csv(path)
+                ok += 1
+                print(f"  ✓ {label} {code}  {len(df)} 行", flush=True)
+                done = True
+                break
+            except Exception as e:
+                msg = str(e)[:80]
+                is_rate_limit = "RateLimit" in msg or "Too Many" in msg or "429" in msg
+                if is_rate_limit and attempt < 3:
+                    wait = 5 * (attempt + 1)  # 5s, 10s, 15s 退避
+                    print(f"  ⏳ {label} {code} 限流，等 {wait}s 后重试（第 {attempt+1}/3 次）", flush=True)
+                    time.sleep(wait)
+                    continue
+                # 非限流或重试耗尽
+                if not is_rate_limit:
+                    break  # 退市/无数据不重试
+                # 限流重试耗尽
+                if attempt == 3:
+                    failed.append(code)
+                    print(f"  ✗ {label} {code} 限流 4 次仍失败，跳过", flush=True)
+                else:
+                    failed.append(code)
+                    print(f"  ✗ {label} {code}  {msg}", flush=True)
+                break
+        if not done:
+            continue
+        time.sleep(base_sleep)
+    print(f"  {label}完成: {ok}/{min(top_n, len(codes))}  失败 {len(failed)} 只")
+    if failed:
+        print(f"  失败清单: {','.join(failed[:20])}{'...' if len(failed) > 20 else ''}")
 
 
 def collect_us_daily(
