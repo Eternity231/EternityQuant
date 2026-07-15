@@ -92,6 +92,7 @@ def collect_hk_minute(
     Args:
         interval: 1m | 5m | 15m | 30m | 60m
         period: 1m=7d, 5m=2mo, 15m/30m/60m=6mo+
+        codes: 显式指定 5 位港股代码列表；传 None 则用内置热门榜
     """
     import yfinance as yf
 
@@ -101,6 +102,9 @@ def collect_hk_minute(
             "03690", "01211", "02015", "02318", "02628", "01299", "00005",
             "00011", "00388", "00883", "00941", "00981", "01347",
         ]
+    else:
+        # 显式清单：补 0 到 5 位
+        codes = [str(c).strip().zfill(5) for c in codes if str(c).strip()]
 
     label = f"港股{interval}"
     out = HK_5M_DIR if interval == "5m" else HK_1M_DIR

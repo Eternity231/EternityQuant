@@ -18,6 +18,9 @@ import numpy as np
 import pandas as pd
 
 from eq.data.paths import (
+    HK_DAILY_DIR as _HK_DAILY_DIR,
+    HK_5M_DIR as _HK_5M_DIR,
+    HK_1M_DIR as _HK_1M_DIR,
     HK_FEAT_DIR as _HK_FEAT_DIR,
     HK_MODELS_DIR as _HK_MODELS_DIR,
     ensure_data_dirs,
@@ -490,3 +493,375 @@ def predict_hk_top(
 
     df_result = pd.DataFrame(results).sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
     return df_result
+
+
+# ============================================================================
+# 方案 A：多频率分别训练 + 集成预测
+# ============================================================================
+
+def _load_hk_cache(code: str, freq: str = "daily") -> pd.DataFrame:
+    """读本地港股缓存 CSV，不存在返回空 DataFrame。
+
+    Args:
+        freq: daily | 5m | 1m
+    """
+    import os
+    if freq == "daily":
+        path = _HK_DAILY_DIR / f"{code}.csv"
+    elif freq == "5m":
+        path = _HK_5M_DIR / f"{code}.csv"
+    elif freq == "1m":
+        path = _HK_1M_DIR / f"{code}.csv"
+    else:
+        return pd.DataFrame()
+    if not path.exists() or path.stat().st_size < 100:
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        if df.empty or len(df) < 10:
+            return pd.DataFrame()
+        # 统一列名（yfinance 下发的是首字母大写 Open/Close）
+        df = df.rename(columns={
+            "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume",
+        })
+        need = {"open", "high", "low", "close", "volume"}
+        if not need.issubset(set(df.columns)):
+            return pd.DataFrame()
+        return df[["open", "high", "low", "close", "volume"]].astype(float)
+    except Exception:
+        return pd.DataFrame()
+
+
+def compute_features_hk_minute(df: pd.DataFrame, freq: str = "5m") -> pd.DataFrame:
+    """港股分钟线特征（~30 维，适配分钟尺度）。
+
+    与日线特征 compute_features_hk 的区别：
+    - 均线窗口按分钟尺度调短（MA3/5/10/30）
+    - MACD 用 12/26/9（分钟级常用）
+    - RSI/KDJ 保留，但滚动窗口缩短
+    - 剔除 MA60 等长窗口（分钟线没有足够样本）
+
+    Args:
+        freq: 5m | 1m（仅影响标签 horizon 的物理含义）
+    """
+    df = df.copy()
+    close = df["close"]
+    open_ = df["open"]
+    high = df["high"]
+    low = df["low"]
+    vol = df["volume"]
+
+    # --- 价格动量 ---
+    for p in [1, 2, 3, 5, 10, 30]:
+        df[f"ret{p}"] = close.pct_change(p)
+    df["close_ma5"] = close / close.rolling(5).mean()
+    df["close_ma10"] = close / close.rolling(10).mean()
+    df["close_ma30"] = close / close.rolling(30).mean()
+
+    # --- 均线 ---
+    for p in [3, 5, 10, 30]:
+        df[f"ma{p}"] = close.rolling(p).mean()
+    df["ma_cross"] = df["ma5"] - df["ma10"]
+
+    # --- MACD（12/26/9 与日线同尺度） ---
+    ema12 = close.ewm(span=12).mean()
+    ema26 = close.ewm(span=26).mean()
+    df["dif"] = ema12 - ema26
+    df["dea"] = df["dif"].ewm(span=9).mean()
+    df["hist"] = 2 * (df["dif"] - df["dea"])
+
+    # --- 布林带 ---
+    ma10 = close.rolling(10).mean()
+    std10 = close.rolling(10).std()
+    df["bb_upper"] = (ma10 + 2 * std10) / close - 1
+    df["bb_lower"] = (ma10 - 2 * std10) / close - 1
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / (ma10 / close + 1)
+
+    # --- 波动率 ---
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(10).mean() / close
+    ret1 = close.pct_change()
+    for p in [5, 10, 30]:
+        df[f"volatility{p}"] = ret1.rolling(p).std() * np.sqrt(p)
+
+    # --- 成交量 ---
+    for p in [5, 30]:
+        df[f"vma{p}"] = vol.rolling(p).mean()
+    df["v_ratio"] = vol / df["vma5"]
+    df["v_price_corr"] = vol.rolling(10).corr(close)
+
+    # --- 邇荡指标 ---
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    df["rsi14"] = 100 - 100 / (1 + gain / (loss + 1e-10))
+
+    llv = low.rolling(9).min()
+    hhv = high.rolling(9).max()
+    rsv = (close - llv) / (hhv - llv + 1e-10) * 100
+    df["k"] = rsv.ewm(span=3).mean()
+    df["d"] = df["k"].ewm(span=3).mean()
+
+    # --- 形态特征 ---
+    df["hl_ratio"] = (high - low) / close
+    df["co_ratio"] = (close - open_) / (high - low + 1e-10)
+    df["up_shadow"] = (high - close) / (close - low + 1e-10)
+    df["body"] = abs(close - open_) / (high - low + 1e-10)
+
+    return df.dropna()
+
+
+def train_hk_minute(
+    symbols: list[str] | None = None,
+    top_n: int = 100,
+    freq: str = "5m",           # 5m | 1m
+    horizon: int = 30,          # 分钟线预测窗口：5m×30=2.5h, 1m×30=30min
+    hidden_size: int = 128,
+    num_layers: int = 2,
+    cell_type: str = "gru",
+    batch_size: int = 512,
+    max_steps: int = 200,
+    device: str = "cuda",
+    dropout: float = 0.3,
+    walk_forward: bool = True,
+    name: str | None = None,
+    verbose: bool = True,
+    gpu_ids: str | list[int] | None = None,
+) -> dict:
+    """港股分钟线 GRU 训练（走本地缓存 5m/1m 目录，不走网络下载）。
+
+    Args:
+        freq: 5m | 1m
+        horizon: 预测窗口（根根频率单位为根数）
+    Returns:
+        {"model_name": str, "ic": float, "model_path": str, "symbols": int, "train_samples": int}
+    """
+    if symbols is None:
+        # 从日线缓存目录反推票池（确保日线有该票）
+        symbols = sorted({f.stem for f in _HK_DAILY_DIR.glob("*.csv") if f.stat().st_size > 1000})
+        if not symbols:
+            raise RuntimeError("无港股日线缓存，先跑 eq hk update-data")
+    symbols = symbols[:top_n]
+
+    all_features: list = []
+    all_labels: list = []
+    symbols_ok: list[str] = []
+
+    for code in symbols:
+        df = _load_hk_cache(code, freq=freq)
+        if df.empty or len(df) < 120:
+            continue
+        feat_df = compute_features_hk_minute(df, freq=freq)
+        if feat_df.empty:
+            continue
+        # 标签：horizon 根分钟后的收益
+        feat_df["label"] = feat_df["close"].shift(-horizon) / feat_df["close"] - 1
+        feat_df = feat_df.dropna()
+        if len(feat_df) < 60:
+            continue
+
+        exclude = {"open", "high", "low", "close", "volume", "label", "vma5", "vma30"}
+        feat_cols = [c for c in feat_df.columns if c not in exclude]
+        time_steps = 6
+        for i in range(time_steps, len(feat_df)):
+            all_features.append(feat_df[feat_cols].iloc[i - time_steps:i].values.flatten())
+            all_labels.append(feat_df["label"].iloc[i])
+        symbols_ok.append(code)
+
+    if not all_features:
+        raise RuntimeError(f"分钟线({freq})特征计算后无有效样本（{len(symbols)} 只股票）")
+
+    import numpy as _np
+    X = _np.array(all_features, dtype=_np.float32)
+    y = _np.array(all_labels, dtype=_np.float32)
+
+    seq_len = time_steps
+    input_size = len(feat_cols)
+
+    from eq.strategy.factors.ml_workflow import _SimpleSeqModel
+
+    # Walk-Forward Validation
+    if walk_forward and len(X) > 240:
+        window = 60
+        step = 30
+        wf_ics = []
+        if verbose:
+            print(f"  Walk-Forward Validation({freq}): 窗口={window} 步长={step}", flush=True)
+        for wf_start in range(window, len(X) - window, step):
+            wf_train_x = X[:wf_start]
+            wf_train_y = y[:wf_start]
+            wf_valid_x = X[wf_start:wf_start + window]
+            wf_valid_y = y[wf_start:wf_start + window]
+            if len(wf_train_x) < 120 or len(wf_valid_x) < 10:
+                continue
+            wf_model = _SimpleSeqModel(
+                input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
+                hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
+                lr=1e-3, max_steps=100, batch_size=batch_size,
+                device=device, dropout=dropout, use_scheduler=True,
+            )
+            wf_model.fit(wf_train_x, wf_train_y, wf_valid_x, wf_valid_y, early_stop=15)
+            wf_ics.append(float(wf_model.best_score))
+        if wf_ics and verbose:
+            avg_ic = sum(wf_ics) / len(wf_ics)
+            print(f"  Walk-Forward IC({freq}): mean={avg_ic:+.4f}  ({len(wf_ics)} 窗口)", flush=True)
+
+    # 固定切分验证
+    split = int(len(X) * 0.8)
+    x_train, y_train = X[:split], y[:split]
+    x_valid, y_valid = X[split:], y[split:]
+
+    if verbose:
+        print(f"分钟线数据集({freq})：{len(x_train)} 训练 + {len(x_valid)} 验证  "
+              f"（{len(symbols_ok)} 只，{len(feat_cols)} 维特征）", flush=True)
+
+    model = _SimpleSeqModel(
+        input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
+        hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
+        lr=1e-3, max_steps=max_steps, batch_size=batch_size,
+        device=device, dropout=dropout, use_scheduler=True,
+    )
+    model.fit(x_train, y_train, x_valid, y_valid, early_stop=20)
+    ic = float(model.best_score)
+
+    import pickle as _pkl
+    _ensure_dirs()
+    model_name = name or f"hk_{cell_type}_{freq}_h{horizon}_{dt.date.today().strftime('%Y%m%d')}"
+    model_path = _HK_MODELS_DIR / f"{model_name}.pkl"
+    with open(model_path, "wb") as f:
+        _pkl.dump(model, f)
+
+    result = {
+        "model_name": model_name,
+        "ic": ic,
+        "model_path": str(model_path),
+        "symbols": len(symbols_ok),
+        "train_samples": len(x_train),
+        "freq": freq,
+        "horizon": horizon,
+    }
+    if verbose:
+        print(f"\n分钟线训练完成({freq})：IC={ic:+.4f}  {len(symbols_ok)} 只  {model_path.name}", flush=True)
+    return result
+
+
+def predict_hk_ensemble(
+    model_daily: str,
+    model_5m: str | None = None,
+    model_1m: str | None = None,
+    symbols: list[str] | None = None,
+    top_n: int = 10,
+    weights: dict | None = None,
+    lookback_days: int = 90,
+) -> pd.DataFrame:
+    """港股多频率集成预测（方案 A 核心）。
+
+    Args:
+        model_daily: 日线模型路径（必传）
+        model_5m: 5 分钟线模型路径（可选）
+        model_1m: 1 分钟线模型路径（可选）
+        weights: {"daily": w1, "5m": w2, "1m": w3} 加权集成；默认均等
+    Returns:
+        DataFrame [symbol, score_daily, score_5m, score_1m, score]，按 score 降序
+    """
+    import pickle as _pkl
+
+    if symbols is None:
+        symbols = sorted({f.stem for f in _HK_DAILY_DIR.glob("*.csv") if f.stat().st_size > 1000})
+        if not symbols:
+            raise RuntimeError("无港股日线缓存，先跑 eq hk update-data")
+
+    if weights is None:
+        weights = {"daily": 1.0, "5m": 1.0 if model_5m else 0.0, "1m": 1.0 if model_1m else 0.0}
+    total_w = sum(weights.values())
+    if total_w <= 0:
+        raise RuntimeError("集成权重全为 0")
+
+    models: dict[str, object] = {}
+    for key, path in [("daily", model_daily), ("5m", model_5m), ("1m", model_1m)]:
+        if path and Path(path).exists():
+            with open(path, "rb") as f:
+                models[key] = _pkl.load(f)
+
+    if "daily" not in models:
+        raise RuntimeError(f"日线模型必传且必须存在: {model_daily}")
+
+    start = (dt.date.today() - dt.timedelta(days=lookback_days)).isoformat()
+    end = dt.date.today().isoformat()
+
+    results: list[dict] = []
+    for code in symbols:
+        row: dict = {"symbol": f"{code}.HK"}
+        valid_any = False
+
+        # 日线分支（缓存不够时在线补拉）
+        if "daily" in models:
+            df = _load_hk_cache(code, freq="daily")
+            if not df.empty and len(df) < 120:
+                try:
+                    df = download_hk_stock(code, start, end)
+                except Exception:
+                    pass
+            if not df.empty and len(df) >= 60:
+                feat_df = compute_features_hk(df)
+                if not feat_df.empty:
+                    exclude = {"open", "high", "low", "close", "volume", "label", "vma5", "vma20"}
+                    feat_cols = [c for c in feat_df.columns if c not in exclude]
+                    m = models["daily"]
+                    last = feat_df[feat_cols].iloc[-m.seq_len:].values.flatten()
+                    if len(last) == m.seq_len * len(feat_cols):
+                        row["score_daily"] = float(m.predict(pd.DataFrame([last]))[0])
+                        valid_any = True
+
+        # 5 分钟线分支
+        if "5m" in models:
+            df = _load_hk_cache(code, freq="5m")
+            if not df.empty and len(df) >= 60:
+                feat_df = compute_features_hk_minute(df, freq="5m")
+                if not feat_df.empty:
+                    exclude = {"open", "high", "low", "close", "volume", "label", "vma5", "vma30"}
+                    feat_cols = [c for c in feat_df.columns if c not in exclude]
+                    m = models["5m"]
+                    last = feat_df[feat_cols].iloc[-m.seq_len:].values.flatten()
+                    if len(last) == m.seq_len * len(feat_cols):
+                        row["score_5m"] = float(m.predict(pd.DataFrame([last]))[0])
+                        valid_any = True
+
+        # 1 分钟线分支
+        if "1m" in models:
+            df = _load_hk_cache(code, freq="1m")
+            if not df.empty and len(df) >= 60:
+                feat_df = compute_features_hk_minute(df, freq="1m")
+                if not feat_df.empty:
+                    exclude = {"open", "high", "low", "close", "volume", "label", "vma5", "vma30"}
+                    feat_cols = [c for c in feat_df.columns if c not in exclude]
+                    m = models["1m"]
+                    last = feat_df[feat_cols].iloc[-m.seq_len:].values.flatten()
+                    if len(last) == m.seq_len * len(feat_cols):
+                        row["score_1m"] = float(m.predict(pd.DataFrame([last]))[0])
+                        valid_any = True
+
+        if valid_any:
+            results.append(row)
+
+    if not results:
+        return pd.DataFrame(columns=["symbol", "score"])
+
+    df = pd.DataFrame(results)
+
+    def _w(row, key):
+        v = row.get(f"score_{key}")
+        return v if pd.notna(v) else 0.0
+
+    df["score"] = 0.0
+    for key in ("daily", "5m", "1m"):
+        if key in models:
+            df["score"] += df.apply(lambda r: _w(r, key) * weights[key], axis=1)
+    df["score"] = df["score"] / total_w
+
+    cols = ["symbol", "score"]
+    for k in ("daily", "5m", "1m"):
+        if k in models:
+            cols.insert(cols.index("score"), f"score_{k}")
+    df = df[cols].sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
+    return df

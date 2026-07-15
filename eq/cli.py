@@ -878,6 +878,71 @@ def hk_predict(
     print(df.to_string(index=False))
 
 
+@hk_app.command("train-minute", help="港股分钟线 GRU 训练（走本地缓存 5m/1m，方案 A）")
+def hk_train_minute(
+    freq: str = typer.Option("5m", "--freq", "-f", help="5m | 1m"),
+    top_n: int = typer.Option(100, "--top", "-n", help="前 N 只"),
+    horizon: int = typer.Option(30, "--horizon", "-h", help="预测窗口（根数，5m×30=2.5h）"),
+    cell_type: str = typer.Option("gru", "--cell", "-c", help="gru/lstm"),
+    hidden_size: int = typer.Option(128, "--hidden", help="隐藏层大小"),
+    num_layers: int = typer.Option(2, "--layers", help="层数"),
+    dropout: float = typer.Option(0.3, "--dropout", help="Dropout 率"),
+    walk_forward: bool = typer.Option(True, "--walk-forward/--no-walk", help="Walk-Forward 滚动验证"),
+    device: str = typer.Option("cuda", "--device", "-d", help="cuda/cpu"),
+    name: str = typer.Option("", "--name", help="模型名"),
+    gpus: str = typer.Option("", "--gpus", help="多卡并行 GPU ID，如 '0,1'"),
+):
+    from eq.data.hk_market import train_hk_minute
+    try:
+        result = train_hk_minute(
+            freq=freq, top_n=top_n, horizon=horizon,
+            cell_type=cell_type, hidden_size=hidden_size,
+            num_layers=num_layers, dropout=dropout,
+            walk_forward=walk_forward, device=device,
+            name=name or None,
+            gpu_ids=gpus if gpus else None,
+        )
+    except Exception as e:
+        typer.echo(f"分钟线训练失败：{e}", err=True)
+        raise typer.Exit(1)
+    typer.echo(
+        f"\n分钟线训练完成({result['freq']})：IC={result['ic']:+.4f}  "
+        f"{result['symbols']} 只  模型：{result['model_path']}"
+    )
+
+
+@hk_app.command("predict-ensemble", help="港股多频率集成预测（方案 A：日线 + 5m + 1m 加权）")
+def hk_predict_ensemble(
+    model_daily: str = typer.Argument(help="日线模型路径（必传）"),
+    model_5m: str = typer.Option("", "--5m", help="5 分钟模型路径"),
+    model_1m: str = typer.Option("", "--1m", help="1 分钟模型路径"),
+    top_n: int = typer.Option(10, "--top", "-n", help="前 N 名"),
+    w_daily: float = typer.Option(1.0, "--w-daily", help="日线权重"),
+    w_5m: float = typer.Option(1.0, "--w-5m", help="5 分钟权重"),
+    w_1m: float = typer.Option(1.0, "--w-1m", help="1 分钟权重"),
+    lookback_days: int = typer.Option(90, "--lookback", help="日线在线补拉的回看天数"),
+):
+    from eq.data.hk_market import predict_hk_ensemble
+    weights = {"daily": w_daily, "5m": w_5m, "1m": w_1m}
+    try:
+        df = predict_hk_ensemble(
+            model_daily=model_daily,
+            model_5m=model_5m or None,
+            model_1m=model_1m or None,
+            top_n=top_n,
+            weights=weights,
+            lookback_days=lookback_days,
+        )
+    except Exception as e:
+        typer.echo(f"集成预测失败：{e}", err=True)
+        raise typer.Exit(1)
+    if df.empty:
+        typer.echo("集成预测结果为空")
+        return
+    print(f"\n港股多频率集成预测 Top{top_n}：\n")
+    print(df.to_string(index=False))
+
+
 # ---------- eq dash 命令（放末尾，避免 streamlit 启动逻辑被其他装饰器干扰） ----------
 
 # ===== eq data 数据收集命令 =====
@@ -902,15 +967,25 @@ def data_hk(
 
 
 @data_app.command("hk-5min", help="港股 5 分钟线（yfinance，最近 30 天）")
-def data_hk_5min(top_n: int = typer.Option(200, "--top", "-n", help="前 N 只")):
+def data_hk_5min(
+    top_n: int = typer.Option(200, "--top", "-n", help="前 N 只"),
+    codes_file: str = typer.Option("", "--codes-file", help="自定义品种表 txt，自动解析其中港股代码"),
+):
     from eq.data.collector import collect_hk_minute
-    collect_hk_minute(top_n=top_n, interval="5m", period="1mo")
+    from eq.data.hk_market import parse_hk_codes_from_file
+    codes = parse_hk_codes_from_file(codes_file) if codes_file else None
+    collect_hk_minute(codes=codes, top_n=top_n, interval="5m", period="1mo")
 
 
 @data_app.command("hk-1min", help="港股 1 分钟线（yfinance，最近 7 天）")
-def data_hk_1min(top_n: int = typer.Option(200, "--top", "-n", help="前 N 只")):
+def data_hk_1min(
+    top_n: int = typer.Option(200, "--top", "-n", help="前 N 只"),
+    codes_file: str = typer.Option("", "--codes-file", help="自定义品种表 txt，自动解析其中港股代码"),
+):
     from eq.data.collector import collect_hk_minute
-    collect_hk_minute(top_n=top_n, interval="1m", period="7d")
+    from eq.data.hk_market import parse_hk_codes_from_file
+    codes = parse_hk_codes_from_file(codes_file) if codes_file else None
+    collect_hk_minute(codes=codes, top_n=top_n, interval="1m", period="7d")
 
 
 @data_app.command("us", help="美股日线（yfinance）")
