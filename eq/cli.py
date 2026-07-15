@@ -805,16 +805,26 @@ def sched_daemon():
 
 # ---------- eq hk 子命令 ----------
 
-@hk_app.command("update-data", help="下载热门港股日线数据到本地缓存（Sina 源，200 只约 3 分钟）")
+@hk_app.command("update-data", help="下载港股日线数据到本地缓存（Sina 源，200 只约 3 分钟）")
 def hk_update_data(
     start: str = typer.Option("", "--start", "-s", help="起始日，默认 2 年前"),
     end: str = typer.Option("", "--end", "-e", help="结束日，默认今天"),
-    top_n: int = typer.Option(200, "--top", "-n", help="前 N 只热门股"),
+    top_n: int = typer.Option(200, "--top", "-n", help="前 N 只热门股（显式 --codes-file 时仅截前 N）"),
     workers: int = typer.Option(3, "--workers", "-w", help="并行数"),
+    codes_file: str = typer.Option("", "--codes-file", help="自定义品种表 txt 路径，自动解析其中港股代码（5 位数字）"),
 ):
-    from eq.data.hk_market import update_hk_data
+    from eq.data.hk_market import update_hk_data, parse_hk_codes_from_file
     try:
-        result = update_hk_data(start=start or None, end=end or None, top_n=top_n, workers=workers)
+        codes = None
+        if codes_file:
+            codes = parse_hk_codes_from_file(codes_file)
+            if not codes:
+                typer.echo(f"警告：品种表 {codes_file} 未解析出港股代码，回退到热门榜", err=True)
+                codes = None
+        result = update_hk_data(
+            start=start or None, end=end or None, top_n=top_n,
+            workers=workers, codes=codes,
+        )
     except Exception as e:
         typer.echo(f"港股数据下载失败：{e}", err=True)
         raise typer.Exit(1)

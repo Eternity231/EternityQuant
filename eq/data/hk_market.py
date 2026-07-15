@@ -46,7 +46,7 @@ def _dl_one(code: str, start: str, end: str) -> tuple:
 # ========== 第 1 步：数据下载 ==========
 
 def list_hk_stocks(limit: int = 200) -> list[str]:
-    """拉港股列表（Sina 源，全量 2799 只约 83s，默认取前 200 热门）。"""
+    """拉港股列表（Sina 源，全量 2799 只约 83s，默认取前 200 烱门）。"""
     import akshare as ak
     try:
         df = ak.stock_hk_spot()
@@ -57,6 +57,64 @@ def list_hk_stocks(limit: int = 200) -> list[str]:
         return codes
     except Exception:
         return []
+
+
+def parse_hk_codes_from_file(path: str | Path, verbose: bool = True) -> list[str]:
+    """从混合品种表文件中解析出港股代码（5 位数字）。
+
+    支持 Table.txt 这种「代码 制表符 名称」格式，自动剔除：
+    - A 股（SH/SZ 前缀）
+    - 美股（纯字母代码）
+    - 指数/ETF/外汇（字母混合）
+    - 已带 -W 后缀的二次上市标记
+
+    Returns:
+        5 位港股代码列表（去重保序），如 ["00700", "09988", ...]
+    """
+    import re
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"品种表文件不存在: {p}")
+
+    codes: list[str] = []
+    seen: set[str] = set()
+    # 港股代码：5 位纯数字（akshare stock_hk_daily 接收的就是 5 位字符串）
+    hk_pattern = re.compile(r"^\d{5}$")
+
+    # 港 A 品种表常见 GBK 编码，先读 bytes 再试解码
+    raw_bytes = p.read_bytes()
+    text: str | None = None
+    for enc in ("utf-8", "gbk", "gb18030", "latin-1"):
+        try:
+            text = raw_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise RuntimeError(f"无法解码品种表文件: {p}")
+
+    for line in text.splitlines():
+            # 分割：制表符或空白
+            parts = re.split(r"[\s\t]+", line.strip())
+            if not parts:
+                continue
+            raw = parts[0].strip()
+            # 剔除明显带市场前缀的（SH/SZ/BJ）或字母代码（美股/指数/ETF/外汇）
+            if not raw:
+                continue
+            if any(raw.startswith(pfx) for pfx in ("SH", "SZ", "BJ", "sh", "sz", "bj")):
+                continue
+            if not raw.isdigit():
+                continue
+            # 5 位数字 → 港股
+            if hk_pattern.match(raw):
+                if raw not in seen:
+                    seen.add(raw)
+                    codes.append(raw)
+
+    if verbose:
+        print(f"  品种表 {p.name}: 解析出 {len(codes)} 只港股  前 5: {codes[:5]}", flush=True)
+    return codes
 
 
 def download_hk_stock(symbol: str, start: str, end: str) -> pd.DataFrame:
@@ -95,10 +153,13 @@ def update_hk_data(
     end: str | None = None,
     top_n: int = 200,
     workers: int = 3,
+    codes: list[str] | None = None,
     verbose: bool = True,
 ) -> dict:
-    """下载热门港股日线数据到本地缓存。
+    """下载港股日线数据到本地缓存。
 
+    Args:
+        codes: 显式指定代码列表（5 位数字字符串）。传 None 则用 list_hk_stocks 拉热门。
     Returns:
         {"codes": int, "days": int, "cache_dir": str}
     """
@@ -107,7 +168,14 @@ def update_hk_data(
     if start is None:
         start = (dt.date.today() - dt.timedelta(days=730)).isoformat()  # 默认 2 年
 
-    codes = list_hk_stocks(limit=top_n)
+    if codes is None:
+        codes = list_hk_stocks(limit=top_n)
+    else:
+        # 显式清单：补 0 到 5 位（如 "9988" → "09988"）
+        codes = [str(c).strip().zfill(5) for c in codes if str(c).strip()]
+        if top_n > 0:
+            codes = codes[:top_n]
+
     if not codes:
         return {"codes": 0, "days": 0, "cache_dir": str(_HK_FEAT_DIR)}
 
