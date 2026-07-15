@@ -10,6 +10,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_ENV = PROJECT_ROOT / ".eternityquant" / ".env"
 
+# 统一 home 根目录，可被 EQ_HOME 环境变量覆盖。
+# 本地开发默认 = 项目内 .eternityquant/，Colab/Kaggle 设 EQ_HOME=~/.eternityquant
+DEFAULT_HOME = Path(os.environ.get("EQ_HOME", PROJECT_ROOT / ".eternityquant"))
+
 
 def load_dotenv_if_present(path: Path | None = None) -> None:
     """加载 .env 文件到 os.environ，已存在的 key 不覆盖。文件不存在静默返回。"""

@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -42,8 +43,10 @@ _HOME = Path.home() / ".eternityquant"
 # 项目内 .eternityquant 兼容旧脚本（collector.py 之前用这个）
 _PROJECT_HOME = Path(__file__).resolve().parent.parent.parent / ".eternityquant"
 
-# 优先使用项目内目录（保持与现有 ml_models / eternityquant.db 一致）
-DATA_ROOT = _PROJECT_HOME / "data"
+# 数据根目录：EQ_HOME 环境变量优先（Colab/Kaggle 用），否则项目内 .eternityquant/data
+_DATA_HOME = Path(os.environ.get("EQ_HOME", _PROJECT_HOME))
+DATA_ROOT = _DATA_HOME / "data"
+
 
 # A 股 qlib 数据
 A_DIR = DATA_ROOT / "a"
