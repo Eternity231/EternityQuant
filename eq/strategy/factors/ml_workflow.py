@@ -55,25 +55,28 @@ def _qlib_init() -> None:
     _qlib_uri = {"day": str(QLIB_CN_DATA_DIR)}
     qlib.init(provider_uri=_qlib_uri, region=REG_CN)
 
-    # monkey patch: 修 qlib 0.9.7 LocalDatasetProvider.features() bug
-    # 它把 disk_cache 当第6个位置参数传给 DatasetD.dataset()，
-    # 但 dataset() 签名是 (self, instruments, fields, ..., inst_processors=[])，
-    # disk_cache 被当作 inst_processors，然后 inst_processors=inst_processors
-    # 又作为关键字参数传入——双重复值报错 (issue #1949)。
-    try:
-        from qlib.data.data import LocalDatasetProvider, DatasetD as _DatasetD
-        _orig_features = LocalDatasetProvider.features
+    # monkey patch: 修 qlib 0.9.7 issue #1949
+    #
+    # 根因:
+    #   LocalDatasetProvider.features() 调用 DatasetD.dataset() 时把 disk_cache
+    #   作为第6个位置参数传入。DatasetD 是 Wrapper，通过 __getattr__ 委托给
+    #   LocalDatasetProvider.dataset()，其签名为:
+    #     def dataset(self, instruments, fields, start_time, end_time, freq, inst_processors=[])
+    #   所以 disk_cache 被当作 inst_processors 位置参数，同时
+    #   inst_processors=inst_processors 又作为关键字参数传入——双重复值报错。
+    #
+    # 修复: monkey patch LocalDatasetProvider.dataset() 接受 *args, 遇
+    #   inst_processors 双重复值时丢弃位置参数，保留关键字参数。
+    _orig_dataset = LocalDatasetProvider.dataset
 
-        def _patched_features(self, instruments, fields, start_time=None, end_time=None,
-                             freq="day", disk_cache=None, inst_processors=None):
-            disk_cache = _DatasetD.default_disk_cache if disk_cache is None else disk_cache
-            fields = list(fields)
-            return _DatasetD.dataset(
-                instruments, fields, start_time, end_time, freq, inst_processors=inst_processors or []
-            )
-        LocalDatasetProvider.features = _patched_features
-    except Exception:
-        pass
+    def _patched_dataset(self, *args, **kwargs):
+        if len(args) > 5 and "inst_processors" in kwargs:
+            # disk_cache 被当作第6个位置参数（inst_processors），
+            # 同时 inst_processors 又以关键字传入——丢弃位置参数
+            args = args[:5]  # 只保留 instruments, fields, start_time, end_time, freq
+        return _orig_dataset(self, *args, **kwargs)
+
+    LocalDatasetProvider.dataset = _patched_dataset
 
 
 def train(
