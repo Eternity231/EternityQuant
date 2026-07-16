@@ -666,16 +666,21 @@ def ml_predict_batch(
     print(df.to_string(index=False))
 
 
-@ml_app.command("update-data", help="更新 qlib 本地数据到最新（baostock 拉 A 股日线 → 续 .bin，多线程并行）")
+@ml_app.command("update-data", help="更新 qlib 本地数据到最新（腾讯 API 拉 A 股日线 → 续 .bin，多线程并行）")
 def ml_update_data(
     start: str = typer.Option("2020-09-28", "--start", "-s", help="续期起始日，默认接 2020-09-25"),
     end: str = typer.Option("", "--end", "-e", help="续期结束日，默认今天"),
     universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all"),
-    workers: int = typer.Option(3, "--workers", "-w", help="并行进程数（baostock 限流敏感，默认 3 最稳）"),
+    extra: str = typer.Option("", "--extra", "-x", help="额外股票代码，逗号分隔，如 SH600519,SZ000001（与 universe 合并下载训练）"),
+    workers: int = typer.Option(3, "--workers", "-w", help="并行进程数（腾讯 API 限流敏感，默认 3 最稳）"),
 ):
     from eq.strategy.factors.ml_data_updater import update_qlib_data
+    extra_codes = [c.strip().upper() for c in extra.split(",") if c.strip()] if extra else None
     try:
-        result = update_qlib_data(start=start, end=end or None, universe=universe, workers=workers, verbose=True)
+        result = update_qlib_data(
+            start=start, end=end or None, universe=universe,
+            extra_codes=extra_codes, workers=workers, verbose=True,
+        )
     except Exception as e:
         typer.echo(f"更新失败：{e}", err=True)
         raise typer.Exit(1)
@@ -947,14 +952,16 @@ def hk_predict_ensemble(
 
 # ===== eq data 数据收集命令 =====
 
-@data_app.command("a", help="A 股日线（qlib/baostock）")
+@data_app.command("a", help="A 股日线（腾讯 API → qlib .bin）")
 def data_a(
     start: str = typer.Option("2026-01-01", "--start", "-s", help="起始日"),
     universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all"),
+    extra: str = typer.Option("", "--extra", "-x", help="额外股票代码，逗号分隔，如 SH600519,SZ000001（与 universe 合并下载训练）"),
     workers: int = typer.Option(5, "--workers", "-w", help="并行进程数（默认5，过大易被API限流）"),
 ):
     from eq.data.collector import collect_a_share
-    collect_a_share(start=start, universe=universe, workers=workers)
+    extra_codes = [c.strip().upper() for c in extra.split(",") if c.strip()] if extra else None
+    collect_a_share(start=start, universe=universe, workers=workers, extra_codes=extra_codes)
 
 
 @data_app.command("hk", help="港股日线（yfinance）")

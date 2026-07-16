@@ -207,10 +207,18 @@ def collect_us_daily(
     print(f"  美股日线完成: {ok}/{min(top_n, len(codes))}")
 
 
-def collect_a_share(start: str = "2026-01-01", universe: str = "csi300", workers: int = 10):
-    """A 股日线（qlib/baostock）。"""
+def collect_a_share(start: str = "2026-01-01", universe: str = "csi300", workers: int = 10, extra_codes: list[str] | None = None):
+    """A 股日线（腾讯 API → qlib .bin）。
+
+    ``extra_codes`` 用于「单只股票 + 预设指数共同下载并训练」：
+    传 ``["SH600519"]`` 等额外代码，它们会与 ``universe``（如 csi500）
+    的成分股合并去重后一起下载、写进同一份 instruments 文件、一起训练。
+    """
     from eq.strategy.factors.ml_data_updater import update_qlib_data
-    result = update_qlib_data(start=start, universe=universe, workers=workers, verbose=True)
+    result = update_qlib_data(
+        start=start, universe=universe, workers=workers,
+        extra_codes=extra_codes, verbose=True,
+    )
     print(f"  A股({universe})完成: {result}")
     return result
 
