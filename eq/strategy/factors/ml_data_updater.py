@@ -106,6 +106,56 @@ def _tencent_daily(code: str, start: str, end: str) -> _TencentResult:
         return _TencentResult(None, is_network_error=True)
 
 
+def _watchlist_instruments() -> list[str]:
+    """从本地自选股文件提取 A 股代码。
+
+    读取 ``D:\\idmxz\\Table.txt``（Tab 分隔，第一列是代码），
+    提取 A 股代码（SH/SZ/BJ 前缀，或裸 6 位数字码），
+    转为 qlib 格式 ``["SH600000", "SZ000001"]``。
+
+    文件不存在或读取失败时回退到已有 features/ 目录扫描。
+    """
+    codes: list[str] = []
+    table_path = Path("D:/idmxz/Table.txt")
+    if not table_path.exists():
+        print(f"  [warn] 自选股文件不存在: {table_path}", flush=True)
+        return codes
+
+    try:
+        raw = table_path.read_text(encoding="utf-8").splitlines()
+        for line in raw:
+            line = line.strip()
+            if not line or line.startswith("代码") or "\t" not in line:
+                continue
+            code = line.split("\t")[0].strip()
+            if not code:
+                continue
+            # 已有前缀
+            if code.startswith(("SH", "SZ", "BJ")):
+                codes.append(code.upper())
+            # 裸 6 位数字 → 推断交易所
+            elif code.isdigit() and len(code) == 6:
+                if code.startswith(("6", "9")):
+                    codes.append(f"SH{code}")
+                elif code.startswith(("0", "3")):
+                    codes.append(f"SZ{code}")
+                elif code.startswith(("4", "8")):
+                    codes.append(f"BJ{code}")
+            # 其他（港股/美股/指数等）跳过
+    except Exception as e:
+        print(f"  [warn] 读取自选股文件失败: {e}", flush=True)
+        return codes
+
+    # 去重
+    seen = set()
+    deduped = []
+    for c in codes:
+        if c not in seen:
+            seen.add(c)
+            deduped.append(c)
+    return deduped
+
+
 def _tencent_instruments(universe: str = "csi300") -> list[str]:
     """获取成分股列表。
 
@@ -114,10 +164,11 @@ def _tencent_instruments(universe: str = "csi300") -> list[str]:
     2. akshare ``index_stock_cons_csindex``（中证指数公司官方源，最稳定）
     3. akshare ``index_stock_cons``（新浪源，老版 akshare 可用）
     4. 全 A 股：``stock_zh_a_spot``
-    5. fallback：从已有 features/ 目录扫描
+    5. 自选股：``watchlist``（从 ``D:\\idmxz\\Table.txt`` 读取）
+    6. fallback：从已有 features/ 目录扫描
 
     Args:
-        universe: csi300 | csi500 | sz50 | all
+        universe: csi300 | csi500 | sz50 | all | watchlist
     Returns:
         qlib 格式代码列表，如 ``["SH600000", "SZ000001"]``
     """
@@ -182,7 +233,11 @@ def _tencent_instruments(universe: str = "csi300") -> list[str]:
         except Exception as e:
             print(f"  [warn] stock_zh_a_spot 失败: {e}", flush=True)
 
-    # 5. 已有 features/ 目录扫描
+    # 5. 自选股（从 D:\idmxz\Table.txt 读取）
+    if universe == "watchlist":
+        codes = _watchlist_instruments()
+
+    # 6. 已有 features/ 目录扫描
     if not codes:
         feats_dir = _QLIB_DATA_DIR / "features"
         if feats_dir.exists():

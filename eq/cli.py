@@ -670,7 +670,7 @@ def ml_predict_batch(
 def ml_update_data(
     start: str = typer.Option("2020-09-28", "--start", "-s", help="续期起始日，默认接 2020-09-25"),
     end: str = typer.Option("", "--end", "-e", help="续期结束日，默认今天"),
-    universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all"),
+    universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all/watchlist（watchlist 从 D:\\idmxz\\Table.txt 读取）"),
     extra: str = typer.Option("", "--extra", "-x", help="额外股票代码，逗号分隔，如 SH600519,SZ000001（与 universe 合并下载训练）"),
     workers: int = typer.Option(3, "--workers", "-w", help="并行进程数（腾讯 API 限流敏感，默认 3 最稳）"),
 ):
@@ -955,7 +955,7 @@ def hk_predict_ensemble(
 @data_app.command("a", help="A 股日线（腾讯 API → qlib .bin）")
 def data_a(
     start: str = typer.Option("2026-01-01", "--start", "-s", help="起始日"),
-    universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all"),
+    universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all/watchlist（watchlist 从 D:\\idmxz\\Table.txt 读取）"),
     extra: str = typer.Option("", "--extra", "-x", help="额外股票代码，逗号分隔，如 SH600519,SZ000001（与 universe 合并下载训练）"),
     workers: int = typer.Option(5, "--workers", "-w", help="并行进程数（默认5，过大易被API限流）"),
 ):
