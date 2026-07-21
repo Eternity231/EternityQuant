@@ -569,7 +569,7 @@ def ml_predict(
 
 @ml_app.command("train", help="走 qlib workflow 真训练（Alpha158 + LightGBM/PyTorch/DeepLOB/TFT，可选 GPU/CUDA）")
 def ml_train(
-    universe: str = typer.Argument("csi300", help="标的池，如 csi300/csi500"),
+    universe: str = typer.Argument("csi300", help="标的池，如 csi300/csi500/all/watchlist"),
     horizon: int = typer.Argument(5, help="预测窗口（天）"),
     algo: str = typer.Option("lightgbm", "--algo", "-a", help="lightgbm | alstm | gru | lstm | mlp | deeplob | tft"),
     train_start: str = typer.Option("2015-01-01", "--train-start", help="训练区间起"),
@@ -692,7 +692,7 @@ def ml_update_data(
 
 @ml_app.command("search", help="LSTM 超参网格搜索（自动试 hidden/layers/lr/batch 组合，报告 Top3）")
 def ml_search(
-    universe: str = typer.Argument("csi300", help="标的池 csi300/csi500/all"),
+    universe: str = typer.Argument("csi300", help="标的池 csi300/csi500/all/watchlist"),
     horizon: int = typer.Argument(5, help="预测窗口（天）"),
     algo: str = typer.Option("gru", "--algo", "-a", help="gru | lstm"),
     fast: bool = typer.Option(True, "--fast/--full", help="快速模式 max_steps=50 还是完整模式 200"),
