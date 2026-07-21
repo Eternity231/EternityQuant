@@ -29,10 +29,14 @@ eq ml train csi300 5 --algo gru --device cuda --optimizer sam --loss sharpe  # S
 eq ml train csi300 5 --algo tft --device cuda --adversarial --orthogonalize   # 对抗训练 + 特征正交化
 eq ml train csi300 5 --algo gru --device cuda --optimizer lion --loss ic      # Lion 优化器（Google 进化发现）
 eq ml train csi300 5 --algo tft --device cuda --gpus "0,1,2,3"              # 多卡并行（4 张 GPU）
-eq ml update-data --start 2020-09-28 --universe csi300  # qlib 数据续到最新（baostock）
+eq ml update-data --start 2020-09-28 --universe csi300  # qlib 数据续到最新（腾讯 API）
+eq ml update-data -u csi500 -x SH600519,SZ000001         # 单股 + 预设指数合并下载训练（v0.22）
+eq ml update-data -u watchlist                            # 从 D:\idmxz\Table.txt 读自选股下载（v0.22）
 eq ml activate <model_id>
 eq ml predict-batch <model_id> --top 10                # 批量预测入 ml_predictions 表（v0.14 支持自写模型）
-eq data a                                 # A 股日线收集（baostock）
+eq data a                                 # A 股日线收集（腾讯 API → qlib .bin）
+eq data a -u csi500 -x SH600519              # 单股 + 预设指数合并下载（v0.22）
+eq data a -u watchlist                       # 从自选股文件下载（v0.22）
 eq data hk                                # 港股日线收集（akshare，全历史 2004~2026）
 eq data hk-5min                           # 港股 5 分钟线（yfinance，最近 30 天）
 eq data hk-1min                           # 港股 1 分钟线（yfinance，最近 7 天）
@@ -113,11 +117,14 @@ eq --help                               # 看所有命令
 `eq data` 命令组统一管理多市场数据收集。**所有数据落到 `~/.eternityquant/data/{a,hk,us}/` 下统一目录**（v0.20 起取代散落的 `.qlib_data/cn_data`、`.eternityquant/hk_data`、`.eternityquant/us_data`）。
 
 ```bash
-# === A 股（qlib 本地数据集，baostock/腾讯 API 续期） ===
+# === A 股（qlib 本地数据集，腾讯 API 续期） ===
 eq data a --start 2026-01-01 --universe csi300 --workers 10   # 沪深 300
 eq data a --start 2026-01-01 --universe csi500 --workers 10   # 中证 500
+eq data a --start 2026-01-01 --universe watchlist --workers 10  # 从 D:\idmxz\Table.txt 读自选股（v0.22）
+# 单只股票 + 预设指数合并下载（v0.22）：
+eq data a --start 2015-01-01 --universe csi500 --extra SH600519,SZ000001 --workers 5
 # 首次使用需先解压 qlib_cn_data 到 data/a/qlib_cn_data/，再续期：
-eq ml update-data --start 2020-09-28 --universe csi300        # baostock 拉 6 年日线
+eq ml update-data --start 2020-09-28 --universe csi300        # 腾讯 API 拉 6 年日线
 
 # === 港股（akshare Sina 源，全历史 2004~2026） ===
 eq data hk --top 73                    # 港股日线 → data/hk/daily/
@@ -133,10 +140,18 @@ eq data all --top 73                   # 全量收集
 
 | 数据源 | 市场 | 类型 | 历史长度 | 落盘位置 |
 |--------|------|------|---------|---------|
-| baostock / 腾讯 API | A 股 | 日线 | 2001~2026 | `data/a/qlib_cn_data/` |
+| 腾讯 API `web.ifzq.gtimg.cn` | A 股 | 日线 | 2001~2026 | `data/a/qlib_cn_data/` |
 | akshare `stock_hk_daily` | 港股 | 日线 | 2004~2026 | `data/hk/daily/` |
 | yfinance | 港股 | 5m/1m | 30天/7天 | `data/hk/{5m,1m}/` |
 | yfinance | 美股 | 日线 | ~2年 | `data/us/daily/` |
+
+### A 股数据抓取三项特性（v0.22）
+
+1. **单只股票 + 预设指数合并下载训练** — `--universe` 指定指数成分股（csi300/csi500/all），`--extra`/`-x` 逗号分隔额外股票代码，两者合并去重后写入同一份 `instruments/<universe>.txt`，训练时 qlib 自动读取合并池。亦支持 `--universe watchlist` 从 `D:\idmxz\Table.txt` 提取 A 股代码。
+
+2. **跳过较晚股票没上市的时间不重试** — 腾讯 API 返回空数据时判定为未上市/已退市/区间在上市前，**直接写全 NaN 跳过不重试**；只有网络异常才指数退避重试 3 次。未上市股在 `instruments` 文件中可用区间为空，qlib 训练时自动忽略。
+
+3. **下载先后顺序无关，结果一致** — 每次更新 `[start, end]` 区间都整段重算并**覆盖写** `.bin` 文件（`_write_bin` 用 `"wb"` 整段写，替代旧追加模式）；`calendars/day.txt` 合并去重升序后整段覆盖写；`instruments/<universe>.txt` 从 `close.day.bin` 扫描首/尾非 NaN 索引映射回日历日期生成。因此无论先下 2016 再下 2026、还是反之，最终 `.bin` 与 `instruments` 文件内容逐字节一致。
 
 ### 从零开始的完整数据流程
 
@@ -145,6 +160,8 @@ eq data all --top 73                   # 全量收集
 #    放到 ~/.eternityquant/data/a/qlib_cn_data/
 #    再续期到最新：
 eq ml update-data --start 2020-09-28 --universe csi300 --workers 5
+# 或合并单股 + 指数一起下载训练：
+eq ml update-data --start 2015-01-01 --universe csi500 --extra SH600519 --workers 5
 
 # 2. 港股：拉日线 + 分钟线
 eq data hk --top 73
@@ -339,15 +356,25 @@ eq hk train --top 73 --cell gru --device cuda --gpus "0,1"
 
 LSTM 路径把 Alpha158 的 158 维特征重塑成 (batch, seq_len=6, input_size=26) 的时序张量喂给 LSTM——这是量化选股的正确做法（学"过去 6 日形态"），比 MLP 把特征当独立向量强。CUDA GPU 12GB CUDA 主场。
 
-### 数据更新器（v0.15）
+### 数据更新器（v0.15，v0.22 增三项特性）
 
 qlib 本地数据集截至 2020-09-25，`eq ml update-data` 续到最新：
 
 ```bash
-eq ml update-data --start 2020-09-28 --universe csi300   # baostock 拉 6 年日线，约 30-60 分钟
+eq ml update-data --start 2020-09-28 --universe csi300   # 腾讯 API 拉 6 年日线，约 30-60 分钟
+# v0.22 新增：单股 + 预设指数合并下载训练
+eq ml update-data --start 2015-01-01 --universe csi500 --extra SH600519,SZ000001
+# v0.22 新增：从自选股文件读取（D:\idmxz\Table.txt）
+eq ml update-data --start 2015-01-01 --universe watchlist
 ```
 
-baostock 拉日线 → 转 qlib .bin 格式（float32，按日历顺序）续期 + 日历续期。续完后 `eq ml train` 用最新数据训练，`predict-batch` 出的就是今天的分数。
+腾讯 API（`web.ifzq.gtimg.cn`，国内直连无需梯子）拉日线 → 转 qlib `.bin` 格式（float32，按日历顺序）续期 + 日历续期。续完后 `eq ml train` 用最新数据训练，`predict-batch` 出的就是今天的分数。
+
+**v0.22 三项特性**（详见前文「A 股数据抓取三项特性」节）：
+
+1. **单股 + 预设指数合并下载训练** — `--extra`/`-x` 指定额内股票，与 `--universe` 成分股合并去重写入同一份 `instruments/<universe>.txt`。
+2. **跳过较晚股票没上市的时间不重试** — 腾讯返回空 → 判定未上市/已退市，直接写全 NaN 跳过；只有网络异常才重试 3 次。
+3. **下载先后顺序无关，结果一致** — `_write_bin` 覆盖写 + `_generate_instruments` 从 `.bin` 推断区间，多次下载同区间得到逐字节一致的 `.bin` 与 `instruments` 文件。
 
 ### Colab / Kaggle 云训练适配
 
@@ -432,7 +459,17 @@ eq dash --port 8501    # 启动本地看板
 12. ✅ 单元测试固化 + CLI CUDA 泄漏修复（v0.12，35 测试）
 13. ✅ 自写 LSTM + CUDA 训练进度 log（v0.13，6×26 时序重塑）
 14. ✅ predict-batch 支持自写 LSTM/MLP 模型（v0.14，按 algo 分路）
-15. ✅ qlib 数据更新器（v0.15，baostock 续到最新）
+15. ✅ qlib 数据更新器（v0.15，腾讯 API 续到最新）
+16. ✅ 高级优化器（AdamW/SAM/Lookahead/Lion）+ 可微夏普损失 + 对抗训练 + 特征正交化（v0.16）
+17. ✅ DeepLOB（CNN+BiLSTM+Attention）+ TFT（Google 多时间跨度）顶会架构复现（v0.17）
+18. ✅ 港股全链路（数据收集 → 特征 → 自写 GRU 训练 → 预测）（v0.18）
+19. ✅ 统一数据目录 `data/{a,hk,us}/` + 旧目录自动迁移（v0.20）
+20. ✅ 自选股 universe（v0.22，从 `D:\idmxz\Table.txt` 读取 A 股代码）
+21. ✅ 数据抓取三项特性（v0.22）：
+    - 单股 + 预设指数合并下载训练（`--extra`/`-x` + `--universe`）
+    - 跳过未上市/已退市时间不重试（腾讯返回空 → 写全 NaN 跳过）
+    - 下载先后顺序无关（覆盖写 `.bin` + 从 `.bin` 推断 instruments 区间）
+22. ✅ 修复导入 bug：`eq.web.run_dashboard` 改从 `runner` 导入；`search_lstm` universe 校验补 `watchlist`（v0.22）
 
 ## 剩余候选（未做）
 
