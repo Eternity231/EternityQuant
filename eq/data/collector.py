@@ -17,6 +17,122 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import requests
+
+
+# ---------- 东财 push2his 统一 K 线拉取器（A/港/美三市场统一接口，免费无 key） ----------
+#
+# 真实用法（浏览器验证可用，沙盒代理可能屏）:
+#   URL: https://push2his.eastmoney.com/api/qt/stock/kline/get
+#   secid 映射: A 股沪=1.<code>, 深=0.<code>; 港股=116.<5位code>; 美股 NASDAQ=105.<sym>, NYSE=106.<sym>
+#   klt: 101 日 K / 102 周 / 103 月 / 1 1分钟 / 5 5分钟 / 15 / 30 / 60
+#   fqt: 0 不复权 / 1 前复权 / 2 后复权
+#   beg/end: YYYYMMDD
+#   fields2=f51..f61 = 日期,开,收,高,低,量,额,振幅,涨跌幅,涨跌额,换手率
+#   JSONP 剥离: cb="" 时无包裹直接 JSON；否则剥 cb(...) 前后
+#
+# 三市场统一接入，替代分散的 akshare(港) / yfinance(美) 多套源
+_EM_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+_EM_UT = "fa5fd1943c7b386f172d6893dbfba10b"  # 东财固定 ut token（公开）
+_EM_FIELDS2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"  # 11 列 K 线
+_EM_KLT = {"daily": "101", "weekly": "102", "monthly": "103",
+            "1": "1", "5": "5", "15": "15", "30": "30", "60": "60"}
+_EM_COLS = ["date", "open", "close", "high", "low", "volume", "amount",
+             "amplitude", "pct_change", "change", "turnover"]
+
+
+def _em_secid(code: str, market: str) -> str:
+    """把项目内标准 code 映射成东财 secid。
+
+    Args:
+        code: 项目内标准 code
+            A 股: "SH600519" / "SZ000001" / "600519.SH"
+            港股: "00700" / "09988"（5 位数字，前导零保留）
+            美股: "AAPL" / "MSFT"
+        market: "a" / "hk" / "us"
+    """
+    c = code.upper().replace(".SH", "").replace(".SZ", "").replace(".US", "").replace(".HK", "")
+    if market == "a":
+        # 沪=1. 深=0.（含北交所 SZ）
+        if c.startswith("SH"):
+            return "1." + c[2:]
+        if c.startswith("SZ"):
+            return "0." + c[2:]
+        if c.startswith("6"):  # 裸代码默认沪
+            return "1." + c
+        return "0." + c
+    if market == "hk":
+        # 港股固定 116.<5位数字>，保留前导零
+        return "116." + c.zfill(5)
+    if market == "us":
+        # NASDAQ=105, NYSE=106；无 key 时用 105 兜底（美股代码大概率 NASDAQ）
+        return "105." + c
+    raise ValueError(f"未知 market: {market}")
+
+
+def _em_kline(code: str, market: str, start: str, end: str,
+              period: str = "daily", adjust: str = "qfq") -> pd.DataFrame:
+    """东财统一日 K/分钟 K 拉取器，返回 OHLCV DataFrame。
+
+    Args:
+        code: 项目内标准 code（同 _em_secid）
+        market: "a" / "hk" / "us"
+        start/end: "YYYY-MM-DD" 或 "YYYYMMDD"（统一转 YYYYMMDD）
+        period: "daily" / "weekly" / "monthly" / "1" / "5" / "15" / "30" / "60"
+        adjust: "qfq" 前复权（默认）/ "hfq" 后复权 / "" 不复权
+    Returns:
+        DataFrame[date, open, close, high, low, volume, amount, pct_change, turnover]
+        失败时返回空 DataFrame（调用方 fallback 到 akshare/yfinance）
+    """
+    beg = start.replace("-", "")
+    end_ = end.replace("-", "")
+    klt = _EM_KLT.get(period, "101")
+    fqt = {"qfq": "1", "hfq": "2"}.get(adjust, "0")
+    params = {
+        "cb": "",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": _EM_FIELDS2,
+        "ut": _EM_UT,
+        "klt": klt,
+        "fqt": fqt,
+        "secid": _em_secid(code, market),
+        "beg": beg,
+        "end": end_,
+        "lmt": "8000",  # 单次上限，日 K 足盖 30 年
+        "_": str(int(time.time() * 1000)),
+    }
+    try:
+        r = requests.get(_EM_URL, params=params, timeout=20,
+                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        r.encoding = "utf-8"
+        txt = r.text.strip()
+        # JSONP 剥离（cb="" 时一般无包裹，但东财偶尔回 cb("")）
+        if txt.startswith("(") and txt.endswith(");"):
+            txt = txt[1:-2]
+        if txt.startswith('"') or txt.startswith("'"):
+            txt = txt.strip('"').strip("'")
+        j = pd.io.json.loads(txt) if hasattr(pd.io.json, "loads") else __import__("json").loads(txt)
+        kl = j.get("data", {}).get("klines", [])
+        if not kl:
+            return pd.DataFrame()
+        rows = [row.split(",") for row in kl]
+        df = pd.DataFrame(rows, columns=_EM_COLS)
+        # 数值列转 float
+        for col in ["open", "close", "high", "low", "amount", "amplitude", "pct_change", "change", "turnover"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Int64")
+        df["date"] = pd.to_datetime(df["date"])  # 日 K 是 YYYY-MM-DD，分钟 K 是 YYYY-MM-DD HH:MM
+        df = df.sort_values("date").reset_index(drop=True)
+        # 裁剪到 [start, end]（东财 beg/end 含端点，再核一次防越界）
+        if beg:
+            df = df[df["date"] >= pd.Timestamp(beg)]
+        if end_:
+            df = df[df["date"] <= pd.Timestamp(end_)]
+        return df[["date", "open", "close", "high", "low", "volume", "amount", "pct_change", "turnover"]]
+    except Exception:
+        return pd.DataFrame()  # 调用方 fallback
+
+
 
 from eq.data.paths import (
     HK_DAILY_DIR, HK_5M_DIR, HK_1M_DIR,
@@ -65,18 +181,24 @@ def collect_hk_daily(
             except:
                 pass
         try:
-            df = ak.stock_hk_daily(symbol=code, adjust="qfq")
+            # 主源: 东财 push2his 统一接口（免费无 key，A/港/美同源）
+            df = _em_kline(code, "hk", start, end, period="daily", adjust="qfq")
             if df.empty:
-                continue
-            df = df.rename(columns={"date": "Date"}).set_index("Date")
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
-            df = df[["open", "high", "low", "close", "volume"]]
-            # 按 start/end 截窗（akshare 只能拉全历史，本地截）
-            if start:
-                df = df[df.index >= pd.Timestamp(start)]
-            if end:
-                df = df[df.index <= pd.Timestamp(end)]
+                # fallback: akshare 新浪源（东财被限流时）
+                import akshare as ak
+                df = ak.stock_hk_daily(symbol=code, adjust="qfq")
+                if df.empty:
+                    continue
+                df = df.rename(columns={"date": "date"}).set_index("date")
+                df.index = pd.to_datetime(df.index)
+                df = df.sort_index()
+                df = df[["open", "high", "low", "close", "volume"]].reset_index()
+                if start:
+                    df = df[df["date"] >= pd.Timestamp(start)]
+                if end:
+                    df = df[df["date"] <= pd.Timestamp(end)]
+            else:
+                df = df.set_index("date").rename(columns={"close": "close"})[["open", "close", "high", "low", "volume"]]
             if df.empty:
                 continue
             df.to_csv(path)
@@ -84,7 +206,7 @@ def collect_hk_daily(
             print(f"  ✓ 港股日线 {code}  {len(df)} 行  {df.index[0].date()}~{df.index[-1].date()}", flush=True)
         except Exception as e:
             print(f"  ✗ 港股日线 {code}  {str(e)[:50]}", flush=True)
-        time.sleep(0.5)
+        time.sleep(0.3)  # 东财源比 akshare 快，间隔从 0.5→0.3
     print(f"  港股日线完成: {ok}/{min(top_n, len(codes))}")
 
 
@@ -197,20 +319,29 @@ def collect_us_daily(
             ok += 1
             continue
         try:
-            df = yf.download(code, start=start, end=end, progress=False)
+            # 主源: 东财 push2his 统一接口（免费无 key，A/港/美同源）
+            df = _em_kline(code, "us", start, end, period="daily", adjust="qfq")
+            if df.empty:
+                # fallback: yfinance（东财被限流时）
+                import yfinance as yf
+                df = yf.download(code, start=start, end=end, progress=False)
+                if df.empty:
+                    continue
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df = df[["Open", "High", "Low", "Close", "Volume"]].rename(
+                    columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+                ).reset_index().rename(columns={"Date": "date"})
+            else:
+                df = df.set_index("date")[["open", "close", "high", "low", "volume"]]
             if df.empty:
                 continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df[["Open", "High", "Low", "Close", "Volume"]].rename(
-                columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-            )
             df.to_csv(path)
             ok += 1
             print(f"  ✓ 美股日线 {code}  {len(df)} 行", flush=True)
         except Exception as e:
             print(f"  ✗ 美股日线 {code}  {str(e)[:50]}", flush=True)
-        time.sleep(0.3)
+        time.sleep(0.3)  # 东财源比 yfinance 快，间隔从 0.3→0.3
     print(f"  美股日线完成: {ok}/{min(top_n, len(codes))}")
 
 

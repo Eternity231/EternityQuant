@@ -37,7 +37,7 @@ st.caption(f"今日 {dt.date.today().isoformat()}")
 
 page = st.sidebar.selectbox(
     "页面",
-    ["概览", "持仓", "自选", "监控规则", "ML 模型", "深度研究"],
+    ["概览", "持仓", "自选", "监控规则", "ML 模型", "下载管理", "深度研究"],
     index=0,
 )
 
@@ -232,5 +232,154 @@ elif page == "深度研究":
             except Exception as e:
                 st.error(f"研究失败：{repr(e)[:300]}")
 
+# -------- 下载管理（v0.23：A/港/美股下载 + 缓存清理 + 进度展示） --------
+elif page == "下载管理":
+    import subprocess as _sp
+    import pathlib as _pl
+    from eq.db import DEFAULT_HOME as _HOME
+
+    st.header("下载管理")
+    st.caption("GUI 替代命令行管理数据下载，含缓存清理")
+
+    _dl_tab1, _dl_tab2, _dl_tab3 = st.tabs(["A股下载", "港股下载", "美股下载"])
+
+    # --- A股下载 ---
+    with _dl_tab1:
+        st.subheader("A股日线（腾讯 API → qlib .bin）")
+        col_a1, col_a2, col_a3, col_a4 = st.columns(4)
+        universe = col_a1.selectbox("Universe", ["csi300", "csi500", "csi800", "all", "watchlist"], index=1)
+        start_a = col_a2.text_input("起始日", "2024-01-01")
+        end_a = col_a3.text_input("结束日", dt.date.today().isoformat())
+        workers_a = col_a4.number_input("并发", min_value=1, max_value=32, value=8, step=1)
+        extra_a = st.text_input("附加股票（逗号分隔，如 SH688256,SZ000001）", "")
+        col_a5, col_a6 = st.columns(2)
+        extra_codes = [x.strip() for x in extra_a.split(",") if x.strip()] if extra_a else None
+        if col_a5.button("📥 开始下载", type="primary"):
+            cmd = ["eq", "ml", "update-data", "-u", universe, "-s", start_a, "-e", end_a, "-w", str(workers_a)]
+            if extra_codes:
+                cmd += ["-x", ",".join(extra_codes)]
+            st.info(f"执行：{' '.join(cmd)}")
+            with st.spinner("下载中... 完成后页面自动刷新"):
+                proc = _sp.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if proc.returncode == 0:
+                st.success("✅ 下载完成")
+                st.code(proc.stdout[-2000:])
+            else:
+                st.error("❌ 下载失败")
+                st.code(proc.stderr[-2000:] or proc.stdout[-2000:])
+        if col_a6.button("🔄 重建 instruments"):
+            cmd = ["eq", "ml", "regen-instruments", universe]
+            if extra_codes:
+                cmd += ["-x", ",".join(extra_codes)]
+            proc = _sp.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            st.success("✅ instruments 重建完成" if proc.returncode == 0 else "❌ 失败")
+            st.code(proc.stdout[-1000:] or proc.stderr[-1000:])
+
+    # --- 港股下载 ---
+    with _dl_tab2:
+        st.subheader("港股日线（akshare 新浪源，全历史 2004~2026）")
+        col_h1, col_h2, col_h3 = st.columns(3)
+        top_h = col_h1.number_input("前 N 只", min_value=1, max_value=500, value=100, step=10)
+        start_h = col_h2.text_input("起始日", "2024-01-01")
+        codes_file_h = col_h3.text_input("品种表 txt（可选，留空用 top）", "")
+        if st.button("📥 开始下载港股", type="primary"):
+            cmd = ["eq", "data", "hk", "-n", str(top_h), "-s", start_h]
+            if codes_file_h.strip():
+                cmd += ["--codes-file", codes_file_h.strip()]
+            st.info(f"执行：{' '.join(cmd)}")
+            with st.spinner("下载中（akshare 源约 3 分钟/100 只）..."):
+                proc = _sp.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if proc.returncode == 0:
+                st.success("✅ 港股下载完成")
+                st.code(proc.stdout[-2000:])
+            else:
+                st.error("❌ 港股下载失败")
+                st.code(proc.stderr[-2000:] or proc.stdout[-2000:])
+
+        # 港股分钟线
+        st.markdown("---")
+        st.subheader("港股分钟线（yfinance Yahoo 源）")
+        col_hm1, col_hm2, col_hm3 = st.columns(3)
+        freq_hm = col_hm1.selectbox("频率", ["5min", "1min"], index=0)
+        top_hm = col_hm2.number_input("前 N 只", min_value=1, max_value=500, value=100, step=10, key="hk_min_top")
+        codes_file_hm = col_hm3.text_input("品种表 txt（可选）", "", key="hk_min_codes")
+        if st.button("📥 下载分钟线港股"):
+            cmd = ["eq", "data", f"hk-{freq_hm}", "-n", str(top_hm)]
+            if codes_file_hm.strip():
+                cmd += ["--codes-file", codes_file_hm.strip()]
+            st.info(f"执行：{' '.join(cmd)}（yfinance 限流，内置 8s 间隔）")
+            with st.spinner("下载中（yfinance 源约 15 分钟/100 只）..."):
+                proc = _sp.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if proc.returncode == 0:
+                st.success("✅ 港股分钟线下载完成")
+                st.code(proc.stdout[-2000:])
+            else:
+                st.error("❌ 失败")
+                st.code(proc.stderr[-2000:] or proc.stdout[-2000:])
+
+    # --- 美股下载 ---
+    with _dl_tab3:
+        st.subheader("美股日线（yfinance Yahoo 源）")
+        col_u1, col_u2, col_u3 = st.columns(3)
+        top_u = col_u1.number_input("前 N 只", min_value=1, max_value=500, value=100, step=10, key="us_top")
+        start_u = col_u2.text_input("起始日", "2024-01-01")
+        codes_file_u = col_u3.text_input("品种表 txt（可选）", "", key="us_codes")
+        if st.button("📥 开始下载美股", type="primary"):
+            cmd = ["eq", "data", "us", "-n", str(top_u), "-s", start_u]
+            if codes_file_u.strip():
+                cmd += ["--codes-file", codes_file_u.strip()]
+            st.info(f"执行：{' '.join(cmd)}")
+            with st.spinner("下载中（yfinance 源约 15 分钟/100 只）..."):
+                proc = _sp.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if proc.returncode == 0:
+                st.success("✅ 美股下载完成")
+                st.code(proc.stdout[-2000:])
+            else:
+                st.error("❌ 失败")
+                st.code(proc.stderr[-2000:] or proc.stdout[-2000:])
+
+    # --- 缓存清理（跨 tab 共用） ---
+    st.markdown("---")
+    st.subheader("🧹 缓存清理")
+    _cache_root = _pl.Path("data")
+    _qlib_root = _pl.Path(_HOME) / "data" / "a" / "qlib_cn_data"
+    _cache_dirs = {
+        "A 股 qlib .bin（features）": _qlib_root / "features",
+        "A 股 qlib 日历": _qlib_root / "calendars",
+        "A 股 qlib instruments": _qlib_root / "instruments",
+        "港股日线 CSV": _cache_root / "hk" / "daily",
+        "港股 5 分钟 CSV": _cache_root / "hk" / "5m",
+        "港股 1 分钟 CSV": _cache_root / "hk" / "1m",
+        "美股日线 CSV": _cache_root / "us" / "daily",
+        "美股 5 分钟 CSV": _cache_root / "us" / "5m",
+        "美股 1 分钟 CSV": _cache_root / "us" / "1m",
+    }
+    cache_choice = st.multiselect("选择要清理的缓存目录", list(_cache_dirs.keys()))
+    col_c1, col_c2 = st.columns(2)
+    if col_c1.button("🧹 清理选中缓存", type="primary"):
+        cleared = 0
+        for name in cache_choice:
+            d = _cache_dirs[name]
+            if d.exists():
+                try:
+                    for f in d.rglob("*"):
+                        if f.is_file():
+                            f.unlink()
+                    cleared += 1
+                    st.info(f"已清 {name}")
+                except Exception as e:
+                    st.error(f"清 {name} 失败：{repr(e)[:100]}")
+        st.success(f"清理完成，共清 {cleared} 个目录" if cleared else "未选任何目录")
+    if col_c2.button("📊 查看缓存占用"):
+        rows = []
+        for name, d in _cache_dirs.items():
+            if d.exists():
+                total = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                files = sum(1 for f in d.rglob("*") if f.is_file())
+                rows.append({"缓存": name, "文件数": files, "大小 MB": round(total / 1024 / 1024, 2)})
+            else:
+                rows.append({"缓存": name, "文件数": 0, "大小 MB": 0.0})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
 st.sidebar.divider()
-st.sidebar.caption("EternityQuant v0.11 · Streamlit 仪表盘")
+st.sidebar.caption("EternityQuant v0.23 · Streamlit 仪表盘")
