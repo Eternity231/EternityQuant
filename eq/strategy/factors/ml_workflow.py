@@ -902,6 +902,60 @@ def train_torch(
     return {"model_id": model_id, "metrics": {"ic": ic, "epochs": len(valid_scores)}, "model_path": str(model_path)}
 
 
+def _score_to_trend(pred_df: pd.DataFrame) -> pd.DataFrame:
+    """把回归分数映射成趋势标签 + 概率，不改模型架构。
+
+    用 csi500 池内分数的横截面分位段（quintile）切 5 档：
+      分位 ≥80% → 强多（Strong Bullish）
+      60~80%   → 弱多（Mild Bullish）
+      40~60%   → 中性（Neutral）
+      20~40%   → 弱空（Mild Bearish）
+      ≤20%     → 强空（Strong Bearish）
+
+    trend_prob 是该股票落在某档的「信心分」：极端档（强多/强空）用距 80/20 分位
+    的标准化距离；中性档用距 50% 的距离反算。值域 [0, 1]，越大越肯定。
+
+    Args:
+        pred_df: 含 score 列的 DataFrame（横截面分数）
+    Returns:
+        加 trend / trend_prob 两列的 DataFrame（按 score 降序）
+    """
+    import numpy as _np
+    df = pred_df.copy()
+    s = df["score"].astype(float)
+    # 横截面分位数（quantile）切档
+    q80 = s.quantile(0.80)
+    q60 = s.quantile(0.60)
+    q40 = s.quantile(0.40)
+    q20 = s.quantile(0.20)
+    labels = []
+    probs = []
+    for v in s:
+        if v >= q80:
+            labels.append("强多")
+            # 距 q80 的标准化距离，上限到池内 max
+            mx = s.max()
+            probs.append(float((v - q80) / (mx - q80 + 1e-9)) if mx > q80 else 0.5)
+        elif v >= q60:
+            labels.append("弱多")
+            probs.append(float((v - q60) / (q80 - q60 + 1e-9)))
+        elif v >= q40:
+            labels.append("中性")
+            # 距 50% 分位越近越肯定中性
+            q50 = s.quantile(0.50)
+            probs.append(float(1 - abs(v - q50) / (q60 - q40 + 1e-9)))
+        elif v >= q20:
+            labels.append("弱空")
+            probs.append(float((q40 - v) / (q40 - q20 + 1e-9)))
+        else:
+            labels.append("强空")
+            mn = s.min()
+            probs.append(float((q20 - v) / (q20 - mn + 1e-9)) if q20 > mn else 0.5)
+    df["trend"] = labels
+    df["trend_prob"] = [_np.clip(p, 0.0, 1.0) for p in probs]
+    return df
+
+
 def predict_batch(
     model_id: str,
     universe: str = "csi300",
@@ -1022,6 +1076,8 @@ def predict_batch(
             (model_id, row["symbol"], target_date.isoformat(), float(row["score"])),
         )
 
+    # 分数 → 趋势标签 + 概率（强多/弱多/中性/弱空/强空），输出列加 trend / trend_prob
+    pred_df = _score_to_trend(pred_df)
     return pred_df
 
 

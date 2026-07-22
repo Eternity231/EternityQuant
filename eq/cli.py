@@ -847,8 +847,16 @@ def ml_predict_batch(
     if df.empty:
         typer.echo("预测结果为空")
         return
+    # trend 列由 _score_to_trend 加上（强多/弱多/中性/弱空/强空 + trend_prob 信心分）
+    has_trend = "trend" in df.columns
     print(f"\n预测前 {len(df)} 名（已写入 ml_predictions 表）：\n")
-    print(df.to_string(index=False))
+    if has_trend:
+        print(f"{'符号':<14} {'分数':>9} {'趋势':<6} {'信心':>6}")
+        print("-" * 40)
+        for _, r in df.iterrows():
+            print(f"{r['symbol']:<14} {r['score']:>+9.4f} {r['trend']:<6} {float(r['trend_prob']):>6.2f}")
+    else:
+        print(df.to_string(index=False))
 
 
 @ml_app.command("top", help="查某日模型预测榜（按分数降序，回看命中用）")
