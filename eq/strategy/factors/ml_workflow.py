@@ -383,12 +383,30 @@ class _SimpleSeqModel:
         self.use_scheduler = use_scheduler
 
         rnn_cls = nn.GRU if cell_type == "gru" else nn.LSTM
+        # 输入归一化：Alpha158 原始特征虽经 RobustZScoreNorm，但重塑后尺度仍可能让
+        # LSTM 的 tanh 饱和（所有样本输出几乎相同 → std=0 → IC=-inf 死循环）。
+        # 加 BatchNorm1d 对重塑后每步 26 维做 BN（reshape 后用 view 摊平 2D 喂 BN，
+        # 避开 BatchNorm1d 对 3D 张量按第二维算的坑），防输出塌缩。
+        self.input_bn = nn.BatchNorm1d(input_size).to(self.device)
         self.net = rnn_cls(input_size, hidden_size, num_layers=num_layers,
                            batch_first=True, dropout=dropout if num_layers > 1 else 0).to(self.device)
-        self.head = nn.Linear(hidden_size, 1).to(self.device)
+        # Xavier 初始化：默认初始化权重过小 + tanh 饱和 + BN 收敛，导致 LSTM 输出
+        # 塌缩成常数（pred.std()=0 → IC=0 恒不更新）。Xavier 拉开初始权重尺度，
+        # 配合首步 warmup 让首步就有差异化输出，训练能真推进。
+        for name, p in self.net.named_parameters():
+            if "weight_ih" in name or "weight_hh" in name:
+                nn.init.xavier_normal_(p)
+            elif "bias_ih" in name or "bias_hh" in name:
+                nn.init.zeros_(p)
+        self.head = nn.Sequential(
+            nn.BatchNorm1d(hidden_size),
+            nn.Linear(hidden_size, 1),
+        ).to(self.device)
+        # weight_decay 1e-5 → 1e-6：LSTM 对 weight_decay 极敏感，过强会把权重
+        # 压向 0 加剧输出塌缩。LSTM 本身有梯度范裁剪，无需强 weight_decay。
         self.opt = torch.optim.AdamW(
-            list(self.net.parameters()) + list(self.head.parameters()),
-            lr=lr, weight_decay=1e-5,
+            list(self.net.parameters()) + list(self.head.parameters()) + list(self.input_bn.parameters()),
+            lr=lr, weight_decay=1e-6,
         )
         if use_scheduler:
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -400,11 +418,20 @@ class _SimpleSeqModel:
         self.best_step = 0
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self._warmup_steps = 5  # 首 5 步 lr 从 1e-4 线性升到 lr，防首步塌缩
 
     def _reshape(self, x):
-        """把 (batch, 158) 重塑成 (batch, seq_len=6, input_size=26)。"""
+        """把 (batch, 158) 重塑成 (batch, seq_len=6, input_size=26)。
+
+        不丢特征：若 cut < input_dim，用零向量 pad 到 cut 长度再重塑，
+        保证 158 维全保留（pad 部分对 LSTM 贡献为 0，不污染）。
+        """
         import torch
         cut = self.seq_len * self.input_size
+        if x.size(1) < cut:
+            # pad 到 cut 长度
+            pad = torch.zeros(x.size(0), cut - x.size(1), device=x.device)
+            x = torch.cat([x, pad], dim=1)
         return x[:, :cut].view(x.size(0), self.seq_len, self.input_size)
 
     def fit(self, x_train, y_train, x_valid, y_valid, early_stop: int = 20):
@@ -423,14 +450,23 @@ class _SimpleSeqModel:
 
         stop = 0
         for step in range(self.max_steps):
+            # warmup：首 _warmup_steps 步 lr 从 1e-4 线性升到 self.lr，
+            # 防首步权重过大 + BN 未收敛导致 LSTM 输出塌缩成常数（pred.std()=0）。
+            if step < self._warmup_steps:
+                warmup_lr = 1e-4 + (self.lr - 1e-4) * (step + 1) / self._warmup_steps
+                for g in self.opt.param_groups:
+                    g["lr"] = warmup_lr
             self.net.train()
             self.head.train()
+            self.input_bn.train()
             idx = torch.randperm(len(xt), device=self.device)
             for i in range(0, len(idx), self.batch_size):
                 b = idx[i:i + self.batch_size]
                 if len(b) < 2:
                     break
                 xb = self._reshape(xt[b])
+                # reshape 后 (batch, 6, 26) → view 摊平 2D 傂 BN 再 view 回
+                xb = self.input_bn(xb.reshape(-1, self.input_size)).reshape(xb.size(0), self.seq_len, self.input_size)
                 out, _ = self.net(xb)
                 pred = self.head(out[:, -1, :]).squeeze(-1)
                 loss = self.loss_fn(pred, yt[b])
@@ -441,16 +477,23 @@ class _SimpleSeqModel:
             # eval
             self.net.eval()
             self.head.eval()
+            self.input_bn.eval()
             with torch.no_grad():
                 xv_r = self._reshape(xv)
+                xv_r = self.input_bn(xv_r.reshape(-1, self.input_size)).reshape(xv_r.size(0), self.seq_len, self.input_size)
                 out, _ = self.net(xv_r)
                 vp = self.head(out[:, -1, :]).squeeze(-1)
-                if len(xv) >= 2 and vp.std().item() > 0 and yv.std().item() > 0:
-                    score = torch.cov(torch.stack([vp, yv]))[0, 1].item() / (vp.std().item() * yv.std().item())
+                # IC 算法加 ε 保护：std=0 时不再直接判 -inf（那会让 best_score 永不更新），
+                # 改用 ε 保护分母，std=0 时 score=0（中性），训练能继续推进。
+                vp_std = vp.std().item()
+                yv_std = yv.std().item()
+                if len(xv) >= 2 and yv_std > 0:
+                    cov = torch.cov(torch.stack([vp, yv]))[0, 1].item()
+                    score = cov / (vp_std * yv_std + 1e-8)
                 else:
-                    score = -float("inf")
+                    score = 0.0
             # 动态学习率（IC 不再提升时降 LR）
-            if self.use_scheduler and score != -float("inf"):
+            if self.use_scheduler:
                 self.scheduler.step(score)
             # 进度
             mem_mb = torch.cuda.memory_allocated() / 1e6 if self.device.type == "cuda" else 0.0
@@ -464,6 +507,7 @@ class _SimpleSeqModel:
                 self.best_state = {
                     "net": {k: v.clone() for k, v in self.net.state_dict().items()},
                     "head": {k: v.clone() for k, v in self.head.state_dict().items()},
+                    "input_bn": {k: v.clone() for k, v in self.input_bn.state_dict().items()},
                 }
                 stop = 0
             else:
@@ -473,6 +517,7 @@ class _SimpleSeqModel:
         if self.best_state is not None:
             self.net.load_state_dict(self.best_state["net"])
             self.head.load_state_dict(self.best_state["head"])
+            self.input_bn.load_state_dict(self.best_state["input_bn"])
         print(f"  [{self.cell_type.upper()} 训练完成] best IC={self.best_score:+.4f} @step {self.best_step} (early_stop={stop}/{early_stop})", flush=True)
 
     def predict(self, x):
@@ -480,15 +525,18 @@ class _SimpleSeqModel:
         import numpy as np
         self.net.eval()
         self.head.eval()
+        self.input_bn.eval()
         with torch.no_grad():
             xt = torch.from_numpy(np.asarray(x if not hasattr(x, "values") else x.values)).float().to(self.device)
             if len(xt) < 2:
                 xt = xt.unsqueeze(0).repeat(2, 1)
                 xr = self._reshape(xt)
+                xr = self.input_bn(xr.reshape(-1, self.input_size)).reshape(xr.size(0), self.seq_len, self.input_size)
                 out, _ = self.net(xr)
                 pred = self.head(out[:, -1, :]).squeeze(-1)[0:1]
             else:
                 xr = self._reshape(xt)
+                xr = self.input_bn(xr.reshape(-1, self.input_size)).reshape(xr.size(0), self.seq_len, self.input_size)
                 out, _ = self.net(xr)
                 pred = self.head(out[:, -1, :]).squeeze(-1)
             return pred.cpu().numpy()
@@ -666,6 +714,27 @@ def train_torch(
             y_train = y_train.squeeze() if y_train.ndim > 1 else y_train
         if hasattr(y_valid, "values"):
             y_valid = y_valid.squeeze() if y_valid.ndim > 1 else y_valid
+        # Dropna：qlib Alpha158 的 DropnaLabel processor 只对训练集删了 NaN label，
+        # 但切到 y_train.squeeze() 后仍可能残留 NaN（337 个），MSELoss 对 NaN 标签
+        # 算 loss 会把权重拉塌缩成常数 → LSTM IC=0 恒不更新。喂 fit 前同步删
+        # feature/label 任一 NaN 的样本（按 index 对齐）。
+        import numpy as _np
+        def _align_dropna(x, y):
+            xv = x.values if hasattr(x, "values") else _np.asarray(x)
+            yv = y.values if hasattr(y, "values") else _np.asarray(y)
+            yv = yv.reshape(yv.shape[0], -1).squeeze(-1) if yv.ndim > 1 else yv
+            mask = ~_np.isnan(yv)
+            if xv.ndim == 2:
+                mask &= ~_np.isnan(xv).any(axis=1)
+            return xv[mask], yv[mask]
+        x_train, y_train = _align_dropna(x_train, y_train)
+        x_valid, y_valid = _align_dropna(x_valid, y_valid)
+        # 诊断探针：dropna 后 feature/label 是否真有信号
+        _xt_std = float(_np.std(x_train))
+        _yt_std = float(_np.std(y_train))
+        print(f"  [DIAG] dropna 后: xt.std={_xt_std:.4f} yt.std={_yt_std:.4f} 样本数={len(y_train)}", flush=True)
+        if _yt_std == 0 or len(y_train) < 10:
+            print(f"  [DIAG] 警告: yt.std=0 或样本过少（{len(y_train)}），LSTM 无信号可学", flush=True)
         if algo == "mlp":
             model = _SimpleMLP(input_dim=158, hidden=(512, 256, 128), lr=1e-3, max_steps=300, batch_size=8000, device=device)
             notes = f"自写 _SimpleMLP 真集成训练（{device}），绕开 qlib DNNModelPytorch nan 坑"

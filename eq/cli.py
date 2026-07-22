@@ -769,15 +769,18 @@ def ml_train(
                     # 仅当默认区间与数据区间不重叠时才覆盖，避免抹掉用户显式传的值
                     default_conflict = (train_end < data_start) or (valid_end < data_start)
                     if default_conflict:
-                        # 数据末 30 个交易日作验证，其余作训练
-                        valid_n = min(30, len(days) // 5)
+                        # 数据末 60 个交易日作验证（不少于数据 10%），其余作训练。
+                        # 之前 30 日太短导致 LightGBM 18 步就 early stop（验证集样本不足）。
+                        valid_n = max(60, len(days) // 10)
+                        valid_n = min(valid_n, len(days) // 3)  # 不超过数据 1/3
                         valid_start = days[-valid_n]
                         valid_end = data_end
                         train_end = days[-(valid_n + 1)]
                         train_start = data_start
                         typer.echo(
-                            f"  [auto-range] 检测到数据区间 {data_start}~{data_end}，"
-                            f"自动切分 train={train_start}~{train_end} valid={valid_start}~{valid_end}"
+                            f"  [auto-range] 检测到数据区间 {data_start}~{data_end}（{len(days)} 日），"
+                            f"自动切分 train={train_start}~{train_end}（{len(days)-valid_n} 日）"
+                            f" valid={valid_start}~{valid_end}（{valid_n} 日）"
                         )
         except Exception as _e:
             typer.echo(f"  [warn] auto-range 检测失败：{_e}，用默认区间")
