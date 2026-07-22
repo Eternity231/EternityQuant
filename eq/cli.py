@@ -128,6 +128,88 @@ def wl_add(
         typer.echo(f"已加入自选：{symbol}")
 
 
+@watchlist_app.command("import", help="从文件批量导入自选股（Tab/逗号/换行分隔，自动识别 A/HK/US 代码）")
+def wl_import(
+    file: str = typer.Argument(help="文件路径，如 D:\\idmxz\\Table.txt"),
+    reason: str = typer.Option("", "--reason", "-r", help="统一加入理由"),
+    tags: str = typer.Option("", "--tags", "-t", help="统一标签，逗号分隔"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只打印将导入什么，不真正写库"),
+):
+    from pathlib import Path
+    p = Path(file)
+    if not p.exists():
+        typer.echo(f"文件不存在：{file}", err=True)
+        raise typer.Exit(1)
+    # 复用 ml_data_updater 的 Table.txt 解析器，提取所有代码（含港股/美股）
+    from eq.strategy.factors.ml_data_updater import _watchlist_instruments
+    a_codes = _watchlist_instruments()  # 仅返回 A 股（SH/SZ/BJ）
+    # 再扫一次拿非 A 股代码（港股裸 5 位、美股字母）
+    import re
+    all_codes: list[tuple[str, str]] = []  # (code, market)
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("代码") or "\t" not in line:
+            continue
+        raw = line.split("\t")[0].strip()
+        if not raw:
+            continue
+        if raw.startswith(("SH", "SZ", "BJ")):
+            # qlib 格式 → 转项目符号格式
+            raw_upper = raw.upper()
+            if raw_upper.startswith("SH"):
+                all_codes.append((f"{raw_upper[2:]}.SH", "A"))
+            elif raw_upper.startswith("SZ"):
+                all_codes.append((f"{raw_upper[2:]}.SZ", "A"))
+            else:
+                all_codes.append((f"{raw_upper[2:]}.BJ", "A"))
+        elif raw.isdigit() and len(raw) == 6:
+            # A 股裸 6 位
+            if raw.startswith(("6", "9")):
+                all_codes.append((f"{raw}.SH", "A"))
+            elif raw.startswith(("0", "3")):
+                all_codes.append((f"{raw}.SZ", "A"))
+            elif raw.startswith(("4", "8")):
+                all_codes.append((f"{raw}.BJ", "A"))
+        elif raw.isdigit() and len(raw) == 5:
+            # 港股裸 5 位
+            all_codes.append((f"{raw}.HK", "HK"))
+        elif re.match(r'^[A-Z]{1,5}$', raw):
+            # 美股字母代码
+            all_codes.append((f"{raw}.US", "US"))
+        # 其他（指数、FX 等）跳过
+
+    # 去重
+    seen = set()
+    deduped = []
+    for sym, mkt in all_codes:
+        if sym not in seen:
+            seen.add(sym)
+            deduped.append((sym, mkt))
+
+    if not deduped:
+        typer.echo(f"文件 {file} 未识别到任何股票代码")
+        return
+
+    print(f"\n识别到 {len(deduped)} 只股票（A/HK/US）：")
+    for sym, mkt in deduped[:20]:
+        print(f"  {sym:<12} {mkt}")
+    if len(deduped) > 20:
+        print(f"  ...（共 {len(deduped)} 只，仅显示前 20）")
+
+    if dry_run:
+        typer.echo(f"\n[dry-run] 未写库。去掉 --dry-run 真正导入。")
+        return
+
+    added = skipped = 0
+    for sym, mkt in deduped:
+        rowid = wl_svc.add(sym, reason=reason, tags=tags)
+        if rowid == 0:
+            skipped += 1
+        else:
+            added += 1
+    typer.echo(f"\n导入完成：新增 {added} 只，跳过 {skipped} 只（已在自选列表）")
+
+
 @watchlist_app.command("remove", help="移出自选股")
 def wl_remove(
     symbol: str = typer.Argument(help="股票符号"),
@@ -263,6 +345,36 @@ def pf_list():
         )
 
 
+@portfolio_app.command("summary", help="持仓体检：一次性看全持仓盈亏/占比/距止损止盈距离/今日涨跌")
+def pf_summary():
+    s = pf_svc.summary()
+    positions = s["positions"]
+    if not positions:
+        typer.echo("当前无持仓")
+        return
+    print(f"\n持仓体检（共 {len(positions)} 只）：\n")
+    print(
+        f"{'符号':<14} {'市场':<6} {'股数':>8} {'成本':>8} {'现价':>8} "
+        f"{'市值':>10} {'浮盈':>10} {'浮盈%':>7} {'今日%':>7} {'距止损%':>8} {'距止盈%':>8}"
+    )
+    print("-" * 120)
+    for p in positions:
+        dist_stop = f"{p['dist_to_stop_pct']:+.1f}" if p["dist_to_stop_pct"] is not None else "-"
+        dist_target = f"{p['dist_to_target_pct']:+.1f}" if p["dist_to_target_pct"] is not None else "-"
+        print(
+            f"{p['symbol']:<14} {p['market'] or '-':<6} {p['shares']:>8.0f} {p['cost_price']:>8.2f} "
+            f"{p['current_price']:>8.2f} {p['market_value']:>10.0f} {p['unrealized_pnl']:>+10.0f} "
+            f"{p['unrealized_pct']:>+7.1f} {p['today_pct']:>+7.1f} {dist_stop:>8} {dist_target:>8}"
+        )
+    print("-" * 120)
+    print(
+        f"合计：市值 {s['total_market_value']:,.0f}  "
+        f"浮盈 {s['total_unrealized_pnl']:>+.0f}  "
+        f"已实现 {s['total_realized_pnl']:>+.0f}  "
+        f"今日盈亏 {s['total_today_pnl']:>+.0f}"
+    )
+
+
 @portfolio_app.command("history", help="查某只股票的交易历史")
 def pf_history(
     symbol: str = typer.Argument(help="股票符号"),
@@ -295,6 +407,45 @@ def pf_closed(
             f"{r['symbol']:<14} {r['market'] or '-':<6} {r['cost_price']:>10.2f} "
             f"{r['realized_pnl']:>+14.2f} {str(r['opened_at']):<22} {str(r['closed_at']):<22}"
         )
+
+
+@portfolio_app.command("summary", help="持仓体检：一次性看盈亏/占比/距止损止盈距离/今日涨跌")
+def pf_summary():
+    """v0.23 新增：一次性体检全持仓。
+
+    每只持仓拉最新行情，算市值/浮盈/距止损止盈%/今日涨跌，
+    末尾汇总总市值/总浮盈/总已实现/今日盈亏。
+    """
+    try:
+        result = pf_svc.summary()
+    except Exception as e:
+        typer.echo(f"持仓体检失败：{e}", err=True)
+        raise typer.Exit(1)
+    positions = result["positions"]
+    if not positions:
+        typer.echo("当前无持仓，体检空")
+        return
+    print(f"\n持仓体检（共 {len(positions)} 只）\n")
+    print(
+        f"{'符号':<14} {'市场':<6} {'股数':>10} {'成本':>10} {'现价':>10} "
+        f"{'市值':>12} {'浮盈':>12} {'浮盈%':>8} {'今日%':>8} {'距止损%':>9} {'距止盈%':>9}"
+    )
+    print("-" * 120)
+    for p in positions:
+        dist_stop = f"{p['dist_to_stop_pct']:>+8.2f}" if p["dist_to_stop_pct"] is not None else f"{'-':>9}"
+        dist_target = f"{p['dist_to_target_pct']:>+8.2f}" if p["dist_to_target_pct"] is not None else f"{'-':>9}"
+        print(
+            f"{p['symbol']:<14} {p['market'] or '-':<6} {p['shares']:>10.0f} {p['cost_price']:>10.2f} "
+            f"{p['current_price']:>10.2f} {p['market_value']:>12.2f} {p['unrealized_pnl']:>+12.2f} "
+            f"{p['unrealized_pct']:>+7.2f}% {p['today_pct']:>+7.2f}% {dist_stop} {dist_target}"
+        )
+    print("-" * 120)
+    print(
+        f"汇总：总市值 {result['total_market_value']:.2f}  "
+        f"总浮盈 {result['total_unrealized_pnl']:+.2f}  "
+        f"累计已实现 {result['total_realized_pnl']:+.2f}  "
+        f"今日盈亏 {result['total_today_pnl']:+.2f}"
+    )
 
 
 # ---------- eq monitor 子命令 ----------
@@ -666,13 +817,42 @@ def ml_predict_batch(
     print(df.to_string(index=False))
 
 
+@ml_app.command("top", help="查某日模型预测榜（按分数降序，回看命中用）")
+def ml_top(
+    date: str = typer.Argument(help="YYYY-MM-DD，如 2026-07-21"),
+    model_id: str = typer.Option("", "--model", "-m", help="按模型过滤，缺省取所有"),
+    top_n: int = typer.Option(20, "--top", "-n", help="前 N 名"),
+):
+    from eq.db import execute
+    if model_id:
+        rows = execute(
+            "SELECT symbol, score, model_id FROM ml_predictions "
+            "WHERE date = ? AND model_id = ? ORDER BY score DESC LIMIT ?",
+            (date, model_id, top_n),
+        )
+    else:
+        rows = execute(
+            "SELECT symbol, score, model_id FROM ml_predictions "
+            "WHERE date = ? ORDER BY score DESC LIMIT ?",
+            (date, top_n),
+        )
+    if not rows:
+        typer.echo(f"{date} 无预测记录（model_id={model_id or '全部'}）")
+        return
+    print(f"\n{date} 预测榜（model_id={model_id or '全部'}，前 {len(rows)} 名）：\n")
+    print(f"{'排名':<4} {'符号':<14} {'分数':>10} {'模型':<14}")
+    print("-" * 50)
+    for i, r in enumerate(rows, 1):
+        print(f"{i:<4} {r['symbol']:<14} {r['score']:>+10.4f} {r['model_id']:<14}")
+
+
 @ml_app.command("update-data", help="更新 qlib 本地数据到最新（腾讯 API 拉 A 股日线 → 续 .bin，多线程并行）")
 def ml_update_data(
     start: str = typer.Option("2020-09-28", "--start", "-s", help="续期起始日，默认接 2020-09-25"),
     end: str = typer.Option("", "--end", "-e", help="续期结束日，默认今天"),
     universe: str = typer.Option("csi300", "--universe", "-u", help="csi300/csi500/all/watchlist（watchlist 从 D:\\idmxz\\Table.txt 读取）"),
     extra: str = typer.Option("", "--extra", "-x", help="额外股票代码，逗号分隔，如 SH600519,SZ000001（与 universe 合并下载训练）"),
-    workers: int = typer.Option(3, "--workers", "-w", help="并行进程数（腾讯 API 限流敏感，默认 3 最稳）"),
+    workers: int = typer.Option(8, "--workers", "-w", help="并行进程数（腾讯 API 国内直连限流宽松，默认 8，上限建议 16）"),
 ):
     from eq.strategy.factors.ml_data_updater import update_qlib_data
     extra_codes = [c.strip().upper() for c in extra.split(",") if c.strip()] if extra else None

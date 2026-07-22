@@ -155,3 +155,79 @@ def _record_trade(symbol: str, action: str, shares: float, price: float, note: s
         "INSERT INTO trade_history (symbol, action, shares, price, note) VALUES (?, ?, ?, ?, ?)",
         (symbol, action, shares, price, note or None),
     )
+
+
+def summary() -> dict[str, Any]:
+    """持仓体检：一次性算全持仓的盈亏/占比/距止损止盈距离/今日涨跌。
+
+    返回字典：
+        ``positions``: 每只持仓的明细（含当前价/总市值/浮盈/浮盈%/
+            距止损%/距止盈%/今日涨跌%）
+        ``total_market_value``: 全持仓总市值
+        ``total_unrealized_pnl``: 全持仓浮盈合计
+        ``total_realized_pnl``: 全持仓已实现盈亏合计
+        ``total_today_pnl``: 全持仓今日盈亏合计（按市值 * 今日涨跌%）
+    """
+    from eq.data.market import get_snapshot
+
+    rows = list_open()
+    positions: list[dict[str, Any]] = []
+    total_mv = 0.0
+    total_unrealized = 0.0
+    total_realized = 0.0
+    total_today = 0.0
+
+    for r in rows:
+        sym = r["symbol"]
+        shares = float(r["shares"] or 0)
+        cost = float(r["cost_price"] or 0)
+        stop = r.get("stop_loss")
+        target = r.get("take_profit")
+        realized = float(r["realized_pnl"] or 0)
+
+        # 拉最新行情
+        try:
+            snap = get_snapshot(sym)
+            close = float(snap["close"])
+            change_pct = float(snap["change_pct"])
+        except Exception:
+            close = cost  # 拉不到行情时退化为用成本价占位
+            change_pct = 0.0
+
+        mv = shares * close
+        unrealized = (close - cost) * shares
+        unrealized_pct = (close - cost) / cost * 100 if cost else 0.0
+        today_pnl = mv * change_pct / 100
+        dist_stop = ((close - stop) / close * 100) if (stop and close) else None
+        dist_target = ((target - close) / close * 100) if (target and close) else None
+
+        positions.append({
+            "symbol": sym,
+            "name": r.get("name") or "",
+            "market": r.get("market") or "",
+            "shares": shares,
+            "cost_price": cost,
+            "current_price": close,
+            "market_value": mv,
+            "unrealized_pnl": unrealized,
+            "unrealized_pct": unrealized_pct,
+            "today_pct": change_pct,
+            "today_pnl": today_pnl,
+            "stop_loss": stop,
+            "take_profit": target,
+            "dist_to_stop_pct": dist_stop,
+            "dist_to_target_pct": dist_target,
+            "realized_pnl": realized,
+        })
+        total_mv += mv
+        total_unrealized += unrealized
+        total_realized += realized
+        total_today += today_pnl
+
+    return {
+        "positions": positions,
+        "total_market_value": total_mv,
+        "total_unrealized_pnl": total_unrealized,
+        "total_realized_pnl": total_realized,
+        "total_today_pnl": total_today,
+    }

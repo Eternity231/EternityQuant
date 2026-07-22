@@ -13,15 +13,22 @@ license = { text = "MIT" }
 dependencies = [
     "typer>=0.12",
     "pandas>=2.0",
+    "numpy>=1.24",
     "akshare>=1.12",
     "yfinance>=0.2.40",
     "baostock>=0.9.3",
+    "requests>=2.31",
+    "apscheduler>=3.10",
     "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 web = ["streamlit>=1.30", "plotly>=5.20"]
-ml = ["qlib>=0.9", "lightgbm>=4.0"]
+ml = ["qlib>=0.9", "lightgbm>=4.0", "torch>=2.0"]
+# CUDA 版 torch 需从 https://download.pytorch.org/whl/cu121 等官方源装，
+# pip 默认装的是 CPU 版；装完 CUDA 版后 ml-cuda 与 ml 等价。
+ml-cuda = ["torch>=2.0"]
+crypto = ["ccxt>=4.0"]
 dev = ["pytest>=8.0", "ruff>=0.5"]
 
 [project.scripts]

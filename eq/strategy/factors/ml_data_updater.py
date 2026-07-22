@@ -317,31 +317,54 @@ def _proc_one_stock(code, start, end, new_days, qlib_feats_dir, expected_floats=
     days_list = list(new_days)
     n_days = len(days_list)
 
-    # 幂等检查：已有 .bin 且长度精确等于交易日数，且 close 全 NaN 时
-    # 也视为「已处理」（未上市股），直接跳过避免重复请求。
-    close_bin = inst_dir / "close.day.bin"
-    if close_bin.exists() and expected_floats > 0:
-        actual = close_bin.stat().st_size // 4
-        if actual == expected_floats:
+    # 完整性检测：所有 7 个特征 .bin 都必须存在且长度精确等于交易日数，
+    # 才视为「已完整下载」可跳过。任一缺失/长度不符/全 NaN（未上市）→ 视为
+    # 损坏或不完整，覆盖重下。这样能抓到中途崩溃留下的半截 .bin。
+    if expected_floats > 0:
+        all_complete = True
+        for feat in _FEATURES:
+            bp = inst_dir / f"{feat}.day.bin"
+            if not bp.exists() or bp.stat().st_size // 4 != expected_floats:
+                all_complete = False
+                break
+        if all_complete:
             return True
 
     # 网络错误最多重试 3 次（指数退避）；
     # 未上市/已退市返回 is_empty_range=True，直接写全 NaN 跳过。
+    # 首请不 sleep（腾讯 API 国内直连限流宽松，靠进程间并发即可），
+    # 重试时才指数退避 2s/4s。
+    #
+    # 「--start 早于上市日」处理：腾讯对 [start, end] 全段返回空时，
+    # 不能直接判"未上市"——可能是 start 早于上市日但上市日在 [start, end] 内。
+    # 此时按年扩窗探测：从 start 起每次把 start 往后推 1 年重试，
+    # 直到拿到数据（说明上市日找到了）或撞到 end（真未上市/已退市）。
     df = None
     is_empty_range = False
+    probe_start = start
     for attempt in range(3):
         if attempt > 0:
             _t.sleep(2 ** attempt)  # 指数退避 2s, 4s
-        else:
-            _t.sleep(0.1)  # 每只股票间隔 100ms
-        result = _tencent_daily(code, start, end)
+        result = _tencent_daily(code, probe_start, end)
         if result.is_network_error:
             # 网络故障，重试
             if attempt >= 2:
                 print(f"  [DEBUG] {code} 网络错误，3 次重试仍失败，跳过", flush=True)
             continue
         if result.is_empty_range:
-            # 未上市/已退市/区间在上市前 —— 不重试，写全 NaN
+            # [probe_start, end] 全空。若 probe_start 已 == start，
+            # 先尝试按年往后推探测上市日；若推到 ≥ end 仍空 → 真未上市。
+            import datetime as _dt_mod
+            try:
+                ps = _dt_mod.date.fromisoformat(probe_start)
+            except ValueError:
+                is_empty_range = True
+                break
+            next_ps = ps.replace(year=ps.year + 1)
+            if next_ps.isoformat() <= end:
+                probe_start = next_ps.isoformat()
+                continue  # 同 attempt 内继续探测，不耗重试次数
+            # 推到 ≥ end 仍空 → 真未上市/已退市
             is_empty_range = True
             break
         df = result.data
@@ -357,7 +380,9 @@ def _proc_one_stock(code, start, end, new_days, qlib_feats_dir, expected_floats=
         # 网络重试耗尽 —— 真失败，不写 .bin（保持旧文件不变）
         return False
     else:
-        # 按交易日对齐：reindex 后未上市/停牌日为 NaN
+        # 按交易日对齐：reindex 后未上市/停牌日为 NaN。
+        # 若 probe_start > start，则上市日之前的交易日自然落 NaN，
+        # 后续 ffill/bfill 不会污染（NaN 仍是 NaN，直到首个有效日）。
         df = df.reindex(pd.to_datetime(days_list))
         # 前向填充 NaN（停牌日沿用上一交易日数据）
         df = df.ffill()
@@ -496,38 +521,45 @@ def update_qlib_data(
             flush=True,
         )
 
-    # 多进程并行拉（每只股票整段 [start, end] 覆盖重算）
+    # 多进程并行拉：把 merged 切成 workers 块，每进程串行处理一块，
+    # 比「每只一 future」少 N 倍进程间调度开销，且腾讯 API 单 TCP 串行无影响。
     feats_dir = _QLIB_DATA_DIR / "features"
     feats_dir.mkdir(parents=True, exist_ok=True)
     total = len(merged)
     import time as _time
     import concurrent.futures as _cf
 
+    # 切块：尽量均匀，最后一块兜底
+    chunks: list[list[str]] = [[] for _ in range(max(workers, 1))]
+    for i, code in enumerate(merged):
+        chunks[i % len(chunks)].append(code)
+    chunks = [c for c in chunks if c]  # 丢空块
+
     _t0 = _time.time()
     ok_count = 0
     fail_count = 0
     done_count = 0
 
-    with _cf.ProcessPoolExecutor(max_workers=workers) as executor:
+    with _cf.ProcessPoolExecutor(max_workers=max(workers, 1)) as executor:
         futures = {}
-        for code in merged:
-            args = ([code], start, end, tuple(new_days), str(feats_dir), len(new_days))
+        for chunk in chunks:
+            args = (chunk, start, end, tuple(new_days), str(feats_dir), len(new_days))
             fut = executor.submit(_proc_batch, args)
-            futures[fut] = code
+            futures[fut] = len(chunk)
 
         for fut in _cf.as_completed(futures, timeout=3600):
-            code = futures[fut]
-            done_count += 1
+            chunk_size = futures[fut]
+            done_count += chunk_size
             try:
-                ok_cnt, fail_cnt = fut.result(timeout=5)
+                ok_cnt, fail_cnt = fut.result(timeout=30)
                 ok_count += ok_cnt
                 fail_count += fail_cnt
             except Exception:
-                fail_count += 1
+                fail_count += chunk_size
                 if verbose:
-                    print(f"\n  ✗ {code} 超时或失败", flush=True)
+                    print(f"\n  ✗ 一块（{chunk_size} 只）超时或失败", flush=True)
 
-            if verbose and (done_count % 50 == 0 or done_count == total):
+            if verbose and (done_count % 50 == 0 or done_count >= total):
                 _elapsed = _time.time() - _t0
                 _pct = min(done_count / total * 100, 100.0)
                 _speed = done_count / _elapsed if _elapsed > 0 else 0
