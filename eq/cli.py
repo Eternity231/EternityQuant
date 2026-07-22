@@ -1090,6 +1090,7 @@ def hk_train(
     dropout: float = typer.Option(0.3, "--dropout", help="Dropout 率（量化建议 0.3-0.4）"),
     walk_forward: bool = typer.Option(True, "--walk-forward/--no-walk", help="Walk-Forward 滚动验证"),
     device: str = typer.Option("cuda", "--device", "-d", help="cuda/cpu"),
+    optimizer: str = typer.Option("lion", "--optimizer", "-o", help="优化器: lion（默认，省显存+抗噪）| adamw"),
     name: str = typer.Option("", "--name", help="模型名"),
     gpus: str = typer.Option("", "--gpus", help="多卡并行GPU ID，如 '0,1,2,3'（默认单卡）"),
 ):
@@ -1100,6 +1101,7 @@ def hk_train(
             cell_type=cell_type, hidden_size=hidden_size,
             num_layers=num_layers, dropout=dropout,
             walk_forward=walk_forward, device=device,
+            optimizer=optimizer,
             name=name or None,
             gpu_ids=gpus if gpus else None,
         )

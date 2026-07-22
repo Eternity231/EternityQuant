@@ -315,6 +315,7 @@ def train_hk(
     name: str | None = None,
     verbose: bool = True,
     gpu_ids: str | list[int] | None = None,  # 多卡并行
+    optimizer: str = "lion",  # 默认 Lion：省显存+抗噪，适合低信噪比金融数据；可切 adamw
 ) -> dict:
     """港股 GRU 训练（不走 qlib，自写特征 + _SimpleSeqModel）。
 
@@ -396,7 +397,7 @@ def train_hk(
                 input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
                 hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
                 lr=1e-3, max_steps=100, batch_size=batch_size,
-                device=device, dropout=dropout, use_scheduler=True,
+                device=device, dropout=dropout, use_scheduler=True, optimizer=optimizer,
             )
             wf_model.fit(wf_train_x, wf_train_y, wf_valid_x, wf_valid_y, early_stop=15)
             wf_ics.append(float(wf_model.best_score))
@@ -421,7 +422,7 @@ def train_hk(
         input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
         hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
         lr=1e-3, max_steps=max_steps, batch_size=batch_size,
-        device=device, dropout=dropout, use_scheduler=True,
+        device=device, dropout=dropout, use_scheduler=True, optimizer=optimizer,
     )
     model.fit(x_train, y_train, x_valid, y_valid, early_stop=20)
     ic = float(model.best_score)
@@ -492,6 +493,10 @@ def predict_hk_top(
         results.append({"symbol": f"{code}.HK", "score": float(score)})
 
     df_result = pd.DataFrame(results).sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
+    # 分数 → 趋势标签 + 概率（强多/弱多/中性/弱空/强空），与 A 股 predict_batch 一致
+    from eq.strategy.factors.ml_workflow import _score_to_trend
+    if not df_result.empty:
+        df_result = _score_to_trend(df_result)
     return df_result
 
 
@@ -627,6 +632,7 @@ def train_hk_minute(
     name: str | None = None,
     verbose: bool = True,
     gpu_ids: str | list[int] | None = None,
+    optimizer: str = "lion",  # 默认 Lion：省显存+抗噪，适合低信噪比金融数据；可切 adamw
 ) -> dict:
     """港股分钟线 GRU 训练（走本地缓存 5m/1m 目录，不走网络下载）。
 
@@ -698,7 +704,7 @@ def train_hk_minute(
                 input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
                 hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
                 lr=1e-3, max_steps=100, batch_size=batch_size,
-                device=device, dropout=dropout, use_scheduler=True,
+                device=device, dropout=dropout, use_scheduler=True, optimizer=optimizer,
             )
             wf_model.fit(wf_train_x, wf_train_y, wf_valid_x, wf_valid_y, early_stop=15)
             wf_ics.append(float(wf_model.best_score))
@@ -719,7 +725,7 @@ def train_hk_minute(
         input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
         hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
         lr=1e-3, max_steps=max_steps, batch_size=batch_size,
-        device=device, dropout=dropout, use_scheduler=True,
+        device=device, dropout=dropout, use_scheduler=True, optimizer=optimizer,
     )
     model.fit(x_train, y_train, x_valid, y_valid, early_stop=20)
     ic = float(model.best_score)
