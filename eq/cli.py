@@ -727,6 +727,7 @@ def ml_train(
     train_end: str = typer.Option("2020-08-31", "--train-end", help="训练区间止"),
     valid_start: str = typer.Option("2020-09-01", "--valid-start", help="验证区间起"),
     valid_end: str = typer.Option("2020-09-25", "--valid-end", help="验证区间止（qlib 数据末日）"),
+    auto_range: bool = typer.Option(True, "--auto-range/--no-auto-range", help="自动检测 qlib 数据实际可用区间覆盖默认值（默认开）"),
     device: str = typer.Option("cpu", "--device", "-d", help="cpu | gpu | cuda（LightGBM gpu=OpenCL；PyTorch cuda=真CUDA，CUDA GPU主场）"),
     hidden: int = typer.Option(0, "--hidden", help="RNN/Transformer 隐藏层大小，0=自动（GRU=64, DeepLOB=64, TFT=256）"),
     layers: int = typer.Option(0, "--layers", help="RNN 层数，0=自动（默认 2）"),
@@ -751,6 +752,36 @@ def ml_train(
         pass
     from eq.strategy.factors.ml_workflow import train as wf_train, train_torch as wf_train_torch, _TORCH_ALGOS
     _ADVANCED_ALGOS = {"deeplob", "tft"}
+
+    # 自动检测 qlib 数据实际可用区间，覆盖与数据不重叠的默认区间（2015~2020）。
+    # 只在 auto_range=True 且用户未显式改默认值时触发；
+    # 检测失败（如日历缺失）退化为用默认值，不阻断训练。
+    if auto_range:
+        try:
+            from eq.data.paths import QLIB_CN_DATA_DIR
+            from pathlib import Path as _P
+            cal = _P(QLIB_CN_DATA_DIR) / "calendars" / "day.txt"
+            if cal.exists():
+                days = [ln.strip() for ln in cal.read_text().splitlines() if ln.strip()]
+                if days:
+                    days.sort()
+                    data_start, data_end = days[0], days[-1]
+                    # 仅当默认区间与数据区间不重叠时才覆盖，避免抹掉用户显式传的值
+                    default_conflict = (train_end < data_start) or (valid_end < data_start)
+                    if default_conflict:
+                        # 数据末 30 个交易日作验证，其余作训练
+                        valid_n = min(30, len(days) // 5)
+                        valid_start = days[-valid_n]
+                        valid_end = data_end
+                        train_end = days[-(valid_n + 1)]
+                        train_start = data_start
+                        typer.echo(
+                            f"  [auto-range] 检测到数据区间 {data_start}~{data_end}，"
+                            f"自动切分 train={train_start}~{train_end} valid={valid_start}~{valid_end}"
+                        )
+        except Exception as _e:
+            typer.echo(f"  [warn] auto-range 检测失败：{_e}，用默认区间")
+
     try:
         if algo in _ADVANCED_ALGOS:
             # 高级模型（DeepLOB / TFT）：用 AdvancedTrainer
@@ -868,6 +899,28 @@ def ml_update_data(
     from eq.data.paths import QLIB_CN_DATA_DIR
     typer.echo(f"  数据目录：{QLIB_CN_DATA_DIR}")
     typer.echo(f"  日历新增 {result['days_added']} 行，现在可以 `eq ml train` 用最新数据训练了")
+
+
+@ml_app.command("regen-instruments", help="不重下数据，仅重建 instruments/<universe>.txt（修训练 universe 无数据用）")
+def ml_regen_instruments(
+    universe: str = typer.Argument("csi300", help="csi300/csi500/all/watchlist"),
+    extra: str = typer.Option("", "--extra", "-x", help="额外股票代码，逗号分隔，与 universe 合并"),
+):
+    from eq.strategy.factors.ml_data_updater import _generate_instruments, _tencent_instruments
+    instruments = _tencent_instruments(universe)
+    extra_codes = [c.strip().upper() for c in extra.split(",") if c.strip()] if extra else []
+    merged = list(instruments)
+    for c in extra_codes:
+        if c not in merged:
+            merged.append(c)
+    try:
+        _generate_instruments(universe, merged, verbose=True)
+    except Exception as e:
+        typer.echo(f"重建失败：{e}", err=True)
+        raise typer.Exit(1)
+    from eq.data.paths import QLIB_CN_DATA_DIR
+    typer.echo(f"\n重建完成：instruments/{universe}.txt ({len(merged)} 只)")
+    typer.echo(f"  现在可以 `eq ml train {universe} <horizon> --algo <algo>` 了")
 
 
 @ml_app.command("search", help="LSTM 超参网格搜索（自动试 hidden/layers/lr/batch 组合，报告 Top3）")

@@ -363,6 +363,7 @@ def _proc_one_stock(code, start, end, new_days, qlib_feats_dir, expected_floats=
             next_ps = ps.replace(year=ps.year + 1)
             if next_ps.isoformat() <= end:
                 probe_start = next_ps.isoformat()
+                _t.sleep(0.3)  # 跨年探测间隔，避免连发多年请求触发限流
                 continue  # 同 attempt 内继续探测，不耗重试次数
             # 推到 ≥ end 仍空 → 真未上市/已退市
             is_empty_range = True
@@ -592,14 +593,15 @@ def _generate_instruments(universe: str, instruments: list[str], verbose: bool =
     与下载顺序无关。
 
     未上市/已退市的股票 .bin 全 NaN，扫描后 in_market = False，
-    该行用 ``instruments`` 列表里的原始占位区间（start=2026-01-01，
-    end=今天）—— qlib 训练时会因无数据自动忽略。
+    该行用 ``instruments`` 列表里的原始占位区间（start=2000-01-01，
+    end=今天）—— qlib 训练时会因无数据自动忽略。占位区间设得足够宽
+    （2000~today），覆盖任何训练区间，避免 list_instruments 滤空。
     """
     import datetime as dt
     import numpy as _np
 
     today = dt.date.today().isoformat()
-    default_start = "2026-01-01"
+    default_start = "2000-01-01"
 
     # 读日历，用于把 .bin 索引映射回日期
     cal_path = _QLIB_DATA_DIR / "calendars" / "day.txt"
