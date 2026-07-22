@@ -734,7 +734,7 @@ def ml_train(
     batch: int = typer.Option(0, "--batch", "-b", help="batch size，0=自动（默认 4000，DeepLOB 建议 512，TFT 建议 256）"),
     name: str = typer.Option("", "--name", "-n", help="模型名，默认自动生成"),
     # --- 高级参数 ---
-    optimizer: str = typer.Option("adamw", "--optimizer", "-o", help="优化器: adamw | sam | lookahead | lion"),
+    optimizer: str = typer.Option("lion", "--optimizer", "-o", help="优化器: lion（默认，省显存+抗噪）| adamw | sam | lookahead"),
     loss: str = typer.Option("sharpe", "--loss", "-l", help="损失函数: sharpe | mse | ic"),
     dropout: float = typer.Option(0.3, "--dropout", help="Dropout 率（量化建议 0.3-0.4）"),
     adversarial: bool = typer.Option(False, "--adversarial/--no-adv", help="FGSM 对抗训练（增强鲁棒性，训练时间翻倍）"),

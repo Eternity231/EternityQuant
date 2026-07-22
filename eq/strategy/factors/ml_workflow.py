@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import torch  # _LionOpt 继承 torch.optim.Optimizer 须顶层可见
 
 from eq.db import DEFAULT_HOME, execute_write
 from eq.strategy.factors.ml import activate, register_model
@@ -22,6 +23,78 @@ _QLIB_MODELS_DIR = DEFAULT_HOME / "ml_models"
 def _ensure_dir() -> Path:
     _QLIB_MODELS_DIR.mkdir(parents=True, exist_ok=True)
     return _QLIB_MODELS_DIR
+
+
+# ---------- 自写 Lion 优化器（EvoLved Sign Momentum，不依赖外部 lion-pytorch 包） ----------
+#
+# Lion 由谷歌通过 AutoML 符号搜索「进化」出，彻底舍弃二阶矩估计，仅追一阶动量，
+# 并强制用符号函数决定更新方向。相比 AdamW：
+#   显存减半（无二阶矩状态）+ 天然正则化（符号操作抗噪），对低信噪比数据
+#   （如股票收益率）噪声不敏感，倾向顺应大趋势忽略微小抖动。
+# 参考: Chen et al. 2023 "Symbolic Discovery of Optimization Rules for Deep Neural Networks"
+class _LionOpt(torch.optim.Optimizer):
+    """最简 Lion 优化器：lr·sign(w·b + (1-w)·m)·lr_proj 更新，动量 m 指数衰减。
+
+    仅追一阶动量 m（与参数同形），无二阶矩 v → 显存比 AdamW 省一半。
+    weight_decay 内嵌进 update（不依赖外部调度），与 AdamW 实现一致。
+
+    继承 torch.optim.Optimizer：兼容 ReduceLROnPlateau / warmup 等 scheduler
+    的 isinstance(opt, Optimizer) 检查，param_groups/state_dict 由父类管。
+    """
+
+    def __init__(self, params, lr=1e-3, weight_decay=1e-6, momentum_decay=0.95):
+        import torch
+        # 父类要 defaults + param_groups；self.m 动量单独管（不进 optimizer.state）
+        defaults = {"lr": lr, "weight_decay": weight_decay, "momentum_decay": momentum_decay}
+        super().__init__(params, defaults)
+        self.lr = lr
+        self.wd = weight_decay
+        self.m_decay = momentum_decay
+        # 一阶动量 m 与各 param 同形，按 param_groups 组织便于 step 时按组遍历
+        self.m = [[torch.zeros_like(p) for p in g["params"]] for g in self.param_groups]
+
+    def zero_grad(self, set_to_none: bool = True):
+        # 父类已有，但 Optimizer.zero_grad 走 self.param_groups，行为一致；显式覆盖保留接口
+        super().zero_grad(set_to_none=set_to_none)
+
+    def _get_lr(self):
+        # warmup / scheduler 会改 param_groups[0]["lr"]，读最新值
+        return float(self.param_groups[0]["lr"])
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        lr = self._get_lr()
+        wd = float(self.param_groups[0].get("weight_decay", self.wd))
+        gi = 0  # param_groups 与 self.m 的同步索引
+        for group in self.param_groups:
+            m_decay = float(group.get("momentum_decay", self.m_decay))
+            for j, p in enumerate(group["params"]):
+                if p.grad is None:
+                    continue
+                g = p.grad
+                m = self.m[gi][j]
+                # Lion 核心: u = sign(β·m + (1-β)·g);  m = β·m + (1-β)·g
+                m.mul_(m_decay).add_(g, alpha=1 - m_decay)
+                update = m.sign()  # 符号方向
+                # weight_decay 内嵌: p -= lr·(update + wd·p)
+                if wd > 0:
+                    p.mul_(1 - lr * wd)
+                p.add_(update, alpha=-lr)
+            gi += 1
+
+    def state_dict(self):
+        # 父类 state 存 defaults；额外存 m 动量
+        sd = super().state_dict()
+        sd["m"] = [[m.clone() for m in group_m] for group_m in self.m]
+        return sd
+
+    def load_state_dict(self, sd):
+        super().load_state_dict(sd)
+        if "m" in sd:
+            for gi, group_m in enumerate(sd["m"]):
+                for j, m_new in enumerate(group_m):
+                    self.m[gi][j].copy_(m_new)
+
 
 
 def _qlib_init() -> None:
@@ -266,18 +339,32 @@ class _SimpleMLP:
     自写此绕开，只取 qlib handler 的 feature 和 label 做数据，训练用原生 torch。
     """
 
-    def __init__(self, input_dim: int = 158, hidden: int = 256, lr: float = 1e-3, max_steps: int = 300, batch_size: int = 2000, device: str = "cuda"):
+    def __init__(self, input_dim: int = 158, hidden: int | tuple = 256, lr: float = 1e-3, max_steps: int = 300, batch_size: int = 2000, device: str = "cuda", optimizer: str = "lion"):
         import torch
         import torch.nn as nn
         self.device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
         self.lr = lr
         self.max_steps = max_steps
         self.batch_size = batch_size
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden), nn.BatchNorm1d(hidden), nn.ReLU(), nn.Dropout(0.05),
-            nn.Linear(hidden, 1),
-        ).to(self.device)
-        self.opt = torch.optim.Adam(self.net.parameters(), lr=lr)
+        # hidden 支持 int（单隐层）或 tuple（多隐层，如 (512,256,128)）
+        if isinstance(hidden, int):
+            hidden_layers = [hidden]
+        else:
+            hidden_layers = list(hidden)
+        # 构造 158 → h1 → h2 → ... → 1 的 Sequential，每层 Linear+BN+ReLU+Dropout
+        layers = []
+        prev = input_dim
+        for h in hidden_layers:
+            layers.extend([nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(0.05)])
+            prev = h
+        layers.append(nn.Linear(prev, 1))
+        self.net = nn.Sequential(*layers).to(self.device)
+        # 默认 Lion：显存省半 + 符号操作抗噪，适合低信噪比金融数据；
+        # optimizer="adamw" 可切回（reduce_lr/warmup 都走 param_groups[0]["lr"] 兼容）
+        if optimizer.lower() == "lion":
+            self.opt = _LionOpt(self.net.parameters(), lr=lr, weight_decay=1e-6)
+        else:
+            self.opt = torch.optim.AdamW(self.net.parameters(), lr=lr, weight_decay=1e-5)
         self.loss_fn = nn.MSELoss()
         self.best_score = -float("inf")
         self.best_state = None
@@ -370,7 +457,8 @@ class _SimpleSeqModel:
     def __init__(self, input_dim: int = 158, seq_len: int = 6, input_size: int = 26,
                  hidden_size: int = 64, num_layers: int = 2, cell_type: str = "gru",
                  lr: float = 1e-3, max_steps: int = 200, batch_size: int = 4000,
-                 device: str = "cuda", dropout: float = 0.1, use_scheduler: bool = True):
+                 device: str = "cuda", dropout: float = 0.1, use_scheduler: bool = True,
+                 optimizer: str = "lion"):
         import torch
         import torch.nn as nn
         self.device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
@@ -404,10 +492,13 @@ class _SimpleSeqModel:
         ).to(self.device)
         # weight_decay 1e-5 → 1e-6：LSTM 对 weight_decay 极敏感，过强会把权重
         # 压向 0 加剧输出塌缩。LSTM 本身有梯度范裁剪，无需强 weight_decay。
-        self.opt = torch.optim.AdamW(
-            list(self.net.parameters()) + list(self.head.parameters()) + list(self.input_bn.parameters()),
-            lr=lr, weight_decay=1e-6,
-        )
+        # 默认 Lion：显存省半 + 符号操作抗噪，适合低信噪比金融数据；
+        # optimizer="adamw" 可切回（warmup/scheduler 都走 param_groups[0]["lr"] 兼容）。
+        _all_params = list(self.net.parameters()) + list(self.head.parameters()) + list(self.input_bn.parameters())
+        if optimizer.lower() == "lion":
+            self.opt = _LionOpt(_all_params, lr=lr, weight_decay=1e-6)
+        else:
+            self.opt = torch.optim.AdamW(_all_params, lr=lr, weight_decay=1e-6)
         if use_scheduler:
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.opt, mode="max", factor=0.5, patience=5, min_lr=1e-6,
@@ -560,7 +651,7 @@ def train_torch(
     batch_size: int = 0,
     name: str | None = None,
     # --- 高级参数（DeepLOB/TFT） ---
-    optimizer: str = "adamw",
+    optimizer: str = "lion",  # 默认 Lion：显存省半 + 符号操作抗噪，适合低信噪比金融数据
     loss_type: str = "sharpe",
     dropout: float = 0.3,
     adversarial: bool = False,
@@ -736,8 +827,8 @@ def train_torch(
         if _yt_std == 0 or len(y_train) < 10:
             print(f"  [DIAG] 警告: yt.std=0 或样本过少（{len(y_train)}），LSTM 无信号可学", flush=True)
         if algo == "mlp":
-            model = _SimpleMLP(input_dim=158, hidden=(512, 256, 128), lr=1e-3, max_steps=300, batch_size=8000, device=device)
-            notes = f"自写 _SimpleMLP 真集成训练（{device}），绕开 qlib DNNModelPytorch nan 坑"
+            model = _SimpleMLP(input_dim=158, hidden=(512, 256, 128), lr=1e-3, max_steps=300, batch_size=8000, device=device, optimizer=optimizer)
+            notes = f"自写 _SimpleMLP 真集成训练（{device}, {optimizer}），绕开 qlib DNNModelPytorch nan 坑"
         else:
             # 研究结论：GRU > LSTM（S&P 500 84%准确率），浅层 2-3 层最优
             cell = "lstm" if algo == "lstm" else "gru"
@@ -749,9 +840,9 @@ def train_torch(
                 input_dim=158, seq_len=6, input_size=26,
                 hidden_size=_hs, num_layers=_nl, cell_type=cell,
                 lr=1e-3, max_steps=200, batch_size=_bs, device=device,
-                use_scheduler=True,
+                use_scheduler=True, optimizer=optimizer,
             )
-            notes = f"自写 {cell.upper()} 真集成训练（{device}），ReduceLROnPlateau 动态学习率"
+            notes = f"自写 {cell.upper()} 眯集成训练（{device}, {optimizer}），ReduceLROnPlateau 动态学习率"
         model.fit(x_train, y_train, x_valid, y_valid, early_stop=20 if algo != "mlp" else 30)
         ic = float(model.best_score)
         epochs = model.best_step + 1

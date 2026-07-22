@@ -795,7 +795,7 @@ class AdvancedTrainer:
     def __init__(
         self,
         model: nn.Module,
-        optimizer_type: str = "adamw",
+        optimizer_type: str = "lion",  # 默认 Lion：显存省半 + 符号操作抗噪，适合低信噪比金融数据
         optimizer_kwargs: dict[str, Any] | None = None,
         loss_type: str = "sharpe",
         learning_rate: float = 1e-4,
