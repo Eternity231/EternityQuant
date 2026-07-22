@@ -12,6 +12,15 @@
 
 from __future__ import annotations
 
+# Windows 控制台默认 cp936/GBK，print() 中文会 mojibake（港股5m完成 → 赟5m姝）
+# 强制 stdout/stderr UTF-8，保证中文输出在任何 Windows 控制台都不乱码
+import sys as _sys
+try:
+    _sys.stdout.reconfigure(encoding="utf-8")
+    _sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass  # 某些嵌入环境无 reconfigure（如 streamlit subprocess），静默跳过
+
 # torch DLL 预热（Windows + cu132 坑：qlib 集成链触发 torch 延迟加载 c10.dll 失败）
 # 放在所有 eq.* import 之前，否则 eq.strategy.factors.ml 会先拖 qlib 链触发 torch 延迟加载
 # 仅 cuda 可用时才 init，避免无 GPU 机器每次 CLI 都拉 CUDA driver

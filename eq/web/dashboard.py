@@ -298,7 +298,7 @@ elif page == "下载管理":
 
         # 港股分钟线
         st.markdown("---")
-        st.subheader("港股分钟线（yfinance Yahoo 源）")
+        st.subheader("港股分钟线（东财 push2his 主源，yfinance fallback）")
         col_hm1, col_hm2, col_hm3 = st.columns(3)
         freq_hm = col_hm1.selectbox("频率", ["5min", "1min"], index=0, key="hk_min_freq")
         top_hm = col_hm2.number_input("前 N 只", min_value=1, max_value=500, value=100, step=10, key="hk_min_top")

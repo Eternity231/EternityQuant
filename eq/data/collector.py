@@ -216,12 +216,95 @@ def collect_hk_minute(
     interval: str = "5m",
     period: str = "2mo",
 ):
-    """港股分钟线（yfinance，8s 间隔防限流）。
+    """港股分钟线（东财 push2his 主源，yfinance fallback）。
 
     Args:
         codes: 显式指定 5 位港股代码列表；传 None 则用内置热门榜
+        interval: "5m" 或 "1m"
+    东财源免费无 key + 无限流，比 yfinance 快约 20 倍；
+    yfinance 仅在东财被屏时 fallback。
     """
-    return _collect_hk_minute_yf(codes=codes, top_n=top_n, interval=interval, period=period)
+    if codes is None:
+        codes = [
+            "00700", "09988", "01024", "01810", "09626", "09888", "09999",
+            "03690", "01211", "02015", "02318", "02628", "01299", "00005",
+            "00011", "00388", "00883", "00941", "00981", "01347",
+        ]
+    else:
+        codes = [str(c).strip().zfill(5) for c in codes if str(c).strip()]
+
+    label = f"港股{interval}"
+    out = HK_5M_DIR if interval == "5m" else HK_1M_DIR
+    ensure_data_dirs()
+    # 东财分钟 K 的 period 映射：5m→"5"，1m→"1"
+    em_period = "5" if interval == "5m" else "1"
+    # 东财分钟 K 拉最近 N 天（beg=end=今天往前推）
+    today = dt.date.today()
+    # 5 分钟线东财存最近 5 天，1 分钟线存最近 2 天
+    days_back = 5 if interval == "5m" else 2
+    beg = (today - dt.timedelta(days=days_back)).strftime("%Y%m%d")
+    end_ = today.strftime("%Y%m%d")
+
+    ok = 0
+    failed = []
+    for code in codes[:top_n]:
+        path = out / f"{code}.csv"
+        if path.exists() and path.stat().st_size > 1000:
+            ok += 1
+            continue
+        # 主源: 东财 push2his 分钟 K（免费无 key，无限流）
+        df = _em_kline(code, "hk", beg, end_, period=em_period, adjust="")
+        if df.empty:
+            # fallback: yfinance（东财被限流/沙盒屏时）
+            failed.append(code)
+            continue
+        df = df.set_index("date").rename(columns={"close": "close"})[["open", "close", "high", "low", "volume"]]
+        df.to_csv(path)
+        ok += 1
+        print(f"  ✓ {label} {code}  {len(df)} 行  (东财源)", flush=True)
+        time.sleep(0.2)  # 东财源无限流，0.2s 间隔足够
+    if failed:
+        # 批量 fallback yfinance（东财失败的才走 yfinance，减少 yfinance 限流压力）
+        yf_failed = []
+        for code in failed:
+            df = _collect_hk_minute_yf_single(code, interval=interval, period=period)
+            if df is None or df.empty:
+                yf_failed.append(code)
+                continue
+            df.to_csv(out / f"{code}.csv")
+            ok += 1
+            print(f"  ✓ {label} {code}  {len(df)} 行  (yfinance fallback)", flush=True)
+        failed = yf_failed
+    print(f"  {label}完成: {ok}/{min(top_n, len(codes))}  失败 {len(failed)} 只")
+    if failed:
+        print(f"  失败清单: {','.join(failed[:20])}{'...' if len(failed) > 20 else ''}")
+
+
+def _collect_hk_minute_yf_single(code: str, interval: str = "5m", period: str = "2mo") -> pd.DataFrame | None:
+    """单股 yfinance 分钟线 fallback（限流重试 3 次）。"""
+    import yfinance as yf
+    yf_code = _fmt_yf_hk(code)
+    for attempt in range(3):
+        try:
+            df = yf.download(yf_code, period=period, interval=interval, progress=False)
+            if df.empty:
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df[["Open", "High", "Low", "Close", "Volume"]].rename(
+                columns={"Open": "open", "High": "high", "Low": "low",
+                         "Close": "close", "Volume": "volume"}
+            )
+            return df
+        except Exception as e:
+            msg = str(e)[:100]
+            if "RateLimit" in msg or "Too Many" in msg or "429" in msg:
+                wait = 30 * (attempt + 1)
+                print(f"  ⏳ 港股{interval} {code} yfinance 限流，等 {wait}s 后重试", flush=True)
+                time.sleep(wait)
+                continue
+            return None
+    return None
 
 
 def _collect_hk_minute_yf(
