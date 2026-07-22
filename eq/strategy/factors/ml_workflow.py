@@ -432,8 +432,11 @@ class _SimpleMLP:
         self.net.eval()
         with torch.no_grad():
             xt = torch.from_numpy(np.asarray(x if not hasattr(x, "values") else x.values)).float().to(self.device)
+            if xt.dim() == 1:
+                xt = xt.unsqueeze(0)  # (158,) → (1,158)
             if len(xt) < 2:
-                xt = xt.unsqueeze(0).repeat(2, 1)  # BatchNorm1d 需 >=2
+                # BatchNorm1d 需 batch≥2，扩成 2 样本预测后取首
+                xt = xt.repeat(2, 1)
                 pred = self.net(xt).squeeze(-1)[0:1]
             else:
                 pred = self.net(xt).squeeze(-1)
@@ -619,8 +622,11 @@ class _SimpleSeqModel:
         self.input_bn.eval()
         with torch.no_grad():
             xt = torch.from_numpy(np.asarray(x if not hasattr(x, "values") else x.values)).float().to(self.device)
+            if xt.dim() == 1:
+                xt = xt.unsqueeze(0)  # (158,) → (1,158)
             if len(xt) < 2:
-                xt = xt.unsqueeze(0).repeat(2, 1)
+                # BatchNorm1d 需 batch≥2，扩成 2 样本预测后取首
+                xt = xt.repeat(2, 1)
                 xr = self._reshape(xt)
                 xr = self.input_bn(xr.reshape(-1, self.input_size)).reshape(xr.size(0), self.seq_len, self.input_size)
                 out, _ = self.net(xr)
@@ -929,13 +935,19 @@ def predict_batch(
 
     # 重新构造 handler 取特征（predict 不需要真 label，用占位表达式避免 horizon 未来数据问题）
     # label 用 Ref($close,-1)/Ref($close,-1)-1 恒为 0 的占位，handler 能跑通，predict 只用 feature
+    # infer_processors 必须与训练时同配置（RobustZScoreNorm+Fillna+CSRankNorm），
+    # 否则特征未归一化/未填 NaN，喂给模型全 NaN（之前 infer_processors=[] 空置的 bug）
     handler = Alpha158(
         instruments=universe,
         start_time=predict_date,
         end_time=predict_date,
         fit_start_time="2015-01-01",
         fit_end_time=predict_date,
-        infer_processors=[],
+        infer_processors=[
+            {"class": "RobustZScoreNorm", "module_path": "qlib.data.dataset.processor"},
+            {"class": "Fillna", "module_path": "qlib.data.dataset.processor"},
+            {"class": "CSRankNorm", "module_path": "qlib.data.dataset.processor"},
+        ],
         label=["Ref($close, -1) / Ref($close, -1) - 1"],
     )
     from qlib.data.dataset import DatasetH
