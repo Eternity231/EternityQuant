@@ -72,6 +72,13 @@ def collect_hk_daily(
             df.index = pd.to_datetime(df.index)
             df = df.sort_index()
             df = df[["open", "high", "low", "close", "volume"]]
+            # 按 start/end 截窗（akshare 只能拉全历史，本地截）
+            if start:
+                df = df[df.index >= pd.Timestamp(start)]
+            if end:
+                df = df[df.index <= pd.Timestamp(end)]
+            if df.empty:
+                continue
             df.to_csv(path)
             ok += 1
             print(f"  ✓ 港股日线 {code}  {len(df)} 行  {df.index[0].date()}~{df.index[-1].date()}", flush=True)
