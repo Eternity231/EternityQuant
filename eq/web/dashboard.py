@@ -247,14 +247,14 @@ elif page == "下载管理":
     with _dl_tab1:
         st.subheader("A股日线（腾讯 API → qlib .bin）")
         col_a1, col_a2, col_a3, col_a4 = st.columns(4)
-        universe = col_a1.selectbox("Universe", ["csi300", "csi500", "csi800", "all", "watchlist"], index=1)
-        start_a = col_a2.text_input("起始日", "2024-01-01")
-        end_a = col_a3.text_input("结束日", dt.date.today().isoformat())
-        workers_a = col_a4.number_input("并发", min_value=1, max_value=32, value=8, step=1)
-        extra_a = st.text_input("附加股票（逗号分隔，如 SH688256,SZ000001）", "")
+        universe = col_a1.selectbox("Universe", ["csi300", "csi500", "csi800", "all", "watchlist"], index=1, key="a_universe")
+        start_a = col_a2.text_input("起始日", "2024-01-01", key="a_start")
+        end_a = col_a3.text_input("结束日", dt.date.today().isoformat(), key="a_end")
+        workers_a = col_a4.number_input("并发", min_value=1, max_value=32, value=8, step=1, key="a_workers")
+        extra_a = st.text_input("附加股票（逗号分隔，如 SH688256,SZ000001）", "", key="a_extra")
         col_a5, col_a6 = st.columns(2)
         extra_codes = [x.strip() for x in extra_a.split(",") if x.strip()] if extra_a else None
-        if col_a5.button("📥 开始下载", type="primary"):
+        if col_a5.button("📥 开始下载", type="primary", key="a_btn_dl"):
             cmd = ["eq", "ml", "update-data", "-u", universe, "-s", start_a, "-e", end_a, "-w", str(workers_a)]
             if extra_codes:
                 cmd += ["-x", ",".join(extra_codes)]
@@ -267,7 +267,7 @@ elif page == "下载管理":
             else:
                 st.error("❌ 下载失败")
                 st.code(proc.stderr[-2000:] or proc.stdout[-2000:])
-        if col_a6.button("🔄 重建 instruments"):
+        if col_a6.button("🔄 重建 instruments", key="a_btn_regen"):
             cmd = ["eq", "ml", "regen-instruments", universe]
             if extra_codes:
                 cmd += ["-x", ",".join(extra_codes)]
@@ -279,10 +279,10 @@ elif page == "下载管理":
     with _dl_tab2:
         st.subheader("港股日线（akshare 新浪源，全历史 2004~2026）")
         col_h1, col_h2, col_h3 = st.columns(3)
-        top_h = col_h1.number_input("前 N 只", min_value=1, max_value=500, value=100, step=10)
-        start_h = col_h2.text_input("起始日", "2024-01-01")
-        codes_file_h = col_h3.text_input("品种表 txt（可选，留空用 top）", "")
-        if st.button("📥 开始下载港股", type="primary"):
+        top_h = col_h1.number_input("前 N 只", min_value=1, max_value=500, value=100, step=10, key="h_top")
+        start_h = col_h2.text_input("起始日", "2024-01-01", key="h_start")
+        codes_file_h = col_h3.text_input("品种表 txt（可选，留空用 top）", "", key="h_codes")
+        if st.button("📥 开始下载港股", type="primary", key="h_btn_dl"):
             cmd = ["eq", "data", "hk", "-n", str(top_h), "-s", start_h]
             if codes_file_h.strip():
                 cmd += ["--codes-file", codes_file_h.strip()]
@@ -300,10 +300,10 @@ elif page == "下载管理":
         st.markdown("---")
         st.subheader("港股分钟线（yfinance Yahoo 源）")
         col_hm1, col_hm2, col_hm3 = st.columns(3)
-        freq_hm = col_hm1.selectbox("频率", ["5min", "1min"], index=0)
+        freq_hm = col_hm1.selectbox("频率", ["5min", "1min"], index=0, key="hk_min_freq")
         top_hm = col_hm2.number_input("前 N 只", min_value=1, max_value=500, value=100, step=10, key="hk_min_top")
         codes_file_hm = col_hm3.text_input("品种表 txt（可选）", "", key="hk_min_codes")
-        if st.button("📥 下载分钟线港股"):
+        if st.button("📥 下载分钟线港股", key="h_btn_min"):
             cmd = ["eq", "data", f"hk-{freq_hm}", "-n", str(top_hm)]
             if codes_file_hm.strip():
                 cmd += ["--codes-file", codes_file_hm.strip()]
@@ -322,9 +322,9 @@ elif page == "下载管理":
         st.subheader("美股日线（yfinance Yahoo 源）")
         col_u1, col_u2, col_u3 = st.columns(3)
         top_u = col_u1.number_input("前 N 只", min_value=1, max_value=500, value=100, step=10, key="us_top")
-        start_u = col_u2.text_input("起始日", "2024-01-01")
+        start_u = col_u2.text_input("起始日", "2024-01-01", key="us_start")
         codes_file_u = col_u3.text_input("品种表 txt（可选）", "", key="us_codes")
-        if st.button("📥 开始下载美股", type="primary"):
+        if st.button("📥 开始下载美股", type="primary", key="us_btn_dl"):
             cmd = ["eq", "data", "us", "-n", str(top_u), "-s", start_u]
             if codes_file_u.strip():
                 cmd += ["--codes-file", codes_file_u.strip()]
@@ -354,9 +354,9 @@ elif page == "下载管理":
         "美股 5 分钟 CSV": _cache_root / "us" / "5m",
         "美股 1 分钟 CSV": _cache_root / "us" / "1m",
     }
-    cache_choice = st.multiselect("选择要清理的缓存目录", list(_cache_dirs.keys()))
+    cache_choice = st.multiselect("选择要清理的缓存目录", list(_cache_dirs.keys()), key="cache_pick")
     col_c1, col_c2 = st.columns(2)
-    if col_c1.button("🧹 清理选中缓存", type="primary"):
+    if col_c1.button("🧹 清理选中缓存", type="primary", key="cache_btn_clean"):
         cleared = 0
         for name in cache_choice:
             d = _cache_dirs[name]
@@ -370,7 +370,7 @@ elif page == "下载管理":
                 except Exception as e:
                     st.error(f"清 {name} 失败：{repr(e)[:100]}")
         st.success(f"清理完成，共清 {cleared} 个目录" if cleared else "未选任何目录")
-    if col_c2.button("📊 查看缓存占用"):
+    if col_c2.button("📊 查看缓存占用", key="cache_btn_view"):
         rows = []
         for name, d in _cache_dirs.items():
             if d.exists():
