@@ -307,8 +307,8 @@ elif page == "下载管理":
             cmd = ["eq", "data", f"hk-{freq_hm}", "-n", str(top_hm)]
             if codes_file_hm.strip():
                 cmd += ["--codes-file", codes_file_hm.strip()]
-            st.info(f"执行：{' '.join(cmd)}（yfinance 限流，内置 8s 间隔）")
-            with st.spinner("下载中（yfinance 源约 15 分钟/100 只）..."):
+            st.info(f"执行：{' '.join(cmd)}（东财主源，无限流；东财失败才走 yfinance fallback）")
+            with st.spinner("下载中（东财源约 30 秒/100 只）..."):
                 proc = _sp.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if proc.returncode == 0:
                 st.success("✅ 港股分钟线下载完成")
