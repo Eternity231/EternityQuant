@@ -154,41 +154,69 @@ def collect_hk_daily(
     start: str = "2024-01-01",
     end: str | None = None,
 ):
-    """港股日线（akshare 新浪源，有 VPN 时可用，全历史 2004~2026）。"""
-    import akshare as ak
+    """港股日线（东财 push2his 主源，akshare 新浪源 fallback，全历史 2004~2026）。
 
+    codes 传 None 时调东财全市场列表（约 3000 只）按 top_n 截；
+    东财限流时 fallback 硬编码 20 只热门榜。
+    8 并发池替串行，不再卡 timeout 等待。
+    """
     if end is None:
         end = dt.date.today().isoformat()
     if codes is None:
-        codes = [
-            "00700", "09988", "01024", "01810", "09626", "09888", "09999",
-            "03690", "01211", "02015", "02318", "02628", "01299", "00005",
-            "00011", "00388", "00883", "00941", "00981", "01347",
-        ]
+        # 复用分钟线的 spot 列表缓存（hk_spot_codes.txt，7 天），避免重拉全市场
+        cache_spot = HK_DAILY_DIR.parent / "hk_spot_codes.txt"
+        codes = None
+        if cache_spot.exists() and (time.time() - cache_spot.stat().st_mtime) < 7 * 86400:
+            try:
+                codes = [ln.strip() for ln in cache_spot.read_text().splitlines() if ln.strip()]
+            except Exception:
+                codes = None
+        if not codes:
+            try:
+                import akshare as ak
+                spot = ak.stock_hk_spot_em()
+                codes = [str(c).zfill(5) for c in spot["代码"].tolist() if str(c).strip()]
+                try:
+                    cache_spot.write_text("\n".join(codes))
+                except Exception:
+                    pass
+            except Exception:
+                codes = [
+                    "00700", "09988", "01024", "01810", "09626", "09888", "09999",
+                    "03690", "01211", "02015", "02318", "02628", "01299", "00005",
+                    "00011", "00388", "00883", "00941", "00981", "01347",
+                ]
+    else:
+        codes = [str(c).strip().zfill(5) for c in codes if str(c).strip()]
 
     out = HK_DAILY_DIR
     ensure_data_dirs()
     ok = 0
-    for code in codes[:top_n]:
+    failed = []
+    # 并发池：东财源无限流，8 并发拉取替串行（串行卡 timeout 8s 等待就是"后台网络不动"根因）
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    targets = [c for c in codes[:top_n]]
+    pre_ok = 0  # 已有缓存的直接算成功（但不再卡 len>=300，新上市股不足 300 行也允许）
+
+    def _dl_one(code):
         path = out / f"{code}.csv"
-        if path.exists() and path.stat().st_size > 1000:
-            # 检查是否已有足够数据（至少 300 行）
+        # 缓存检测：仅判文件存在 + 非空，不卡 len>=300（新上市股不足 300 行被跳过是 bug）
+        if path.exists() and path.stat().st_size > 100:
             try:
-                df = pd.read_csv(path, index_col=0, parse_dates=True)
-                if len(df) >= 300:
-                    ok += 1
-                    continue
-            except:
+                df_cache = pd.read_csv(path, index_col=0, parse_dates=True)
+                if not df_cache.empty:
+                    return code, df_cache, "cache"
+            except Exception:
                 pass
-        try:
-            # 主源: 东财 push2his 统一接口（免费无 key，A/港/美同源）
-            df = _em_kline(code, "hk", start, end, period="daily", adjust="qfq")
-            if df.empty:
-                # fallback: akshare 新浪源（东财被限流时）
+        # 主源: 东财 push2his
+        df = _em_kline(code, "hk", start, end, period="daily", adjust="qfq")
+        if df.empty:
+            # fallback: akshare 新浪源
+            try:
                 import akshare as ak
                 df = ak.stock_hk_daily(symbol=code, adjust="qfq")
                 if df.empty:
-                    continue
+                    return code, None, "fail"
                 df = df.rename(columns={"date": "date"}).set_index("date")
                 df.index = pd.to_datetime(df.index)
                 df = df.sort_index()
@@ -197,17 +225,29 @@ def collect_hk_daily(
                     df = df[df["date"] >= pd.Timestamp(start)]
                 if end:
                     df = df[df["date"] <= pd.Timestamp(end)]
-            else:
-                df = df.set_index("date").rename(columns={"close": "close"})[["open", "close", "high", "low", "volume"]]
-            if df.empty:
+                df = df.set_index("date")
+            except Exception:
+                return code, None, "fail"
+        else:
+            df = df.set_index("date")[["open", "close", "high", "low", "volume"]]
+        if df.empty:
+            return code, None, "fail"
+        df.to_csv(path)
+        return code, df, "em"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_dl_one, c): c for c in targets}
+        for fut in as_completed(futures):
+            code, df, src = fut.result()
+            if df is None or df.empty:
+                failed.append(code)
                 continue
-            df.to_csv(path)
             ok += 1
-            print(f"  ✓ 港股日线 {code}  {len(df)} 行  {df.index[0].date()}~{df.index[-1].date()}", flush=True)
-        except Exception as e:
-            print(f"  ✗ 港股日线 {code}  {str(e)[:50]}", flush=True)
-        time.sleep(0.3)  # 东财源比 akshare 快，间隔从 0.5→0.3
-    print(f"  港股日线完成: {ok}/{min(top_n, len(codes))}")
+            tag = "缓存" if src == "cache" else ("东财源" if src == "em" else "akshare")
+            print(f"  ✓ 港股日线 {code}  {len(df)} 行  {df.index[0].date()}~{df.index[-1].date()}  ({tag})", flush=True)
+    print(f"  港股日线完成: {ok}/{min(top_n, len(codes))}  失败 {len(failed)} 只")
+    if failed:
+        print(f"  失败清单: {','.join(failed[:20])}{'...' if len(failed) > 20 else ''}")
 
 
 def collect_hk_minute(
