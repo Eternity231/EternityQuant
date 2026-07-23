@@ -354,7 +354,7 @@ elif page == "下载管理":
         "美股 5 分钟 CSV": _cache_root / "us" / "5m",
         "美股 1 分钟 CSV": _cache_root / "us" / "1m",
     }
-    cache_choice = st.multiselect("选择要清理的缓存目录", list(_cache_dirs.keys()), key="cache_pick")
+    cache_choice = st.multiselect("选择要清理的缓存目录", list(_cache_dirs.keys()))
     col_c1, col_c2 = st.columns(2)
     if col_c1.button("🧹 清理选中缓存", type="primary", key="cache_btn_clean"):
         cleared = 0
