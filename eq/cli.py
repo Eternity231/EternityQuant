@@ -1219,13 +1219,15 @@ def data_a(
     collect_a_share(start=start, universe=universe, workers=workers, extra_codes=extra_codes)
 
 
-@data_app.command("hk", help="港股日线（yfinance）")
+@data_app.command("hk", help="港股日线（东财 push2his 主源，akshare fallback）")
 def data_hk(
     top_n: int = typer.Option(200, "--top", "-n", help="前 N 只"),
     start: str = typer.Option("2024-01-01", "--start", "-s", help="起始日"),
+    codes: str = typer.Option("", "--codes", help="显式指定港股代码（逗号分隔，如 00700,09988），优先于 top"),
 ):
     from eq.data.collector import collect_hk_daily
-    collect_hk_daily(top_n=top_n, start=start)
+    codes_list = [c.strip().zfill(5) for c in codes.split(",") if c.strip()] if codes else None
+    collect_hk_daily(top_n=top_n, start=start, codes=codes_list)
 
 
 @data_app.command("hk-5min", help="港股 5 分钟线（yfinance，最近 30 天）")
@@ -1254,9 +1256,11 @@ def data_hk_1min(
 def data_us(
     top_n: int = typer.Option(100, "--top", "-n", help="前 N 只"),
     start: str = typer.Option("2024-01-01", "--start", "-s", help="起始日"),
+    codes: str = typer.Option("", "--codes", help="显式指定美股代码（逗号分隔，如 AAPL,MSFT），优先于 top"),
 ):
     from eq.data.collector import collect_us_daily
-    collect_us_daily(top_n=top_n, start=start)
+    codes_list = [c.strip().upper() for c in codes.split(",") if c.strip()] if codes else None
+    collect_us_daily(top_n=top_n, start=start, codes=codes_list)
 
 
 @data_app.command("all", help="全量数据收集（A股+港股日线+5min+1min+美股）")

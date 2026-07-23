@@ -277,7 +277,7 @@ elif page == "下载管理":
 
     # --- 港股下载 ---
     with _dl_tab2:
-        st.subheader("港股日线（akshare 新浪源，全历史 2004~2026）")
+        st.subheader("港股日线（东财 push2his 主源，akshare 新浪源 fallback）")
         col_h1, col_h2, col_h3 = st.columns(3)
         top_h = col_h1.number_input("前 N 只", min_value=1, max_value=500, value=100, step=10, key="h_top")
         start_h = col_h2.text_input("起始日", "2024-01-01", key="h_start")
@@ -287,7 +287,7 @@ elif page == "下载管理":
             if codes_file_h.strip():
                 cmd += ["--codes-file", codes_file_h.strip()]
             st.info(f"执行：{' '.join(cmd)}")
-            with st.spinner("下载中（akshare 源约 3 分钟/100 只）..."):
+            with st.spinner("下载中（东财源约 30 秒/100 只）..."):
                 proc = _sp.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if proc.returncode == 0:
                 st.success("✅ 港股下载完成")
@@ -295,6 +295,26 @@ elif page == "下载管理":
             else:
                 st.error("❌ 港股下载失败")
                 st.code(proc.stderr[-2000:] or proc.stdout[-2000:])
+
+        # 港股自选单股下载
+        st.markdown("---")
+        st.subheader("港股自选单股下载（东财源，秒级）")
+        col_hs1, col_hs2, col_hs3 = st.columns([2, 2, 1])
+        single_h = col_hs1.text_input("港股代码（5 位数字，如 00700）", "", key="h_single")
+        single_start_h = col_hs2.text_input("起始日", "2024-01-01", key="h_single_start")
+        if col_hs3.button("📥 下载单股", type="primary", key="h_btn_single"):
+            if not single_h.strip():
+                st.error("请填港股代码")
+            else:
+                cmd = ["eq", "data", "hk", "-n", "1", "-s", single_start_h, "--codes", single_h.strip().zfill(5)]
+                st.info(f"执行：{' '.join(cmd)}")
+                proc = _sp.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                if proc.returncode == 0:
+                    st.success("✅ 单股下载完成")
+                    st.code(proc.stdout[-1500:])
+                else:
+                    st.error("❌ 失败")
+                    st.code(proc.stderr[-1500:] or proc.stdout[-1500:])
 
         # 港股分钟线
         st.markdown("---")
@@ -319,7 +339,7 @@ elif page == "下载管理":
 
     # --- 美股下载 ---
     with _dl_tab3:
-        st.subheader("美股日线（yfinance Yahoo 源）")
+        st.subheader("美股日线（东财 push2his 主源，yfinance fallback）")
         col_u1, col_u2, col_u3 = st.columns(3)
         top_u = col_u1.number_input("前 N 只", min_value=1, max_value=500, value=100, step=10, key="us_top")
         start_u = col_u2.text_input("起始日", "2024-01-01", key="us_start")
@@ -329,7 +349,7 @@ elif page == "下载管理":
             if codes_file_u.strip():
                 cmd += ["--codes-file", codes_file_u.strip()]
             st.info(f"执行：{' '.join(cmd)}")
-            with st.spinner("下载中（yfinance 源约 15 分钟/100 只）..."):
+            with st.spinner("下载中（东财源约 30 秒/100 只）..."):
                 proc = _sp.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if proc.returncode == 0:
                 st.success("✅ 美股下载完成")
@@ -337,6 +357,26 @@ elif page == "下载管理":
             else:
                 st.error("❌ 失败")
                 st.code(proc.stderr[-2000:] or proc.stdout[-2000:])
+
+        # 美股自选单股下载
+        st.markdown("---")
+        st.subheader("美股自选单股下载（东财源，秒级）")
+        col_us1, col_us2, col_us3 = st.columns([2, 2, 1])
+        single_u = col_us1.text_input("美股代码（如 AAPL, MSFT）", "", key="us_single")
+        single_start_u = col_us2.text_input("起始日", "2024-01-01", key="us_single_start")
+        if col_us3.button("📥 下载单股", type="primary", key="us_btn_single"):
+            if not single_u.strip():
+                st.error("请填美股代码")
+            else:
+                cmd = ["eq", "data", "us", "-n", "1", "-s", single_start_u, "--codes", single_u.strip().upper()]
+                st.info(f"执行：{' '.join(cmd)}")
+                proc = _sp.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                if proc.returncode == 0:
+                    st.success("✅ 单股下载完成")
+                    st.code(proc.stdout[-1500:])
+                else:
+                    st.error("❌ 失败")
+                    st.code(proc.stderr[-1500:] or proc.stdout[-1500:])
 
     # --- 缓存清理（跨 tab 共用） ---
     st.markdown("---")
@@ -371,6 +411,9 @@ elif page == "下载管理":
                     st.error(f"清 {name} 失败：{repr(e)[:100]}")
         st.success(f"清理完成，共清 {cleared} 个目录" if cleared else "未选任何目录")
     if col_c2.button("📊 查看缓存占用", key="cache_btn_view"):
+        st.session_state["cache_viewed"] = True
+    # rerun 时若已查看过，仍渲染 DataFrame（按钮 reset 后不丢）
+    if st.session_state.get("cache_viewed"):
         rows = []
         for name, d in _cache_dirs.items():
             if d.exists():
