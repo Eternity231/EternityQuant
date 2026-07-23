@@ -75,6 +75,8 @@ def parse_hk_codes_from_file(path: str | Path, verbose: bool = True) -> list[str
         5 位港股代码列表（去重保序），如 ["00700", "09988", ...]
     """
     import re
+    # 剥引号（GUI subprocess 透传时路径可能带 "..." 包裹）+ 去首尾空白
+    path = str(path).strip().strip('"').strip("'").strip()
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"品种表文件不存在: {p}")
