@@ -102,7 +102,7 @@ def _em_kline(code: str, market: str, start: str, end: str,
         "_": str(int(time.time() * 1000)),
     }
     try:
-        r = requests.get(_EM_URL, params=params, timeout=20,
+        r = requests.get(_EM_URL, params=params, timeout=8,
                          headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
         r.encoding = "utf-8"
         txt = r.text.strip()
@@ -226,18 +226,32 @@ def collect_hk_minute(
     """
     if codes is None:
         # 拉东财全港股市场列表（约 3000 只），按 top_n 截；不再用硬编码 20 只热门榜
-        try:
-            import akshare as ak
-            spot = ak.stock_hk_spot_em()
-            # 东财 spot 表里代码列叫"代码"，5 位数字
-            codes = [str(c).zfill(5) for c in spot["代码"].tolist() if str(c).strip()]
-        except Exception:
-            # fallback: 东财被限流时用硬编码 20 只热门榜（至少能下到核心标的）
-            codes = [
-                "00700", "09988", "01024", "01810", "09626", "09888", "09999",
-                "03690", "01211", "02015", "02318", "02628", "01299", "00005",
-                "00011", "00388", "00883", "00941", "00981", "01347",
-            ]
+        # 文件缓存 7 天（避免每次重拉 ak.stock_hk_spot_em()，这本身就慢/限流）
+        cache_spot = HK_5M_DIR.parent / "hk_spot_codes.txt"
+        codes = None
+        if cache_spot.exists() and (time.time() - cache_spot.stat().st_mtime) < 7 * 86400:
+            try:
+                codes = [ln.strip() for ln in cache_spot.read_text().splitlines() if ln.strip()]
+            except Exception:
+                codes = None
+        if not codes:
+            try:
+                import akshare as ak
+                spot = ak.stock_hk_spot_em()
+                # 东财 spot 表里代码列叫"代码"，5 位数字
+                codes = [str(c).zfill(5) for c in spot["代码"].tolist() if str(c).strip()]
+                # 落缓存（Hk_5M_DIR 已 ensure_data_dirs）
+                try:
+                    cache_spot.write_text("\n".join(codes))
+                except Exception:
+                    pass
+            except Exception:
+                # fallback: 东财被限流时用硬编码 20 只热门榜（至少能下到核心标的）
+                codes = [
+                    "00700", "09988", "01024", "01810", "09626", "09888", "09999",
+                    "03690", "01211", "02015", "02318", "02628", "01299", "00005",
+                    "00011", "00388", "00883", "00941", "00981", "01347",
+                ]
     else:
         codes = [str(c).strip().zfill(5) for c in codes if str(c).strip()]
 
@@ -255,22 +269,29 @@ def collect_hk_minute(
 
     ok = 0
     failed = []
-    for code in codes[:top_n]:
-        path = out / f"{code}.csv"
-        if path.exists() and path.stat().st_size > 1000:
-            ok += 1
-            continue
-        # 主源: 东财 push2his 分钟 K（免费无 key，无限流）
+    # 并发池：东财源无限流，8 并发拉取替串行（串行卡 timeout 8s 等待就是"后台网络不动"根因）
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    targets = [c for c in codes[:top_n] if not (out / f"{c}.csv").exists() or (out / f"{c}.csv").stat().st_size <= 1000]
+    pre_ok = min(top_n, len(codes)) - len(targets)
+    ok = pre_ok  # 已存在缓存的直接算成功
+
+    def _dl_one(code):
         df = _em_kline(code, "hk", beg, end_, period=em_period, adjust="")
         if df.empty:
-            # fallback: yfinance（东财被限流/沙盒屏时）
-            failed.append(code)
-            continue
-        df = df.set_index("date").rename(columns={"close": "close"})[["open", "close", "high", "low", "volume"]]
-        df.to_csv(path)
-        ok += 1
-        print(f"  ✓ {label} {code}  {len(df)} 行  (东财源)", flush=True)
-        time.sleep(0.2)  # 东财源无限流，0.2s 间隔足够
+            return code, None
+        df = df.set_index("date")[["open", "close", "high", "low", "volume"]]
+        return code, df
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_dl_one, c): c for c in targets}
+        for fut in as_completed(futures):
+            code, df = fut.result()
+            if df is None or df.empty:
+                failed.append(code)
+                continue
+            df.to_csv(out / f"{code}.csv")
+            ok += 1
+            print(f"  ✓ {label} {code}  {len(df)} 行  (东财源)", flush=True)
     if failed:
         # 批量 fallback yfinance（东财失败的才走 yfinance，减少 yfinance 限流压力）
         yf_failed = []
