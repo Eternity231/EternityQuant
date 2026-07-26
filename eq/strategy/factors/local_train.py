@@ -39,7 +39,7 @@ _MIN_UNIVERSE = 30
 
 __all__ = ["load_bars", "build_dataset", "train_local",
            "load_local_model", "predict_local", "factor_scan",
-           "baseline_composite"]
+           "baseline_composite", "score_matrix_local", "backtest_local"]
 
 
 def load_bars(symbols: list[str], days: int = 1200, workers: int = 8,
@@ -161,8 +161,11 @@ def train_local(
     suffix = f"_x{n_seeds}" if n_seeds > 1 else ""
     model_path = _ensure_dir() / f"local_{algo}_{horizon}d{suffix}.pkl"
     with open(model_path, "wb") as f:
+        # split_bounds 必须一起存：回测时要知道测试段从哪天开始，
+        # 否则会滑进训练段——样本内的权益曲线又漂亮又没有意义
         _pkl.dump({"model": model, "pipeline": pipe,
-                   "features": list(x.columns), "horizon": horizon}, f)
+                   "features": list(x.columns), "horizon": horizon,
+                   "split_bounds": split.bounds, "label_norm": label_norm}, f)
 
     b = split.bounds
     model_id = register_model(
@@ -558,3 +561,129 @@ def baseline_composite(
         "singles": pd.DataFrame(singles),
         "n_test_days": int(len(set(x_t.index.get_level_values("datetime")))),
     }
+
+
+# ======================================================================
+# 组合回测：把 IC 换算成钱
+# ======================================================================
+
+def _test_start(blob: dict[str, Any], model_id: str) -> pd.Timestamp:
+    """确定回测起点＝测试段第一天。定不下来就报错，**绝不猜**。
+
+    在训练段上回测会给出一条又漂亮又毫无意义的权益曲线——模型见过那段数据。
+    这种错误不会报警、不会崩，只会让人高兴，所以宁可拒绝执行。
+    """
+    b = blob.get("split_bounds") or {}
+    if b.get("test"):
+        return pd.Timestamp(b["test"][0])
+    # 老模型没存 split_bounds，退回注册表里的 valid 区间末尾 + embargo
+    from eq.db import execute
+
+    rows = execute("SELECT valid_period, metrics FROM ml_models WHERE id = ?", (model_id,))
+    if rows and rows[0]["valid_period"] and "~" in rows[0]["valid_period"]:
+        import json
+
+        end = rows[0]["valid_period"].split("~")[1].strip()
+        emb = int(json.loads(rows[0]["metrics"] or "{}").get("embargo_days", 5))
+        if end:
+            return pd.Timestamp(end) + pd.Timedelta(days=emb)
+    raise ValueError(
+        f"定不下 {model_id} 的测试段起点（模型太老、没存 split_bounds）。"
+        "重训一次即可；或者显式传 start= 指定从哪天开始回测。"
+        "注意起点必须晚于训练/验证段，否则是样本内回测。")
+
+
+def score_matrix_local(
+    model_id: str,
+    symbols: list[str],
+    *,
+    days: int = 1200,
+    start: str | None = None,
+    top_n: int = 10,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """用本地模型给**每一个交易日**打分，返回 ``(日期 × 标的 分数矩阵, 行情)``。
+
+    只输出测试段之后的日期——模型见过训练段和验证段，在那上面回测没有意义。
+
+    分数矩阵的取值：当日排名前 ``top_n`` 的标的取 ``1.0 → 0.5`` 的线性递减权重，
+    其余为 0。组合引擎按 ``>0`` 判断是否想持有、按数值大小分配权重。
+    """
+    blob = load_local_model(model_id)
+    model, pipe, feats = blob["model"], blob["pipeline"], blob["features"]
+
+    bars = load_bars(symbols, days=days)
+    if not bars:
+        raise ValueError("一只标的的行情都没拉到")
+    x = alpha_mod.alpha158(bars)
+    if x.empty:
+        raise ValueError("特征为空——行情根数不够（每只至少 70 根）")
+
+    begin = pd.Timestamp(start) if start else _test_start(blob, model_id)
+    dates = x.index.get_level_values("datetime")
+    x = x[dates >= begin]
+    if x.empty:
+        raise ValueError(f"{begin.date()} 之后没有数据可回测")
+    missing = [c for c in feats if c not in x.columns]
+    if missing:
+        raise ValueError(f"特征对不上，缺 {missing[:5]}——模型需要重训")
+
+    scores = pd.Series(np.asarray(model.predict(pipe.transform(x[feats]))).reshape(-1),
+                       index=x.index)
+    wide = scores.unstack("instrument")
+
+    # 逐日取前 top_n，权重从 1.0 线性降到 0.5——让引擎知道谁更被看好，
+    # 又不至于让第一名一家独大（真正的仓位上限由 PortfolioConfig 管）
+    ranks = wide.rank(axis=1, ascending=False, method="first")
+    sel = ranks <= top_n
+    weight = (1.0 - 0.5 * (ranks - 1) / max(1, top_n - 1)).where(sel, 0.0)
+    return weight.fillna(0.0), bars
+
+
+def backtest_local(
+    model_id: str,
+    symbols: list[str],
+    *,
+    days: int = 1200,
+    start: str | None = None,
+    top_n: int = 10,
+    cfg=None,
+) -> dict[str, Any]:
+    """把本地模型**真的跑一遍组合回测**——含 A 股真实成本。
+
+    这是回答「IC 0.011 到底是赚是亏」的唯一办法。IC 不含手续费、不含印花税、
+    不含最低佣金、不含换手，也不含「只能买整手」这种约束。
+    日频 IC 0.01 这个量级，成本大概率把它整个吃掉——但吃掉多少要跑出来才知道。
+
+    Returns:
+        ``{"result", "gross", "cost_drag", "start", "n_symbols", "n_days"}``。
+        ``gross`` 是同信号同约束、但**零成本**的对照，``cost_drag`` 是两者的
+        总收益之差——即交易成本实际吃掉了多少。
+    """
+    from eq.backtest.portfolio import PortfolioConfig, run_portfolio
+
+    weight, bars = score_matrix_local(model_id, symbols, days=days,
+                                      start=start, top_n=top_n)
+    cfg = cfg or PortfolioConfig(max_positions=top_n, rebalance="weekly",
+                                 allocation="score", cost_model="a_share")
+    # 只保留有分数的那段行情，否则组合引擎会从更早的日期开始空转
+    begin = weight.index.min()
+    sub = {s: d[d.index >= begin] for s, d in bars.items() if s in weight.columns}
+    sub = {s: d for s, d in sub.items() if len(d) >= 30}
+    if not sub:
+        raise ValueError("测试段太短，组合回测至少要 30 根 bar")
+    w = weight.reindex(columns=list(sub)).fillna(0.0)
+    res = run_portfolio(sub, w, cfg)
+
+    # 零成本对照：同一套信号、同一套约束，只把交易成本抹掉。
+    # 差值就是成本真实吃掉了多少——日频选股的换手动辄几十倍，
+    # 印花税 0.1% + 佣金在这个量级上是决定性的，不量出来只能靠猜。
+    import dataclasses
+
+    free_cfg = dataclasses.replace(cfg, cost_model=None,
+                                   commission_bps=0.0, slippage_bps=0.0)
+    gross = run_portfolio(sub, w, free_cfg)
+    net_ret = res.metrics.get("total_return", 0.0)
+    gross_ret = gross.metrics.get("total_return", 0.0)
+    return {"result": res, "gross": gross, "start": str(begin.date()),
+            "n_symbols": len(sub), "n_days": len(weight),
+            "cost_drag": gross_ret - net_ret}

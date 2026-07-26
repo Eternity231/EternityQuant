@@ -505,3 +505,90 @@ def test_factor_scan_empty_and_nonempty_have_same_columns(patched, monkeypatch):
     monkeypatch.setattr(lt, "daily_ic_matrix", lambda *a, **k: pd.DataFrame())
     empty = lt.factor_scan([f"S{i:02d}" for i in range(20)], top_k=3)
     assert list(normal.columns) == list(empty.columns)
+
+
+# ---------- 组合回测：把 IC 换算成钱（v0.42） ----------
+
+@pytest.fixture
+def trained_big(tmp_db, monkeypatch):
+    """40 只 × 700 根，足够切出一段像样的测试段。"""
+    bars = {f"S{i:03d}": _bars(700, seed=i) for i in range(40)}
+    monkeypatch.setattr(lt, "load_bars", lambda *a, **k: bars)
+    r = lt.train_local(list(bars), algo="lightgbm", params=FAST)
+    return r, list(bars)
+
+
+def test_backtest_starts_at_test_segment(trained_big):
+    """**最重要的一条**：回测起点必须落在测试段，绝不能滑进训练段。
+
+    在模型见过的数据上回测会给出一条又漂亮又毫无意义的权益曲线，
+    而且不报错、不崩，只会让人高兴——所以必须钉死。
+    """
+    import pickle
+    from pathlib import Path
+
+    r, syms = trained_big
+    blob = pickle.loads(Path(r["model_path"]).read_bytes())
+    bt = lt.backtest_local(r["model_id"], syms, top_n=5)
+    assert pd.Timestamp(bt["start"]) >= pd.Timestamp(blob["split_bounds"]["test"][0])
+    assert pd.Timestamp(bt["start"]) > pd.Timestamp(blob["split_bounds"]["train"][1])
+
+
+def test_backtest_reports_cost_drag(trained_big):
+    """毛/净两条曲线都要有，差值就是成本吃掉的部分。"""
+    r, syms = trained_big
+    bt = lt.backtest_local(r["model_id"], syms, top_n=5)
+    gross = bt["gross"].metrics["total_return"]
+    net = bt["result"].metrics["total_return"]
+    assert bt["cost_drag"] == pytest.approx(gross - net)
+    assert bt["cost_drag"] > 0, "有换手就必然有成本，drag 不该 ≤0"
+
+
+def test_gross_beats_net(trained_big):
+    """零成本对照的收益必须不低于含成本的——否则成本模型接反了。"""
+    r, syms = trained_big
+    bt = lt.backtest_local(r["model_id"], syms, top_n=5)
+    assert bt["gross"].metrics["total_return"] >= bt["result"].metrics["total_return"]
+
+
+def test_lower_turnover_costs_less(trained_big):
+    """月度调仓的成本必须低于周度——这是「降换手」建议的依据。"""
+    from eq.backtest.portfolio import PortfolioConfig
+
+    r, syms = trained_big
+    def _run(freq):
+        cfg = PortfolioConfig(max_positions=5, rebalance=freq, allocation="score",
+                              cost_model="a_share")
+        return lt.backtest_local(r["model_id"], syms, top_n=5, cfg=cfg)
+    assert _run("monthly")["cost_drag"] < _run("weekly")["cost_drag"]
+
+
+def test_score_matrix_shape_and_selection(trained_big):
+    r, syms = trained_big
+    w, bars = lt.score_matrix_local(r["model_id"], syms, top_n=5)
+    assert (w > 0).sum(axis=1).max() <= 5, "每天最多选 5 只"
+    assert (w >= 0).all().all() and w.max().max() <= 1.0
+    assert set(w.columns) <= set(bars)
+
+
+def test_backtest_refuses_when_boundary_unknown(tmp_db, monkeypatch):
+    """老模型没存 split_bounds、注册表也查不到时，必须拒绝而不是猜一个起点。"""
+    import pickle
+
+    from eq.strategy.factors.ml import register_model
+    from eq.strategy.factors.ml_workflow import _ensure_dir
+
+    path = _ensure_dir() / "nobounds.pkl"
+    path.write_bytes(pickle.dumps({"model": None, "pipeline": object(),
+                                   "features": [], "horizon": 5}))
+    mid = register_model(name="x", universe="u", features=[], algo="lightgbm",
+                         horizon=5, train_period="", valid_period="",
+                         model_path=str(path))
+    with pytest.raises(ValueError, match="定不下|测试段起点"):
+        lt._test_start(pickle.loads(path.read_bytes()), mid)
+
+
+def test_explicit_start_overrides(trained_big):
+    r, syms = trained_big
+    bt = lt.backtest_local(r["model_id"], syms, top_n=5, start="2024-06-03")
+    assert bt["start"] >= "2024-06-03"

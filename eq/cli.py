@@ -1859,6 +1859,54 @@ def ml_train_local(
         typer.echo(f"  用 `eq ml activate {r['model_id']}` 激活")
 
 
+@ml_app.command("backtest-local",
+                help="把本地模型跑成权益曲线（只在测试段，含 A 股真实成本）")
+def ml_backtest_local(
+    model_id: str = typer.Argument(help="train-local 训出来的模型 id"),
+    source: str = typer.Option("watchlist", "--from", "-f", help="标的来源，同 train-local"),
+    top: int = typer.Option(200, "--top", help="市场榜来源时取前 N 只"),
+    positions: int = typer.Option(10, "--positions", "-n", help="同时持有几只"),
+    days: int = typer.Option(1200, "--days", "-d", help="每只拉多少根日线"),
+    start: str = typer.Option("", "--start", help="回测起点 YYYY-MM-DD，缺省用模型的测试段起点"),
+    rebalance: str = typer.Option("weekly", "--rebalance", "-r",
+                                  help="调仓节奏：signal|daily|weekly|monthly。"
+                                       "日频换手极高，成本大概率吃光收益"),
+    max_industry: int = typer.Option(0, "--max-industry", help="同行业最多持几只，0=不限"),
+):
+    """IC 是抽象数字，不含手续费、印花税、最低佣金和换手。这条命令给出钱。"""
+    from eq.backtest.portfolio import PortfolioConfig, format_portfolio
+    from eq.strategy.factors.local_train import backtest_local
+
+    try:
+        symbols, label_txt = _resolve_symbols(source, top_n=top)
+    except Exception as e:
+        typer.echo(f"标的解析失败：{e}", err=True)
+        raise typer.Exit(1) from e
+
+    cfg = PortfolioConfig(max_positions=positions, rebalance=rebalance,
+                          allocation="score", cost_model="a_share",
+                          max_per_industry=max_industry)
+    try:
+        bt = backtest_local(model_id, symbols, days=days,
+                            start=start or None, top_n=positions, cfg=cfg)
+    except Exception as e:
+        typer.echo(f"回测失败：{e}", err=True)
+        raise typer.Exit(1) from e
+
+    m, g = bt["result"].metrics, bt["gross"].metrics
+    typer.echo(f"\n{label_txt} {bt['n_symbols']} 只  测试段 {bt['start']} 起 "
+               f"{bt['n_days']} 天  持仓 {positions} 只  {rebalance} 调仓")
+    typer.echo(format_portfolio(bt["result"]))
+    typer.echo("\n成本账（同信号同约束，只抹掉交易成本做对照）：")
+    typer.echo(f"  毛收益 {g['total_return']:+.2%}   净收益 {m['total_return']:+.2%}"
+               f"   **成本吃掉 {bt['cost_drag']:.2%}**")
+    typer.echo(f"  换手 {m.get('annual_turnover', 0):.1f}x/年"
+               f"（A 股卖出印花税 0.1% + 佣金，换手越高被吃得越狠）")
+    if bt["cost_drag"] > abs(g.get("total_return", 0)) * 0.5:
+        typer.echo("\n  ⚠ 成本吃掉了毛收益的一半以上。降换手比调模型有效得多："
+                   "\n    --rebalance monthly、加大 --positions、或训练时拉长 --horizon")
+
+
 @ml_app.command("baseline",
                 help="无参数基准：验证段选因子、测试段评估，和模型 test IC 直接可比")
 def ml_baseline(
