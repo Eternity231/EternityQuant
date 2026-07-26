@@ -238,3 +238,37 @@ def test_explicit_params_are_not_scaled():
                    num_boost_round=10)
     assert m.effective_params["lambda_l1"] == 99.0
     assert m.effective_params["num_leaves"] == 3
+
+
+# ---------- 早停口径（v0.40） ----------
+
+def test_ic_early_stop_uses_custom_metric():
+    """开启后内置 metric 关掉，改用 Rank IC 早停——选和考同一把尺。"""
+    xt, yt, xv, yv = _split(*_ranked_panel(80, 20))
+    m = train_gbdt(xt, yt, xv, yv, num_boost_round=200, ic_early_stop=True)
+    assert m.effective_params.get("metric") == "None"
+    assert m.best_iteration >= 1
+
+
+def test_mse_early_stop_keeps_builtin_metric():
+    xt, yt, xv, yv = _split(*_ranked_panel(80, 20))
+    m = train_gbdt(xt, yt, xv, yv, num_boost_round=200, ic_early_stop=False)
+    assert m.effective_params.get("metric") != "None"
+
+
+def test_ic_feval_returns_higher_is_better():
+    """feval 的第三个返回值必须是 True，否则 LightGBM 会往 IC 变小的方向早停。"""
+    from eq.strategy.factors.gbdt import _make_ic_feval
+
+    _, y = _ranked_panel(20, 10)
+    name, value, higher = _make_ic_feval(y)(np.asarray(y), None)
+    assert name == "rank_ic" and higher is True
+    assert value > 0.9, "拿标签自己当预测，IC 应该接近 1"
+
+
+def test_ic_feval_handles_constant_prediction():
+    from eq.strategy.factors.gbdt import _make_ic_feval
+
+    _, y = _ranked_panel(20, 10)
+    _, value, _ = _make_ic_feval(y)(np.zeros(len(y)), None)
+    assert value == 0.0, "常数预测的 IC 是 0，不能是 NaN"

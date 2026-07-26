@@ -1841,8 +1841,9 @@ def ml_train_local(
                   else "   （无独立测试段，valid IC 偏乐观）"))
     if m.get("test"):
         t = m["test"]
-        typer.echo(f"  test ICIR {t.get('icir', 0):+.3f}  t 值 {t.get('t_stat', 0):+.2f}"
-                   f"  胜率 {t.get('ic_win_rate', 0):.0%}")
+        typer.echo(f"  test ICIR {t.get('icir', 0):+.3f}  胜率 {t.get('ic_win_rate', 0):.0%}"
+                   f"  t {t.get('t_stat', 0):+.2f} → **重叠修正后 "
+                   f"{t.get('t_stat_nw', 0):+.2f}**（|t|>2 才谈得上显著）")
     typer.echo(f"  存盘 {r['model_path']}")
 
     # 自检结果放在最后、最显眼的位置。IC=0 有两种完全不同的原因——
@@ -1856,6 +1857,52 @@ def ml_train_local(
                    "  （A 股成交额前 300，候选池大得多）")
     else:
         typer.echo(f"  用 `eq ml activate {r['model_id']}` 激活")
+
+
+@ml_app.command("baseline",
+                help="无参数基准：验证段选因子、测试段评估，和模型 test IC 直接可比")
+def ml_baseline(
+    source: str = typer.Option("watchlist", "--from", "-f", help="标的来源，同 train-local"),
+    top: int = typer.Option(200, "--top", help="市场榜来源时取前 N 只"),
+    horizon: int = typer.Option(5, "--horizon", "-h", help="预测窗口（交易日）"),
+    days: int = typer.Option(1200, "--days", "-d", help="每只拉多少根日线"),
+    test_ratio: float = typer.Option(0.15, "--test-ratio", help="测试段占比"),
+    top_k: int = typer.Option(5, "--top-k", help="合成用的因子个数"),
+):
+    """factor-scan 是在测试段挑最大值（带选择偏差）；这个把选择和评估分开。"""
+    from eq.strategy.factors.local_train import baseline_composite
+
+    try:
+        symbols, label_txt = _resolve_symbols(source, top_n=top)
+    except Exception as e:
+        typer.echo(f"标的解析失败：{e}", err=True)
+        raise typer.Exit(1) from e
+
+    typer.echo(f"\n无参数基准：{label_txt} {len(symbols)} 只  horizon={horizon}d  "
+               f"取验证段最强 {top_k} 个因子等权合成")
+    try:
+        r = baseline_composite(symbols, horizon=horizon, days=days,
+                               test_ratio=test_ratio, top_k=top_k)
+    except Exception as e:
+        typer.echo(f"失败：{e}", err=True)
+        raise typer.Exit(1) from e
+
+    s = r["singles"].copy()
+    for col, fmt in (("valid_ic", "{:+.4f}"), ("test_ic", "{:+.4f}"),
+                     ("test_icir", "{:+.3f}"), ("test_t", "{:+.2f}")):
+        s[col] = s[col].map(fmt.format)
+    typer.echo(f"\n验证段选出的 {top_k} 个因子（在测试段 {r['n_test_days']} 天上的表现）：\n")
+    typer.echo(s.to_string(index=False))
+
+    c = r["composite"]
+    typer.echo(f"\n等权合成基准：test IC {c['ic_mean']:+.4f}  ICIR {c['icir']:+.3f}  "
+               f"胜率 {c['ic_win_rate']:.0%}"
+               f"\n            t {c['t_stat']:+.2f} → **重叠修正后 {c['t_stat_nw']:+.2f}**"
+               f"（horizon={horizon} 的标签相邻日重叠，普通 t 高估约 √{horizon} 倍）")
+    typer.echo("\n拿它和 `eq ml train-local` 报的 test IC 比：")
+    typer.echo("  · 模型明显更高 → 训练确实创造了价值，可以用")
+    typer.echo("  · 打平或更低 → 158 维模型没跑赢一个等权公式，别用它交易")
+    typer.echo("     （可能是过拟合到训练段的旧行情，也可能这批特征就只有这点信息）")
 
 
 @ml_app.command("factor-scan",
@@ -1900,15 +1947,18 @@ def ml_factor_scan(
     show["ic"] = show["ic"].map(lambda v: f"{v:+.4f}")
     show["icir"] = show["icir"].map(lambda v: f"{v:+.3f}")
     show["t_stat"] = show["t_stat"].map(lambda v: f"{v:+.2f}")
+    show["t_nw"] = show["t_nw"].map(lambda v: f"{v:+.2f}")
     show["win_rate"] = show["win_rate"].map(lambda v: f"{v:.0%}")
     typer.echo(f"\n测试段 {int(df['n_days'].iloc[0])} 个交易日，|IC| 前 {len(df)}：\n")
     typer.echo(show.to_string(index=False))
     best = df.iloc[0]
     typer.echo(f"\n最强单因子 {best['factor']}：IC {best['ic']:+.4f}  "
-               f"t 值 {best['t_stat']:+.2f}")
+               f"t {best['t_stat']:+.2f} → **重叠修正后 {best['t_nw']:+.2f}**")
     typer.echo("  · 模型 test IC 明显高于它 → 模型确实学到了组合效应")
     typer.echo("  · 模型 test IC 还不如它 → 158 维模型跑输一个公式，管线有问题")
     typer.echo("  · 两者都接近 0 → 这段行情/这批票就是难，不是模型的错")
+    typer.echo(f"\n⚠ t_nw 才是该看的数：horizon={horizon} 的标签相邻日重叠 {horizon - 1} 天，"
+               f"每日 IC 强烈自相关，\n  t_stat 把它们当独立样本，系统性高估约 √{horizon} 倍。")
     typer.echo("\n⚠ 多重检验：这是从 158 个因子里挑最大值，不是单次检验。"
                "\n  零假设下扫 158 个因子，最大 |t| 本来就期望在 3 附近——"
                "纯随机数据上实测能挑出 t=4.85 的「因子」。"

@@ -131,14 +131,18 @@ def daily_ic(
     return s
 
 
-def ic_summary(ic: pd.Series) -> dict[str, float]:
+def ic_summary(ic: pd.Series, horizon: int = 1) -> dict[str, float]:
     """把每日 IC 序列汇总成一组指标。
 
     - ``ic_mean``   平均 IC。A 股日频选股，0.03 已算可用，0.05+ 是好因子
     - ``ic_std``    IC 波动
     - ``icir``      = ic_mean / ic_std。**比 IC 本身更重要**，衡量信号稳定性；
                     经验上 ICIR > 0.3 才值得上实盘
-    - ``t_stat``    = icir * sqrt(n_days)，|t| > 2 才谈得上统计显著
+    - ``t_stat``    = icir * sqrt(n_days)，|t| > 2 才谈得上统计显著。
+                    **注意它假设每日 IC 相互独立**，horizon>1 时标签重叠会让这个
+                    数偏大——真正该看的是下面那个
+    - ``t_stat_nw`` Newey-West 修正后的 t 值（滞后阶 horizon-1），
+                    扣掉重叠标签造成的自相关。h=5 时通常比 ``t_stat`` 小一半左右
     - ``ic_win_rate`` IC > 0 的交易日占比，0.55+ 算稳
     - ``ic_ir_annual`` 年化 ICIR（= icir * sqrt(252)），和夏普可比
     """
@@ -146,7 +150,8 @@ def ic_summary(ic: pd.Series) -> dict[str, float]:
     n = len(ic)
     if n == 0:
         return {"ic_mean": 0.0, "ic_std": 0.0, "icir": 0.0, "t_stat": 0.0,
-                "ic_win_rate": 0.0, "ic_ir_annual": 0.0, "n_days": 0}
+                "t_stat_nw": 0.0, "ic_win_rate": 0.0, "ic_ir_annual": 0.0,
+                "n_days": 0}
     mean = float(ic.mean())
     std = float(ic.std(ddof=1)) if n > 1 else 0.0
     # 常数序列的样本标准差在浮点下是 ~1e-18 而非严格 0，直接 mean/std
@@ -159,10 +164,52 @@ def ic_summary(ic: pd.Series) -> dict[str, float]:
         "ic_std": std,
         "icir": icir,
         "t_stat": icir * np.sqrt(n) if std > 0 else 0.0,
+        "t_stat_nw": _newey_west_t(ic, horizon) if std > 0 else 0.0,
         "ic_win_rate": float((ic > 0).mean()),
         "ic_ir_annual": icir * np.sqrt(TRADING_DAYS) if std > 0 else 0.0,
         "n_days": n,
     }
+
+
+def _newey_west_t(ic: pd.Series, horizon: int) -> float:
+    """重叠标签修正后的 t 值（Newey-West，滞后阶取 ``horizon-1``）。
+
+    **为什么必须修**：``horizon=5`` 的标签是 ``close[t+5]/close[t]-1``，
+    相邻交易日的标签共用 4 天行情，于是每日 IC 强烈自相关。
+    而 ``t = ICIR × sqrt(n_days)`` 把这些天当成独立样本，
+    系统性高估显著性——粗略地说高估 ``sqrt(horizon)`` 倍，h=5 时约 2.2 倍。
+
+    这不是小事：一个报出来 t=4.6 的因子，修正后可能只有 2.1，
+    刚好跨在「显著」和「不显著」的分界线两侧。
+
+    Newey-West 用**实测的自相关**而不是拍一个 sqrt(h)：
+
+        var_NW = var₀ × (1 + 2·Σₖ (1 − k/(L+1))·ρₖ)
+
+    ρₖ 为正（重叠导致的典型情形）时方差被放大、t 值被压小；
+    自相关恰好为 0 时退回普通 t 值。
+    """
+    n = len(ic)
+    lag = max(0, int(horizon) - 1)
+    if n < 3 or lag == 0:
+        std = float(ic.std(ddof=1))
+        return float(ic.mean()) / std * np.sqrt(n) if std > 1e-12 else 0.0
+
+    x = ic.to_numpy(dtype="float64")
+    mean = float(x.mean())
+    dev = x - mean
+    gamma0 = float((dev * dev).mean())
+    if gamma0 <= 1e-24:
+        return 0.0
+    lag = min(lag, n - 1)
+    factor = 1.0
+    for k in range(1, lag + 1):
+        rho = float((dev[k:] * dev[:-k]).mean()) / gamma0
+        factor += 2.0 * (1.0 - k / (lag + 1.0)) * rho
+    # 自相关为负且很强时 factor 可能算成非正，退回未修正口径
+    if factor <= 0:
+        return mean / np.sqrt(gamma0 / n)
+    return float(mean / np.sqrt(gamma0 * factor / n))
 
 
 def quantile_returns(
@@ -230,8 +277,14 @@ def quantile_returns(
     }
 
 
-def evaluate(pred, label, n_groups: int = 5, method: str = "spearman") -> dict[str, Any]:
+def evaluate(pred, label, n_groups: int = 5, method: str = "spearman",
+             horizon: int = 1) -> dict[str, Any]:
     """一次算全套评估指标。
+
+    Args:
+        horizon: 标签的预测窗口（交易日）。>1 时相邻交易日的标签重叠，
+            每日 IC 自相关，普通 t 值会高估显著性——传对了才会算
+            ``t_stat_nw``（Newey-West 修正）。
 
     Returns:
         含 ``rank_ic`` / ``pearson_ic`` / 分层结果 / ``pooled`` 标志的字典。
@@ -241,7 +294,7 @@ def evaluate(pred, label, n_groups: int = 5, method: str = "spearman") -> dict[s
     df = _aligned_frame(pred, label)
     pooled = _date_level(df) is None
     ic = daily_ic(df["pred"], df["label"], method=method)
-    summ = ic_summary(ic)
+    summ = ic_summary(ic, horizon=horizon)
     q = quantile_returns(df["pred"], df["label"], n_groups=n_groups)
     # Pearson 版本一并给出，和 Rank IC 差很多时说明信号被极端值主导
     pic = daily_ic(df["pred"], df["label"], method="pearson")

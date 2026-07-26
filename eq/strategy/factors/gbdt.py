@@ -131,6 +131,29 @@ class GBDTModel:
                 .sort_values(ascending=False).head(top))
 
 
+def _make_ic_feval(y_valid: pd.Series):
+    """给 LightGBM 用的自定义评估函数：**每日横截面 Rank IC**。
+
+    改之前 LightGBM 是按 MSE 早停的，而模型最终按 Rank IC 验收和使用——
+    又是一次「拿一把尺选 checkpoint、拿另一把尺打分」。v0.36 已经给自写的
+    torch 模型修过同一类错误，当时我在这里写了句「早停只能用 LightGBM 的
+    mse，那是它内部的事」，**那句话是错的**：``feval`` 就是干这个的。
+
+    为什么这两把尺会分岔：MSE 关心的是预测值离标签有多远（受少数极端样本主导），
+    Rank IC 只关心当日截面上的**次序**。在 158 维高噪声特征上，
+    MSE 最优的那一轮往往远不是截面排序最优的那一轮。
+    """
+    from eq.strategy.factors.evaluation import daily_ic
+
+    def _feval(preds, _dataset):
+        ics = daily_ic(pd.Series(np.asarray(preds).reshape(-1), index=y_valid.index),
+                       y_valid)
+        m = float(ics.mean()) if len(ics) else 0.0
+        return "rank_ic", (m if m == m else 0.0), True   # True = 越大越好
+
+    return _feval
+
+
 def train_gbdt(
     x_train: pd.DataFrame,
     y_train: pd.Series,
@@ -143,6 +166,7 @@ def train_gbdt(
     seed: int = 42,
     verbose: bool = False,
     auto_scale: bool = True,
+    ic_early_stop: bool = True,
 ) -> GBDTModel:
     """训练一个 LightGBM。有验证集就按验证集早停。
 
@@ -169,12 +193,19 @@ def train_gbdt(
     valid_sets, callbacks = [], []
     has_valid = (x_valid is not None and y_valid is not None
                  and len(x_valid) > 0 and len(y_valid) > 0)
+    feval = None
     if has_valid:
         dvalid = lgb.Dataset(x_valid[feats].to_numpy(dtype="float64"),
                              label=np.asarray(y_valid, dtype="float64"),
                              reference=dtrain, free_raw_data=False)
         valid_sets = [dvalid]
-        callbacks.append(lgb.early_stopping(early_stopping_rounds, verbose=verbose))
+        if ic_early_stop:
+            # 关掉内置 metric，只用自定义的 Rank IC 早停——
+            # 选 checkpoint 的尺必须和最终验收的尺一致
+            p["metric"] = "None"
+            feval = _make_ic_feval(y_valid)
+        callbacks.append(lgb.early_stopping(early_stopping_rounds, verbose=verbose,
+                                            first_metric_only=True))
     else:
         # 没有验证集就没法早停，跑满轮数几乎必然过拟合——明确警告，不静默
         logger.warning("无验证集，LightGBM 将跑满 %d 轮且不早停，结果大概率过拟合",
@@ -183,14 +214,13 @@ def train_gbdt(
         callbacks.append(lgb.log_evaluation(period=50))
 
     booster = lgb.train(p, dtrain, num_boost_round=num_boost_round,
-                        valid_sets=valid_sets, callbacks=callbacks)
+                        valid_sets=valid_sets, feval=feval, callbacks=callbacks)
 
     best_iter = booster.best_iteration or num_boost_round
     best_score = 0.0
     collapsed = False
     if has_valid:
-        # 用**每日横截面 Rank IC** 记分，和早停口径、最终验收保持同一把尺
-        # （早停本身只能用 LightGBM 的 mse，那是它内部的事）
+        # 和早停、最终验收同一把尺（ic_early_stop=True 时早停也用它）
         from eq.strategy.factors.evaluation import daily_ic
 
         pred = booster.predict(x_valid[feats].to_numpy(dtype="float64"),

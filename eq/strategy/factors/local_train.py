@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 _MIN_UNIVERSE = 30
 
 __all__ = ["load_bars", "build_dataset", "train_local",
-           "load_local_model", "predict_local", "factor_scan"]
+           "load_local_model", "predict_local", "factor_scan",
+           "baseline_composite"]
 
 
 def load_bars(symbols: list[str], days: int = 1200, workers: int = 8,
@@ -150,7 +151,7 @@ def train_local(
 
         x_test, y_test = pipe.transform(x[split.test]), y[split.test]
         pred = pd.Series(model.predict(x_test), index=x_test.index)
-        test_report = evaluate(pred, y_test)
+        test_report = evaluate(pred, y_test, horizon=horizon)
     ic = test_report["ic_mean"] if test_report else valid_ic
 
     import pickle as _pkl
@@ -379,8 +380,9 @@ def factor_scan(
 
     Returns:
         按 |IC| 降序的前 ``top_k`` 行，列：``factor / ic / icir / t_stat /
-        win_rate / n_days``。IC 为负的因子反向用同样有效，所以排序看绝对值，
-        ``ic`` 列保留原始符号。
+        t_nw / win_rate / n_days``。``t_nw`` 是 Newey-West 修正后的 t 值，
+        扣掉了重叠标签造成的自相关——**该看的是它，不是 t_stat**。
+        IC 为负的因子反向用同样有效，所以排序看绝对值，``ic`` 列保留原始符号。
     """
     from eq.strategy.factors.evaluation import evaluate
 
@@ -401,7 +403,7 @@ def factor_scan(
         if f.notna().sum() < 100 or f.nunique() < 2:
             continue
         try:
-            rep = evaluate(f, y_t)
+            rep = evaluate(f, y_t, horizon=horizon)
         except Exception as e:
             logger.debug("因子 %s 评估失败：%s", col, e)
             continue
@@ -409,8 +411,89 @@ def factor_scan(
                      "t_stat": rep["t_stat"], "win_rate": rep["ic_win_rate"],
                      "n_days": rep["n_days"]})
     if not rows:
-        return pd.DataFrame(columns=["factor", "ic", "icir", "t_stat",
+        return pd.DataFrame(columns=["factor", "ic", "icir", "t_stat", "t_nw",
                                      "win_rate", "n_days"])
     df = pd.DataFrame(rows)
     return (df.reindex(df["ic"].abs().sort_values(ascending=False).index)
             .head(top_k).reset_index(drop=True))
+
+
+def baseline_composite(
+    symbols: list[str],
+    *,
+    horizon: int = 5,
+    days: int = 1200,
+    valid_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    embargo_days: int | None = None,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """无参数基准：在**验证段**挑因子，在**测试段**评估，和模型成绩直接可比。
+
+    :func:`factor_scan` 是在测试段上挑最大值，带选择偏差，只能当粗略参照。
+    这个函数把选择和评估分开——用验证段（模型早停也用它）排出 |IC| 前 k 个因子，
+    按各自 IC 的符号取向后**等权合成**，然后在测试段量一次。全程没有拟合参数。
+
+    这是判断「模型到底有没有用」最干净的对照：
+
+    - 模型 test IC 明显高于合成基准 → 训练确实创造了价值
+    - 打平或更低 → 158 维模型没跑赢一个等权公式。可能是过拟合到训练段的旧行情，
+      也可能是这批特征本来就只有那么点信息——两者都说明不该用这个模型交易。
+
+    Returns:
+        ``{"selected": [...], "composite": {...}, "singles": DataFrame,
+        "n_test_days": int}``；``composite`` 是 :func:`evaluation.evaluate` 的报告。
+    """
+    from eq.strategy.factors.evaluation import evaluate
+
+    embargo = horizon if embargo_days is None else int(embargo_days)
+    bars = load_bars(symbols, days=days)
+    if not bars:
+        raise ValueError("一只标的的行情都没拉到")
+    x, y = build_dataset(bars, horizon=horizon)
+    split = purged_split(x.index, valid_ratio=valid_ratio, test_ratio=test_ratio,
+                         embargo_days=embargo, with_test=test_ratio > 0)
+    if split.test is None or split.test.sum() == 0:
+        raise ValueError("没有独立测试段，无法做无偏对照（test_ratio 不能为 0）")
+
+    x_v, y_v = x[split.valid], y[split.valid]
+    x_t, y_t = x[split.test], y[split.test]
+
+    # 1) 在验证段给每个因子打分（选择只用验证段，测试段完全不参与）
+    scored = []
+    for col in x_v.columns:
+        f = x_v[col]
+        if f.notna().sum() < 100 or f.nunique() < 2:
+            continue
+        try:
+            ic = float(evaluate(f, y_v, horizon=horizon)["ic_mean"])
+        except Exception:
+            continue
+        if ic == ic:
+            scored.append((col, ic))
+    if not scored:
+        raise ValueError("验证段上没有可用因子")
+    scored.sort(key=lambda kv: abs(kv[1]), reverse=True)
+    picked = scored[:top_k]
+
+    # 2) 按验证段 IC 的符号取向，逐因子做截面 rank 归一化后等权相加。
+    #    先归一化再相加是必须的：158 个因子的量纲天差地别，
+    #    直接加等于让方差最大的那个说了算。
+    parts = []
+    for col, ic in picked:
+        z = pp.cs_rank_norm(x_t[col])
+        parts.append(z * (1.0 if ic >= 0 else -1.0))
+    composite = sum(parts) / len(parts)
+
+    # 3) 在测试段评估：合成基准 + 各成分单独表现（都用同一把尺）
+    singles = []
+    for col, vic in picked:
+        rep = evaluate(x_t[col], y_t, horizon=horizon)
+        singles.append({"factor": col, "valid_ic": vic, "test_ic": rep["ic_mean"],
+                        "test_icir": rep["icir"], "test_t": rep["t_stat"]})
+    return {
+        "selected": [c for c, _ in picked],
+        "composite": evaluate(composite, y_t, horizon=horizon),
+        "singles": pd.DataFrame(singles),
+        "n_test_days": int(len(set(x_t.index.get_level_values("datetime")))),
+    }

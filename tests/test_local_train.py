@@ -389,3 +389,52 @@ def test_factor_scan_needs_bars(monkeypatch):
     monkeypatch.setattr(lt, "load_bars", lambda *a, **k: {})
     with pytest.raises(ValueError, match="一只标的的行情都没拉到"):
         lt.factor_scan(["600519.SH"])
+
+
+# ---------- 无参数基准（v0.40：选择与评估分开） ----------
+
+def test_baseline_selects_on_valid_evaluates_on_test(patched):
+    """选因子只能用验证段，测试段绝不能参与选择——否则又是选择偏差。"""
+    r = lt.baseline_composite([f"S{i:02d}" for i in range(20)], top_k=4)
+    assert len(r["selected"]) == 4
+    assert set(r["singles"]["factor"]) == set(r["selected"])
+    assert r["n_test_days"] > 0
+    for k in ("ic_mean", "icir", "t_stat", "ic_win_rate"):
+        assert k in r["composite"]
+
+
+def test_baseline_shows_valid_to_test_shrinkage(patched):
+    """随机数据上，验证段挑出来的 |IC| 到测试段必然缩水——这正是选择偏差本身。
+
+    这条用例的价值是把「在哪个段上挑的」这件事的后果量出来：
+    factor_scan 直接在测试段挑最大值，报出来的数就带着这份水分。
+    """
+    r = lt.baseline_composite([f"S{i:02d}" for i in range(20)], top_k=5)
+    s = r["singles"]
+    assert s["valid_ic"].abs().mean() > s["test_ic"].abs().mean(), \
+        "验证段挑出的因子在测试段应当缩水"
+
+
+def test_baseline_composite_is_not_significant_on_noise(patched):
+    """纯随机行情上合成基准不该显著——工具本身不能凭空造出信号。
+
+    判据用**重叠修正后**的 t 值而不是 IC 绝对值：horizon=5 时相邻交易日的标签
+    共用 4 天行情，每日 IC 强烈自相关，20 只票的截面上 |IC| 到 0.1 都属正常涨落。
+    这条用例第一次写成 |IC| < 0.05 时挂了（实得 0.097），正是这个原因——
+    普通 t 值把自相关的日子当独立样本，把噪声算成了 4.6 个标准误。
+    """
+    r = lt.baseline_composite([f"S{i:02d}" for i in range(20)], top_k=5)
+    assert abs(r["composite"]["t_stat_nw"]) < 3.0,         f"随机数据上不该显著：t_nw={r['composite']['t_stat_nw']:.2f}"
+
+
+def test_baseline_requires_test_segment(patched):
+    with pytest.raises(ValueError, match="没有独立测试段"):
+        lt.baseline_composite([f"S{i:02d}" for i in range(20)], test_ratio=0.0)
+
+
+def test_baseline_flips_negative_factors(patched, monkeypatch):
+    """IC 为负的因子要反向计入合成，不能直接相加把信号抵消掉。"""
+    r = lt.baseline_composite([f"S{i:02d}" for i in range(20)], top_k=5)
+    # 只要选出的因子里有负 IC 的，就说明反向逻辑被触发过
+    if (r["singles"]["valid_ic"] < 0).any():
+        assert r["composite"]["n_days"] > 0

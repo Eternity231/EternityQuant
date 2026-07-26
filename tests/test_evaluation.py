@@ -189,3 +189,74 @@ def test_pooled_ic_is_inflated_vs_daily_ic():
     daily = ev.daily_ic(pred, label).mean()          # 新口径
     assert pooled > 0.9, "pooled 口径把无选股能力的模型评得很高"
     assert abs(daily) < 0.1, "按日横截面口径正确地判定它没有选股能力"
+
+
+# ---------- 重叠标签的 t 值修正（v0.40） ----------
+
+def test_newey_west_shrinks_t_under_overlap():
+    """重叠标签造成正自相关时，修正后的 t 必须明显变小。
+
+    horizon=5 的标签是 close[t+5]/close[t]-1，相邻交易日共用 4 天行情。
+    普通 t = ICIR×√n 把这些天当独立样本，系统性高估显著性——
+    粗略地说高估 √horizon 倍。
+    """
+    import numpy as np
+    import pandas as pd
+
+    from eq.strategy.factors.evaluation import ic_summary
+
+    rng = np.random.default_rng(0)
+    raw = rng.normal(0.02, 0.2, 400)
+    overlapped = pd.Series(pd.Series(raw).rolling(5).mean().dropna().to_numpy())
+    plain = ic_summary(overlapped, horizon=1)["t_stat"]
+    fixed = ic_summary(overlapped, horizon=5)["t_stat_nw"]
+    assert abs(fixed) < abs(plain) * 0.75, f"{plain:.2f} → {fixed:.2f} 缩得不够"
+
+
+def test_newey_west_is_harmless_without_autocorrelation():
+    """序列本来就独立时，传 horizon>1 不该无故压低 t 值。"""
+    import numpy as np
+    import pandas as pd
+
+    from eq.strategy.factors.evaluation import ic_summary
+
+    s = pd.Series(np.random.default_rng(1).normal(0.02, 0.2, 400))
+    r = ic_summary(s, horizon=5)
+    assert abs(r["t_stat_nw"] - r["t_stat"]) < 0.3
+
+
+def test_horizon_one_falls_back_to_plain_t():
+    import numpy as np
+    import pandas as pd
+
+    from eq.strategy.factors.evaluation import ic_summary
+
+    s = pd.Series(np.random.default_rng(2).normal(0.02, 0.2, 200))
+    r = ic_summary(s, horizon=1)
+    assert r["t_stat_nw"] == pytest.approx(r["t_stat"], rel=1e-9)
+
+
+def test_empty_ic_has_zero_nw_t():
+    import pandas as pd
+
+    from eq.strategy.factors.evaluation import ic_summary
+
+    assert ic_summary(pd.Series(dtype=float), horizon=5)["t_stat_nw"] == 0.0
+
+
+def test_evaluate_passes_horizon_through():
+    import numpy as np
+    import pandas as pd
+
+    from eq.strategy.factors.evaluation import evaluate
+
+    rng = np.random.default_rng(3)
+    idx = pd.MultiIndex.from_product(
+        [pd.bdate_range("2024-01-01", periods=80), [f"S{i:02d}" for i in range(20)]],
+        names=["datetime", "instrument"])
+    lab = pd.Series(rng.normal(size=len(idx)), index=idx)
+    pred = lab + rng.normal(scale=0.5, size=len(idx))
+    r1 = evaluate(pred, lab, horizon=1)
+    r5 = evaluate(pred, lab, horizon=5)
+    assert r1["t_stat"] == pytest.approx(r5["t_stat"]), "普通 t 不受 horizon 影响"
+    assert r1["t_stat_nw"] != r5["t_stat_nw"], "修正 t 必须随 horizon 变"
