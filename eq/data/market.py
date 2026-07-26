@@ -1,7 +1,6 @@
 """市场数据获取：按市场选主源 + fallback。
 
-vibe-trading 仅作数据补全和一次性查询的助手，不作硬依赖。
-本模块直调 yfinance / akshare SDK，避免 MCP stdio RPC 开销。
+直调 yfinance / akshare / baostock SDK，不经任何外部服务或 AI agent。
 """
 
 from __future__ import annotations
@@ -93,7 +92,7 @@ def detect_market(symbol: str) -> Market:
     raise ValueError(f"无法识别市场：{symbol}")
 
 
-def _yfinance_symbol(symbol: str, market: Market) -> str:
+def yfinance_symbol(symbol: str, market: Market) -> str:
     """把 EternityQuant 符号转成 yfinance 符号。"""
     code, _, suffix = symbol.partition(".")
     if market == "A":
@@ -264,7 +263,7 @@ def _fetch_baostock_a(symbol: str, start: dt.date, end: dt.date) -> pd.DataFrame
 def _fetch_yfinance(symbol: str, market: Market, start: dt.date, end: dt.date) -> pd.DataFrame:
     import yfinance as yf  # 延迟加载，避免未安装时阻塞 CLI
 
-    yf_symbol = _yfinance_symbol(symbol, market)
+    yf_symbol = yfinance_symbol(symbol, market)
     df = yf.download(yf_symbol, start=start.isoformat(), end=end.isoformat(), progress=False, auto_adjust=False)
     if df.empty:
         raise ValueError(f"yfinance 返回空：{yf_symbol}")

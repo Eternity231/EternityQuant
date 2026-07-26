@@ -59,13 +59,13 @@ def test_bare_code():
 
 def test_yfinance_hk_symbol_is_four_digits():
     """yfinance 港股用 4 位零填充（0700.HK），传 5 位查无此票。"""
-    from eq.data.market import _yfinance_symbol
+    from eq.data.market import yfinance_symbol
 
-    assert _yfinance_symbol("00700.HK", "HK") == "0700.HK"
-    assert _yfinance_symbol("09988.HK", "HK") == "9988.HK"
+    assert yfinance_symbol("00700.HK", "HK") == "0700.HK"
+    assert yfinance_symbol("09988.HK", "HK") == "9988.HK"
 
 
 def test_yfinance_crypto_maps_usdt_to_usd():
-    from eq.data.market import _yfinance_symbol
+    from eq.data.market import yfinance_symbol
 
-    assert _yfinance_symbol("BTC-USDT", "CRYPTO") == "BTC-USD"
+    assert yfinance_symbol("BTC-USDT", "CRYPTO") == "BTC-USD"

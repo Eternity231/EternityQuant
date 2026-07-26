@@ -15,7 +15,7 @@ eq watch 600519.SH                       # 个股快照（A/HK/US/CRYPTO，自�
 eq watch 600519                          # 符号随手写：裸码/小写/SH 前缀都认（v0.24）
 eq scan A --by change_pct --top 30       # 四市场扫描（A/HK/US/CRYPTO）
 eq screen golden_cross,volume_spike --from watchlist   # 技术选股（14 种条件，v0.24）
-eq research 600519.SH                   # 个股深度研究（14 板块）
+eq research 600519.SH                   # 个股深度研究（15 板块，全本地）
 eq export --format excel                 # 导出全部数据为 Excel（v0.24）
 eq cache stats / warm / clear            # 行情本地缓存管理（v0.24）
 eq watchlist add 600519.SH --reason 白酒龙头
@@ -59,15 +59,16 @@ eq --help                               # 看所有命令
 ## 架构原则
 
 - **EternityQuant 自写全部核心引擎**（数据层、信号引擎、回测、监控、推送）。
-- **vibe-trading MCP 仅作数据补全和一次性查询的助手**，不是硬依赖 —— 挂了框架照样跑。
-  - 港/美/加密行情源被中国大陆网络限流时，`eq research` 输出显式 MCP 补全建议（💡），agent 里跑会自动调 vibe-trading `get_*` 系列补全。
+- **不依赖任何 AI 助手或外部服务**（v0.34 起）—— 纯 Python 进程，装好依赖就能跑，
+  所有数据直连公开 SDK（akshare / yfinance / baostock / 腾讯 / 新浪 / 东财）。
+  没有 MCP、没有 API key、没有需要登录的账号。
 - **qlib 作信号引擎**，预测值作为因子喂给信号层。
 
 ## 技术栈
 
 - CLI：`typer`
 - 定时：`APScheduler`（`eq scheduler daemon` 常驻）
-- Web：`Streamlit`（6 页看板：概览/持仓/自选/监控/ML/深度研究）
+- Web：`Streamlit`（10 页看板，见下）
 - 数据源：A股 baostock（TCP 稳）/ 港美 yfinance / 加密 okx / fallback akshare
 - 回测：双引擎（向量化 + 事件驱动），共享 `signal(df) -> df` 接口
 - ML：qlib Alpha158 特征 + LightGBM（CPU/GPU）+ 自写 MLP（CUDA，CUDA GPU 主场）
@@ -116,7 +117,7 @@ eq --help                               # 看所有命令
 | `eq export --datasets --format` | 导出 7 类数据为 CSV / Excel | v0.24 |
 | `eq cache stats/warm/clear` | 行情本地缓存管理 | v0.24 |
 | `eq data sources [--test]` | 数据源注册表：13 个源，本机自检可用性 | v0.26 |
-| `eq research <symbol> --sections` | 个股深度研究（14 板块） | v0.10 |
+| `eq research <symbol> --sections` | 个股深度研究（15 板块，无外部依赖） | v0.10/v0.34 |
 | `eq watchlist add/import/list/remove/find/quotes` | 自选股 CRUD + 批量实时行情 | v0.1/v0.24 |
 | `eq portfolio buy/add/trim/sell/list/stops/history/summary/closed` | 持仓全生命周期 + 风险体检 | v0.1/v0.24 |
 | `eq monitor add/list/run/enable/disable/signals/cooldown` | 监控规则（11 种类型 + 冷却期 + 信号历史） | v0.1/v0.5/v0.24 |
@@ -998,18 +999,23 @@ EternityQuant 支持在 **Google Colab** 和 **Kaggle** 的免费 GPU 上训练�
 - **qlib ReduceLROnPlateau 版本判断 bug**：qlib 0.9.7 用 `str(torch.__version__).split('+')[0] <= '2.6.0'` 做字符串比较，对 torch 2.13.0 误判（字典序 `'2.13.0' <= '2.6.0'` 为真），走错老分支传 `verbose=True`。monkey patch 绕开：让 `ReduceLROnPlateau.__init__` 接受并忽略 `verbose` 参数。
 - **qlib DNNModelPytorch loss 全 nan**：torch 2.13 + Alpha158 默认配置下 BatchNorm1d �遇全 NaN 列梯度爆。自写 `_SimpleMLP`（158→256→1，BatchNorm1d+Adam+Dropout）绕开，直 API 路径走 `torch.cuda`。
 
-## 个股深度研究 14 板块
+## 个股深度研究 15 板块
 
 按市场自动选板块：
 
 | 市场 | 板块数 | 板块列表 |
 |------|--------|----------|
 | A 股 | 11 | snapshot/financial/fund_flow/news/research/block_trades/margin/shareholders/lockup/northbound/sector |
-| 港股 | 4 | snapshot/profile/news/fund_flow |
-| 美股 | 6 | snapshot/profile/sec_filings/news/financial/options |
+| 港股 | 6 | snapshot/profile/financial/news/research/holders |
+| 美股 | 8 | snapshot/profile/financial/news/research/sec_filings/options/holders |
 | 加密 | 1 | snapshot |
 
-港/美/加密数据源被中国大陆网络限流时，输出 vibe-trading MCP 补全建议（💡）。
+港美板块 v0.34 前是占位符（只提示"请用外部工具补全"），现已全部用 yfinance 落地：
+公司画像、财报三期、新闻、分析师目标价与评级、机构持股、SEC 公告、期权链摘要
+（put/call 未平仓比 + 平值隐波）。取不到数据时说明原因，不再指向别的工具。
+
+港股个股资金流没有免费接口（东财那套主力/超大单分类是 A 股独有），
+所以港股默认板块里不放 `fund_flow`，用 `holders` 看机构持股代替。
 
 ## Streamlit 10 页看板
 
@@ -1028,7 +1034,7 @@ eq dash --port 8501    # 启动本地看板
 | 监控规则 | 规则列表+触发统计 |
 | ML 模型 | 模型列表+激活+predict-batch Top10+一键入自选+预测历史 |
 | 下载管理 | A/港/美股下载 + 缓存占用统计与清理 |
-| 深度研究 | 输入 symbol → 14 板块深度研究（结构化展开） |
+| 深度研究 | 输入 symbol → 15 板块深度研究（结构化展开） |
 
 ### 换肤（v0.33）
 
@@ -1067,7 +1073,7 @@ eq dash --no-theme                   # 本次禁用主题（排查显示问题�
 7. ✅ predict-batch 跑通 + torch DLL 预热（v0.7）
 8. ✅ LightGBM GPU 训练（v0.8，`--device gpu`）
 9. ✅ qlib PyTorch CUDA 集成（v0.9，自写 MLP 走 CUDA GPU）
-10. ✅ 个股深度研究（v0.10，跨市场 14 板块 + MCP 补全建议）
+10. ✅ 个股深度研究（v0.10 跨市场 14 板块；v0.34 港美板块全部本地实现）
 11. ✅ Streamlit 看板加 ML 交互 + 深度研究页（v0.11）
 12. ✅ 单元测试固化 + CLI CUDA 泄漏修复（v0.12，35 测试）
 13. ✅ 自写 LSTM + CUDA 训练进度 log（v0.13，6×26 时序重塑）

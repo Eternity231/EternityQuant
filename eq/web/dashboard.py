@@ -539,7 +539,8 @@ elif page == "ML 模型":
 # -------- 深度研究（v0.11） --------
 elif page == "深度研究":
     st.header("个股深度研究")
-    st.caption("按市场自动选数据源汇总：A 股 11 板块 / 港 4 / 美 6 / 加密 1；港美拉取失败会显 MCP 补全建议")
+    st.caption("按市场自动选数据源汇总：A 股 11 板块 / 港股 6 / 美股 8 / 加密 1。"
+               "全部本地直连公开接口，不需要任何外部服务。")
     sym = st.text_input("股票符号", placeholder="如 600519.SH / AAPL.US / 00700.HK / BTC-USDT")
     # 板块选择
     from eq.core.research import _DEFAULT_SECTIONS, _SECTION_LABELS
@@ -560,8 +561,15 @@ elif page == "深度研究":
                     with st.expander(f"{_SECTION_LABELS.get(sec, sec)}"):
                         if isinstance(data, dict) and "error" in data:
                             st.error(data["error"])
-                        elif isinstance(data, dict) and "hint" in data:
-                            st.info(f"💡 {data['hint']}")
+                        elif isinstance(data, dict) and "note" in data:
+                            st.info(data["note"])
+                        elif isinstance(data, dict) and "profile" in data:
+                            st.json(data["profile"])
+                        elif isinstance(data, dict) and ("metrics" in data or "targets" in data
+                                                         or "major" in data or "filings" in data
+                                                         or "expiry" in data):
+                            # v0.34 新落地的港美板块：结构各异，直接给结构化 JSON
+                            st.json({k: v for k, v in data.items() if not k.endswith("_error")})
                         elif isinstance(data, dict) and "snapshot" in data:
                             snap = data["snapshot"]
                             cols = st.columns(4)

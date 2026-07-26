@@ -5,26 +5,29 @@ from __future__ import annotations
 import pytest
 
 
-def test_section_handlers_count():
-    """_SECTION_HANDLERS 应注册 14 个板块处理器。"""
-    from eq.core.research import _SECTION_HANDLERS
-    assert len(_SECTION_HANDLERS) == 14
+def test_every_default_section_has_handler():
+    """默认板块表里的每一项都必须有处理器——写错名字会静默变成 error 板块。
+
+    原来这里断言的是硬编码的板块数（14 / 11 / 4 / 6），加板块必挂一次且
+    挂了也不说明哪错了。改成断言两张表的一致性，才真的守住了东西。
+    """
+    from eq.core.research import _DEFAULT_SECTIONS, _SECTION_HANDLERS
+    for market, secs in _DEFAULT_SECTIONS.items():
+        assert secs, f"{market} 的默认板块为空"
+        for sec in secs:
+            assert sec in _SECTION_HANDLERS, f"{market} 的板块 {sec} 没有处理器"
 
 
-def test_default_sections_by_market():
-    """_DEFAULT_SECTIONS 应按市场定义板块。"""
+def test_every_market_has_snapshot():
+    """行情快照是所有市场的共同底座。"""
     from eq.core.research import _DEFAULT_SECTIONS
-    assert len(_DEFAULT_SECTIONS["A"]) == 11
-    assert len(_DEFAULT_SECTIONS["HK"]) == 4
-    assert len(_DEFAULT_SECTIONS["US"]) == 6
-    assert len(_DEFAULT_SECTIONS["CRYPTO"]) == 1
-    assert "snapshot" in _DEFAULT_SECTIONS["A"]
-    assert "snapshot" in _DEFAULT_SECTIONS["HK"]
+    for market, secs in _DEFAULT_SECTIONS.items():
+        assert "snapshot" in secs, f"{market} 缺 snapshot"
 
 
 def test_section_labels():
-    """_SECTION_LABELS 应覆盖全部 14 板块的中文名。"""
-    from eq.core.research import _SECTION_LABELS, _SECTION_HANDLERS
+    """每个处理器都要有中文标签，否则报告里会露出英文键名。"""
+    from eq.core.research import _SECTION_HANDLERS, _SECTION_LABELS
     for sec in _SECTION_HANDLERS:
         assert sec in _SECTION_LABELS, f"板块 {sec} 缺中文标签"
 
