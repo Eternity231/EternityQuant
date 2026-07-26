@@ -1232,6 +1232,61 @@ eq dash --no-theme                   # 本次禁用主题（排查显示问题�
 sqlite3 date/timestamp 适配器显式注册（消除 Python 3.12+ 废弃告警）；
 Streamlit `use_container_width` → `width="stretch"`（旧参数已过移除期）。
 
+## 脱离 qlib：第一步（v0.38）
+
+qlib 在本项目里贴了 5 个 monkey patch 绕它的 bug（ReduceLROnPlateau 的版本号
+字符串比较 `'2.13.0' <= '2.6.0'` 字典序为真、issue #1949 的位置参数重复传值、
+`Corr._load_internal` 空序列崩溃、`provider_uri` 必须是 dict）。v0.38 把便宜的
+部分全部接管过来，qlib 从「贯穿全项目」缩成**一个 Alpha158/360 特征计算器**。
+
+| 原来由 qlib 提供 | v0.38 | 位置 |
+|---|---|---|
+| `contrib.model.LGBModel` | 原生 lightgbm | `factors/gbdt.py` |
+| `contrib.model.ALSTM/GRU/LSTM/DNNModelPytorch` | **删除**（早就是死代码） | — |
+| 5 个处理器（RobustZScoreNorm / CSRankNorm / …） | 自写 | `factors/preprocess.py` |
+| ReduceLROnPlateau 补丁 | **删除**（只为 qlib 原生模型存在） | — |
+| **Alpha158 / Alpha360 特征** | 仍用 qlib | 第二步再说 |
+
+### 接管的收益不只是少个依赖
+
+**能测了。** qlib 的处理器要跑起来得先有 qlib + 一整套 .bin 数据，边界行为
+（全 NaN 列、单股票截面、MAD=0 的常数列）从来没验证过。接管后是纯 pandas，
+`tests/test_preprocess.py` 26 例、`tests/test_gbdt.py` 14 例全部真跑。
+
+**fit 窗口从隐式变显式。** 归一化统计量必须只用训练段拟合，否则验证/测试段的
+分布信息会顺着中位数和 MAD 漏进训练。以前这藏在 handler 的 `fit_start_time`
+参数里看不见，现在 `Pipeline.fit()` 收什么就是拟合什么，还有一条专门的
+反证用例（全样本 fit 会给出不同的统计量）。
+
+### 顺带修的两个东西
+
+- **rank 归一化没有精确居中**：qlib 的 `rank(pct=True) - 0.5` 残留 `+1/(2n)`
+  的偏移（n=30 时是 +0.058），于是「当天有多少只票」被编码进了因子值，
+  变成纯粹由样本量制造的跨日水平差。改用 `(rank-(n+1)/2)/n`，对任意 n 严格居中。
+- **预测路径的 lightgbm 分支已经坏了**：它调的是 qlib LGBModel 的
+  `predict(dataset, segment=)` 签名，换成原生 lightgbm 后只接一个位置参数，
+  那条路会直接 TypeError。两个分支的后处理本来一模一样，合并掉。
+
+### 没验证的部分（重要）
+
+本机**没装 qlib、qlib 数据目录是空的**，所以：
+
+- `preprocess.py` 是照 qlib 处理器的**语义**写的，没做过逐位对拍。
+  装了 qlib 的机器上跑 `preprocess.compare_with_qlib(features)` 可以比对。
+- 改动过的 `train()` / `predict_batch()` 里**碰 qlib handler 的那几行没跑过**。
+  自写部分（preprocess / gbdt / 集成 / 评估）全部有测试覆盖。
+- 项目当前已注册模型数为 0，所以数值口径变化不存在新旧模型可比性问题。
+
+### 第二步（未做）：自写 Alpha158
+
+Alpha158 不是 158 个手写公式，是约 30 个滚动算子模板 × 5 个窗口生成的
+（ROC / MA / STD / MAX / MIN / QTLU / RANK / CORR / CNTP / SUMP / VMA / WVMA…），
+本质是 pandas rolling 的批量套用，和已有的 `technical.py` 是同一个套路。
+做完就能把 qlib 从依赖里彻底移除（数据层的 `.bin` 读写本来就是本项目自己的代码）。
+
+**前提**：必须验证自写版和 qlib 版在同一份数据上算出的因子值一致，
+否则历史训练结果全部不可比。这需要先把 qlib 数据拉回来。
+
 ## 事件因子（v0.37）
 
 v0.35 删掉深度研究时留了个回收清单：解禁 / 股东户数 / 融资融券 / 北向持股

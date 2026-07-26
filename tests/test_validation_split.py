@@ -245,4 +245,7 @@ def test_lgb_params_are_regularized():
     assert LGB_PARAMS["lambda_l2"] > 100
     assert 0 < LGB_PARAMS["subsample"] < 1
     assert 0 < LGB_PARAMS["colsample_bytree"] < 1
-    assert LGB_PARAMS["early_stopping_rounds"] > 0
+    # v0.38：轮数/早停从 params 里挪出来了——lightgbm 原生 API 把它们当
+    # train() 的参数而不是超参字典的键
+    from eq.strategy.factors.gbdt import DEFAULT_EARLY_STOP, DEFAULT_ROUNDS
+    assert DEFAULT_EARLY_STOP > 0 and DEFAULT_ROUNDS > DEFAULT_EARLY_STOP

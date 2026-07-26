@@ -100,23 +100,14 @@ class _LionOpt(torch.optim.Optimizer):
 def _qlib_init() -> None:
     """qlib init + torch DLL 预热（Windows + cu132 坑：先 torch.cuda.init 再 qlib.init）。
 
-    还修 qlib 0.9.7 的 ReduceLROnPlateau 版本判断 bug：
-    qlib 用 `str(torch.__version__).split('+')[0] <= '2.6.0'` 做字符串比较，
-    对 torch 2.13.0 误判（'2.13.0' <= '2.6.0' 字典序为真），走错老分支传 verbose=True。
-    monkey patch 绕开：让 ReduceLROnPlateau 接受并忽略 verbose 参数。
+    v0.38 起 qlib 在本项目里**只剩一个角色：Alpha158/360 特征计算器**。
+    模型层（LightGBM/MLP/RNN）、预处理层、分段切片都已自写，所以下面只保留
+    「让 handler 能取到数」所必需的两个补丁；qlib 原生 torch 模型用的
+    ReduceLROnPlateau 补丁已随那批死代码一起删掉。
     """
     import torch  # noqa: F401
     if torch.cuda.is_available():
         torch.cuda.init()  # 预热 DLL，避免 c10.dll 延迟加载失败
-
-    # monkey patch ReduceLROnPlateau 接受 verbose 参数（qlib 0.9.7 版本判断 bug 绕开）
-    _orig_reduce_lr = torch.optim.lr_scheduler.ReduceLROnPlateau.__init__
-
-    def _patched_reduce_lr(self, *args, **kwargs):
-        kwargs.pop("verbose", None)  # 新版 torch 不再支持 verbose，忽略
-        return _orig_reduce_lr(self, *args, **kwargs)
-
-    torch.optim.lr_scheduler.ReduceLROnPlateau.__init__ = _patched_reduce_lr
 
     import qlib
     from pathlib import Path as _P
@@ -203,8 +194,6 @@ def train(
     _qlib_init()
     from qlib.data import D
 
-    from qlib.contrib.model import LGBModel
-
     from eq.strategy.factors.validation import set_seed
 
     set_seed(seed)
@@ -255,13 +244,18 @@ def train(
     # 4. 训练 LightGBM（device 透传：cpu|gpu|cuda）
     if algo != "lightgbm":
         raise NotImplementedError(f"algo {algo} 待集成，第一版只支持 lightgbm")
-    lgb_kwargs = dict(LGB_PARAMS)
-    lgb_kwargs.update(params or {})
-    lgb_kwargs["device"] = device
-    lgb_kwargs.setdefault("seed", seed)
-    model = LGBModel(**lgb_kwargs)
-    # 有 valid 段时交给 LightGBM 自己早停（qlib LGBModel 内部用 valid 做 early stopping）
-    model.fit(dataset)
+    # v0.38：走 lightgbm 原生 API，不再经 qlib.contrib.model.LGBModel。
+    # LGBModel 只是薄包装，却把 qlib 的 DatasetH 绑进了模型层——「训练一个 GBDT」
+    # 因此依赖整套 qlib 数据栈，一行代码都没法单测。
+    from eq.strategy.factors.gbdt import train_gbdt
+
+    x_train, y_train = _prepare_xy(dataset, "train")
+    x_valid, y_valid = _prepare_xy(dataset, "valid")
+    model = train_gbdt(
+        x_train, y_train, x_valid, y_valid,
+        params=params, device=device, seed=seed,
+        num_boost_round=_LGB_ROUNDS, early_stopping_rounds=_LGB_EARLY_STOP,
+    )
 
     # 5. 评估：valid（选择集，偏乐观）+ test（独立，真成绩）
     valid_report = _eval_segment(model, dataset, "valid", segments)
@@ -310,23 +304,13 @@ _FEATURE_SETS = {"alpha158": "Alpha158", "alpha360": "Alpha360"}
 # （单因子 IC 通常 0.02~0.05），这种配置几乎必然过拟合训练段：
 # 官方调出来的 lambda_l1=205 / lambda_l2=580 是常规 GBDT 任务的几百倍，
 # 正是为了压住这种低信噪比数据上的过拟合。
-LGB_PARAMS: dict[str, Any] = {
-    "loss": "mse",
-    "learning_rate": 0.0421,
-    "colsample_bytree": 0.8879,
-    "subsample": 0.8789,
-    "lambda_l1": 205.6999,
-    "lambda_l2": 580.9769,
-    "max_depth": 8,
-    "num_leaves": 210,
-    "feature_fraction": 0.8879,
-    "bagging_fraction": 0.8789,
-    "bagging_freq": 1,
-    "min_data_in_leaf": 50,
-    "num_boost_round": 1000,      # 配合 early stopping，不会真跑满
-    "early_stopping_rounds": 50,
-    "num_threads": 20,
-}
+# LightGBM 超参已搬到 eq.strategy.factors.gbdt（那边不依赖 qlib，可以真跑测试）。
+# 这里复出一份，保持老的 import 路径可用。
+from eq.strategy.factors.gbdt import (  # noqa: E402
+    DEFAULT_EARLY_STOP as _LGB_EARLY_STOP,
+    DEFAULT_ROUNDS as _LGB_ROUNDS,
+    LGB_PARAMS,
+)
 
 
 def _resolve_handler(feature_set: str):
@@ -464,32 +448,6 @@ def _eval_on_test(model, dataset, segments: dict[str, tuple[str, str]]) -> dict[
 # ---------- qlib PyTorch 模型（走 CUDA，CUDA GPU 主场） ----------
 
 _TORCH_ALGOS = {"alstm", "gru", "lstm", "mlp", "deeplob", "tft"}
-
-
-def _build_torch_model(algo: str, device: str):
-    """按 algo 名造一个 qlib PyTorch 模型实例。device='cuda' 时 GPU=0。
-
-    注意：qlib DNNModelPytorch/ALSTM/GRU 在 torch 2.13 + Alpha158 默认配置下 loss 全 nan
-    （BatchNorm1d 遇全 NaN 列梯度爆），所以这只返回 qlib 原生模型供尝试，主路径走自写 MLP。
-    """
-    from qlib.contrib.model import ALSTM, GRU, LSTM, DNNModelPytorch
-
-    gpu_id = 0 if device == "cuda" else -1  # GPU=-1 走 CPU
-    common = dict(
-        d_feat=6, hidden_size=64, num_layers=2, dropout=0.0,
-        n_epochs=50, lr=0.001, batch_size=2000, early_stop=10,
-        loss="mse", optimizer="adam", GPU=gpu_id,
-    )
-    if algo == "alstm":
-        return ALSTM(**common)
-    if algo == "gru":
-        return GRU(**common)
-    if algo == "lstm":
-        return LSTM(**common)
-    if algo == "mlp":
-        # 走自写 MLP 路径，不返 qlib DNNModelPytorch
-        return None
-    raise NotImplementedError(f"algo {algo} 待集成，可选：{sorted(_TORCH_ALGOS)}")
 
 
 # ---------- 多种子集成 ----------
@@ -1317,34 +1275,6 @@ def train_torch(
                 "metrics": {"ic": ic, "valid_ic": valid_ic, "epochs": epochs, "test": test_report},
                 "model_path": str(model_path)}
 
-    # qlib 原生 ALSTM/GRU/LSTM 路径
-    model = _build_torch_model(algo, device)
-    if model is None:
-        raise NotImplementedError(f"algo {algo} 构造失败")
-    evals_result: dict = {}
-    model.fit(dataset, evals_result=evals_result)
-    valid_scores = evals_result.get("valid", [])
-    ic = float(valid_scores[-1]) if valid_scores else 0.0
-
-    import pickle as _pkl
-    model_path = _ensure_dir() / f"torch_{algo}_{universe}_{horizon}d.pkl"
-    with open(model_path, "wb") as f:
-        _pkl.dump(model, f)
-
-    model_id = register_model(
-        name=name or f"{universe}_{algo}_h{horizon}_{dt.date.today().strftime('%Y%m%d')}",
-        universe=universe,
-        features=["Alpha158(158 个 qlib 标准特征)"],
-        algo=algo,
-        horizon=horizon,
-        train_period=f"{train_start}~{train_end}",
-        valid_period=f"{valid_start}~{valid_end}",
-        metrics={"ic": ic, "algo": algo, "horizon": horizon, "device": device, "epochs": len(valid_scores)},
-        model_path=str(model_path),
-        notes=f"qlib PyTorch {algo} 真集成训练（{device}）",
-    )
-    return {"model_id": model_id, "metrics": {"ic": ic, "epochs": len(valid_scores)}, "model_path": str(model_path)}
-
 
 def _score_to_trend(pred_df: pd.DataFrame) -> pd.DataFrame:
     """把回归分数映射成趋势标签 + 概率，不改模型架构。
@@ -1414,8 +1344,6 @@ def predict_batch(
     from qlib.data import D
 
     from qlib.contrib.data.handler import Alpha158
-    from qlib.contrib.model import LGBModel
-
     # 拉模型元数据
     from eq.db import execute
     meta_rows = execute("SELECT universe, horizon, model_path FROM ml_models WHERE id = ?", (model_id,))
@@ -1459,44 +1387,32 @@ def predict_batch(
     algo_row = _execute("SELECT algo FROM ml_models WHERE id = ?", (model_id,))
     algo = algo_row[0]["algo"] if algo_row else "lightgbm"
 
-    if algo in ("lstm", "gru", "alstm", "mlp", "deeplob", "tft"):
-        # 自写模型路径：取 feature，喂 model.predict(x)
-        test_data = dataset.prepare("test", col_set="feature")
-        # test_data 可能是 DataFrame（index 是 MultiIndex datetime, instrument）或 dict
-        if isinstance(test_data, dict):
-            test_data = test_data.get("feature", pd.DataFrame())
-        if test_data is None or test_data.empty:
-            return pd.DataFrame(columns=["symbol", "score"])
-        # 调自写模型 predict（接 DataFrame，返回 ndarray）
-        scores = model.predict(test_data)
-        # 构造 pred_df，index 复用 test_data 的 MultiIndex
-        pred_df = pd.DataFrame({"score": scores}, index=test_data.index)
-        if isinstance(pred_df.index, pd.MultiIndex):
-            if predict_date in pred_df.index.get_level_values(0):
-                pred_df = pred_df.xs(predict_date, level=0)
-            else:
-                pred_df = pred_df.groupby(level=1).last()
-            pred_df = pred_df.reset_index()
-            inst_col = "instrument" if "instrument" in pred_df.columns else pred_df.columns[0]
-            pred_df = pred_df.rename(columns={inst_col: "symbol"})
+    # v0.38：所有模型统一走 predict(DataFrame) —— GBDTModel 和自写 torch 模型
+    # 接口一致，不再按 algo 分叉。
+    #
+    # 修的是一个真 BUG：原来 lightgbm 分支调的是 qlib LGBModel 的
+    # `predict(dataset, segment="test")` 签名，而 v0.38 换成原生 lightgbm 之后
+    # 模型只接一个位置参数，那条路会直接 TypeError。两个分支的后处理本来就
+    # 一模一样，合并掉顺便消掉这类不同步。
+    _ = algo  # 保留读取用于日志/排查，不再参与分支
+    test_data = dataset.prepare("test", col_set="feature")
+    if isinstance(test_data, dict):
+        test_data = test_data.get("feature", pd.DataFrame())
+    if test_data is None or test_data.empty:
+        return pd.DataFrame(columns=["symbol", "score"])
+
+    scores = model.predict(test_data)
+    pred_df = pd.DataFrame({"score": np.asarray(scores).reshape(-1)}, index=test_data.index)
+    if isinstance(pred_df.index, pd.MultiIndex):
+        if predict_date in pred_df.index.get_level_values(0):
+            pred_df = pred_df.xs(predict_date, level=0)
         else:
-            pred_df = pred_df.reset_index()
+            pred_df = pred_df.groupby(level=1).last()
+        pred_df = pred_df.reset_index()
+        inst_col = "instrument" if "instrument" in pred_df.columns else pred_df.columns[0]
+        pred_df = pred_df.rename(columns={inst_col: "symbol"})
     else:
-        # LightGBM 路径：qlib LGBModel.predict(dataset, segment) 返回 pd.Series
-        pred = model.predict(dataset, segment="test")
-        if pred is None or (isinstance(pred, pd.Series) and pred.empty):
-            return pd.DataFrame(columns=["symbol", "score"])
-        pred_df = pred.to_frame("score") if isinstance(pred, pd.Series) else pred
-        if isinstance(pred_df.index, pd.MultiIndex):
-            if predict_date in pred_df.index.get_level_values(0):
-                pred_df = pred_df.xs(predict_date, level=0)
-            else:
-                pred_df = pred_df.groupby(level=1).last()
-            pred_df = pred_df.reset_index()
-            inst_col = "instrument" if "instrument" in pred_df.columns else pred_df.columns[0]
-            pred_df = pred_df.rename(columns={inst_col: "symbol"})
-        else:
-            pred_df = pred_df.reset_index()
+        pred_df = pred_df.reset_index()
     pred_df = pred_df[["symbol", "score"]].sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
 
     # 转 EternityQuant 符号格式：SH600519 → 600519.SH
