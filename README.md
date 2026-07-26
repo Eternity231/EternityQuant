@@ -134,6 +134,7 @@ eq --help                               # 看所有命令
 | `eq ml train/activate/list/info/predict/predict-batch/update-data` | ML 因子（LightGBM + PyTorch + 数据更新） | v0.6~v0.15 |
 | `eq data a/hk/hk-5min/hk-1min/us/all` | 统一数据收集（A股/港股日线/分钟线/美股） | v0.19 |
 | `eq ml train-local` | 训练（不用 qlib）：本地 Alpha158 + 项目自己的行情缓存 | v0.39 |
+| `eq ml predict-local` | 用 train-local 的模型给一批标的打分（不用 qlib）| v0.39 |
 | `eq dash` | Streamlit 9 页看板 | v0.1/v0.11/v0.24/v0.33 |
 | `eq theme <图片>` | 看板换肤：自动取色 + 背景图 + 侧栏看板娘 | v0.33 |
 
@@ -1257,6 +1258,20 @@ eq ml train-local --from watchlist --algo lightgbm --seeds 3
 
 老的 `eq ml train` 仍然走 qlib，两条路共用切分/预处理/模型/评估/集成/注册，
 所以成绩可以直接比——比的是特征实现，不是别的东西。
+
+完整用法：
+
+```bash
+eq data a -u watchlist                       # 先把行情下下来
+eq ml train-local --from watchlist --seeds 3 # 训练（多种子集成）
+eq ml predict-local <model_id> --dry-run     # 先看看，不写库
+eq ml predict-local <model_id> --top 10      # 满意了再落 ml_predictions
+```
+
+**模型和预处理管线是一起存的**（`{"model", "pipeline", "features", "horizon"}`）。
+推理时必须复用训练时拟合好的管线——重新 fit 一个，归一化统计量就来自推理数据
+而不是训练段，那就是 train/serve skew 又回来了，而且不会报任何错。
+测试里有一条专门把 `Pipeline.fit` 换成抛异常来钉死这点。
 
 ### 自写 Alpha158 的验证方式
 

@@ -24,6 +24,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from eq.strategy.factors import alpha as alpha_mod
@@ -33,7 +34,8 @@ from eq.strategy.factors.validation import purged_split, set_seed
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["load_bars", "build_dataset", "train_local"]
+__all__ = ["load_bars", "build_dataset", "train_local",
+           "load_local_model", "predict_local"]
 
 
 def load_bars(symbols: list[str], days: int = 1200, workers: int = 8,
@@ -212,3 +214,94 @@ def _fit(algo, x_train, y_train, x_valid, y_valid, *, device, seed, n_seeds, par
     if n == 1:
         return members[0], notes
     return SeedEnsemble(members, [seed + i for i in range(n)]), notes + f"｜{n} 种子集成"
+
+
+# ======================================================================
+# 推理
+# ======================================================================
+
+def load_local_model(model_id: str) -> dict[str, Any]:
+    """按 model_id 从 ml_models 表读出本地模型（含预处理管线）。
+
+    存的是 ``{"model", "pipeline", "features", "horizon"}`` 而不是裸模型——
+    **管线必须和模型一起走**。推理时重新 fit 一个管线，得到的归一化统计量
+    来自推理数据而不是训练段，那就是 v0.37 修掉的 train/serve skew 又回来了。
+    """
+    import pickle
+    from pathlib import Path
+
+    from eq.db import execute
+
+    rows = execute("SELECT model_path, notes FROM ml_models WHERE id = ?", (model_id,))
+    if not rows:
+        raise ValueError(f"模型 {model_id} 不存在")
+    path = Path(rows[0]["model_path"])
+    if not path.exists():
+        raise FileNotFoundError(f"模型文件不见了：{path}")
+    blob = pickle.loads(path.read_bytes())
+    if not isinstance(blob, dict) or "pipeline" not in blob:
+        raise ValueError(
+            f"{model_id} 不是本地模型（没有预处理管线）。"
+            "走 qlib 训练的模型请用 `eq ml predict-batch`")
+    return blob
+
+
+def predict_local(
+    model_id: str,
+    symbols: list[str],
+    *,
+    top_n: int = 20,
+    days: int = 400,
+    predict_date: str | None = None,
+    write: bool = True,
+) -> pd.DataFrame:
+    """用本地模型给一批标的打分，默认写入 ``ml_predictions`` 表。
+
+    只对**最后一个共同交易日**的截面打分：选股是个截面排序问题，
+    跨日混在一起排没有意义（不同日期的分数不可比）。
+
+    Args:
+        predict_date: 指定打分日期（``YYYY-MM-DD``）。缺省用数据里的最后一天。
+        write: False 时只返回结果不落库，方便先看看再决定。
+
+    Returns:
+        ``symbol`` / ``score`` 两列，按分数降序，最多 ``top_n`` 行。
+    """
+    blob = load_local_model(model_id)
+    model, pipe, feats = blob["model"], blob["pipeline"], blob["features"]
+
+    bars = load_bars(symbols, days=days)
+    if not bars:
+        raise ValueError("一只标的的行情都没拉到")
+    x = alpha_mod.alpha158(bars)
+    if x.empty:
+        raise ValueError("特征为空——多半是行情根数不够（至少要 70 根）")
+
+    dates = x.index.get_level_values("datetime")
+    target = pd.Timestamp(predict_date) if predict_date else dates.max()
+    cross = x[dates == target]
+    if cross.empty:
+        avail = sorted(set(dates))[-3:]
+        raise ValueError(f"{target.date()} 没有数据，最近可用：{[str(d.date()) for d in avail]}")
+
+    missing = [c for c in feats if c not in cross.columns]
+    if missing:
+        raise ValueError(f"特征对不上，缺 {missing[:5]}（共 {len(missing)}）——"
+                         "模型和当前代码的特征集不一致，需要重训")
+    # 用**训练时**拟合好的管线，不重新 fit
+    scored = pd.DataFrame({
+        "symbol": cross.index.get_level_values("instrument"),
+        "score": np.asarray(model.predict(pipe.transform(cross[feats]))).reshape(-1),
+    }).sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
+
+    if write and len(scored):
+        from eq.db import execute_write
+
+        for _, row in scored.iterrows():
+            execute_write(
+                "INSERT INTO ml_predictions (model_id, symbol, date, score) "
+                "VALUES (?, ?, ?, ?)",
+                (model_id, row["symbol"], target.date().isoformat(), float(row["score"])),
+            )
+    scored.attrs["date"] = target.date().isoformat()
+    return scored

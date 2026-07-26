@@ -1844,6 +1844,44 @@ def ml_train_local(
     typer.echo(f"  用 `eq ml activate {r['model_id']}` 激活")
 
 
+@ml_app.command("predict-local",
+                help="用 train-local 训出的模型给一批标的打分（不用 qlib）")
+def ml_predict_local(
+    model_id: str = typer.Argument(help="模型 id（train-local 训出来的）"),
+    source: str = typer.Option("watchlist", "--from", "-f",
+                               help="标的来源：watchlist|portfolio|both|逗号分隔代码"),
+    top: int = typer.Option(20, "--top", "-t", help="返回前 N 名"),
+    days: int = typer.Option(400, "--days", "-d", help="每只拉多少根日线（够算 60 日窗口即可）"),
+    date: str = typer.Option("", "--date", help="指定打分日期 YYYY-MM-DD，缺省用最新一天"),
+    write: bool = typer.Option(True, "--write/--dry-run", help="是否写入 ml_predictions 表"),
+):
+    from eq.strategy.factors.local_train import predict_local
+
+    try:
+        symbols, label_txt = _resolve_symbols(source)
+    except Exception as e:
+        typer.echo(f"标的解析失败：{e}", err=True)
+        raise typer.Exit(1) from e
+    if not symbols:
+        typer.echo(f"候选池为空（{source}）", err=True)
+        raise typer.Exit(1)
+
+    try:
+        df = predict_local(model_id, symbols, top_n=top, days=days,
+                           predict_date=date or None, write=write)
+    except Exception as e:
+        typer.echo(f"预测失败：{e}", err=True)
+        raise typer.Exit(1) from e
+
+    if df.empty:
+        typer.echo("没有打出分数")
+        return
+    typer.echo(f"\n{label_txt} {len(symbols)} 只 → {df.attrs.get('date', '')} 截面 Top {len(df)}")
+    typer.echo(df.to_string(index=False, float_format=lambda v: f"{v:+.4f}"))
+    if not write:
+        typer.echo("\n（--dry-run，未写入 ml_predictions）")
+
+
 @ml_app.command("predict-batch", help="用激活模型批量预测全 universe，写入 ml_predictions 表")
 def ml_predict_batch(
     model_id: str = typer.Argument(help="模型 id"),

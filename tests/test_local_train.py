@@ -217,3 +217,106 @@ def test_train_local_runs_without_qlib_installed(tmp_db, patched, monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _blocked)
     r = lt.train_local([f"S{i:02d}" for i in range(20)], algo="lightgbm", params=FAST)
     assert r["model_id"]
+
+
+# ---------- 推理 ----------
+
+@pytest.fixture
+def trained(tmp_db, patched):
+    return lt.train_local([f"S{i:02d}" for i in range(20)],
+                          algo="lightgbm", params=FAST)
+
+
+def test_predict_local_scores_latest_cross_section(trained, patched):
+    df = lt.predict_local(trained["model_id"], [f"S{i:02d}" for i in range(20)],
+                          top_n=5, write=False)
+    assert len(df) == 5
+    assert list(df.columns) == ["symbol", "score"]
+    assert df["score"].is_monotonic_decreasing, "应按分数降序"
+    assert df["symbol"].nunique() == 5, "同一天同一只票不该出现两次"
+
+
+def test_predict_local_writes_to_table(trained, patched):
+    from eq.db import execute
+
+    lt.predict_local(trained["model_id"], [f"S{i:02d}" for i in range(20)], top_n=3)
+    rows = execute("SELECT symbol, score, date FROM ml_predictions WHERE model_id = ?",
+                   (trained["model_id"],))
+    assert len(rows) == 3
+    assert len({r["date"] for r in rows}) == 1, "只该写一个截面日期"
+
+
+def test_dry_run_does_not_write(trained, patched):
+    from eq.db import execute
+
+    lt.predict_local(trained["model_id"], [f"S{i:02d}" for i in range(20)],
+                     top_n=3, write=False)
+    assert execute("SELECT COUNT(*) c FROM ml_predictions WHERE model_id = ?",
+                   (trained["model_id"],))[0]["c"] == 0
+
+
+def test_predict_reuses_saved_pipeline_not_refit(trained, patched, monkeypatch):
+    """推理**必须**用训练时存下来的管线。
+
+    重新 fit 一个管线，归一化统计量就来自推理数据而不是训练段——
+    那正是 v0.37 修掉的 train/serve skew 又回来了，而且不会报任何错。
+    """
+    from eq.strategy.factors import preprocess as pp
+
+    def _boom(self, features):
+        raise AssertionError("推理阶段不许再 fit 管线")
+
+    monkeypatch.setattr(pp.Pipeline, "fit", _boom)
+    df = lt.predict_local(trained["model_id"], [f"S{i:02d}" for i in range(20)],
+                          top_n=3, write=False)
+    assert len(df) == 3
+
+
+def test_predict_specific_date(trained, patched, fake_bars):
+    target = fake_bars["S00"].index[-10]
+    df = lt.predict_local(trained["model_id"], [f"S{i:02d}" for i in range(20)],
+                          top_n=3, predict_date=str(target.date()), write=False)
+    assert df.attrs["date"] == str(target.date())
+
+
+def test_predict_unknown_date_lists_available(trained, patched):
+    with pytest.raises(ValueError, match="最近可用"):
+        lt.predict_local(trained["model_id"], [f"S{i:02d}" for i in range(20)],
+                         predict_date="1999-01-04", write=False)
+
+
+def test_predict_rejects_qlib_model(tmp_db):
+    """qlib 训出来的模型是裸 pickle，没有管线——要明确报错并指路。"""
+    import pickle
+
+    from eq.strategy.factors.ml import register_model
+    from eq.strategy.factors.ml_workflow import _ensure_dir
+
+    path = _ensure_dir() / "bare.pkl"
+    path.write_bytes(pickle.dumps({"not": "a local model"}))
+    mid = register_model(name="x", universe="u", features=[], algo="lightgbm",
+                         horizon=5, train_period="", model_path=str(path))
+    with pytest.raises(ValueError, match="predict-batch"):
+        lt.load_local_model(mid)
+
+
+def test_predict_missing_model_file(tmp_db):
+    from eq.strategy.factors.ml import register_model
+
+    mid = register_model(name="x", universe="u", features=[], algo="lightgbm",
+                         horizon=5, train_period="", model_path="Z:/不存在.pkl")
+    with pytest.raises(FileNotFoundError):
+        lt.load_local_model(mid)
+
+
+def test_predict_unknown_model_id(tmp_db):
+    with pytest.raises(ValueError, match="不存在"):
+        lt.load_local_model("m_不存在")
+
+
+def test_train_predict_roundtrip_is_deterministic(trained, patched):
+    a = lt.predict_local(trained["model_id"], [f"S{i:02d}" for i in range(20)],
+                         top_n=10, write=False)
+    b = lt.predict_local(trained["model_id"], [f"S{i:02d}" for i in range(20)],
+                         top_n=10, write=False)
+    pd.testing.assert_frame_equal(a, b)
