@@ -1879,6 +1879,56 @@ def ml_train_local(
         typer.echo(f"  用 `eq ml activate {r['model_id']}` 激活")
 
 
+@ml_app.command("walk-forward",
+                help="滚动重训：每折只用截至当时的数据训练，预测紧接着的一段（样本外样本量大得多）")
+def ml_walk_forward(
+    source: str = typer.Option("watchlist", "--from", "-f", help="标的来源，同 train-local"),
+    top: int = typer.Option(200, "--top", help="市场榜来源时取前 N 只"),
+    algo: str = typer.Option("lightgbm", "--algo", "-a", help="lightgbm | mlp | gru | lstm"),
+    horizon: int = typer.Option(5, "--horizon", "-h", help="预测窗口（交易日）"),
+    days: int = typer.Option(1200, "--days", "-d", help="每只拉多少根日线"),
+    folds: int = typer.Option(6, "--folds", help="滚动几折"),
+    test_days: int = typer.Option(40, "--test-days", help="每折的测试窗口长度"),
+    seeds: int = typer.Option(1, "--seeds", help="每折的多种子集成数"),
+):
+    """单次切分是用最老的数据预测最新的行情，市场非平稳时天然失效。"""
+    import pandas as pd
+
+    from eq.strategy.factors.local_train import walk_forward_local
+
+    try:
+        symbols, label_txt = _resolve_symbols(source, top_n=top)
+    except Exception as e:
+        typer.echo(f"标的解析失败：{e}", err=True)
+        raise typer.Exit(1) from e
+
+    typer.echo(f"\n滚动重训：{label_txt} {len(symbols)} 只  {folds} 折 x {test_days} 天  "
+               f"horizon={horizon}d  algo={algo}")
+    try:
+        r = walk_forward_local(symbols, algo=algo, horizon=horizon, days=days,
+                               n_folds=folds, test_days=test_days, n_seeds=seeds)
+    except Exception as e:
+        typer.echo(f"失败：{e}", err=True)
+        raise typer.Exit(1) from e
+
+    f = pd.DataFrame(r["folds"])
+    for c, fmt in (("ic", "{:+.4f}"), ("icir", "{:+.3f}"), ("t_nw", "{:+.2f}")):
+        f[c] = f[c].map(fmt.format)
+    f["win"] = f["win"].map("{:.0%}".format)
+    typer.echo(f"\n逐折结果（{r['n_folds_ok']} 折成功）：\n")
+    typer.echo(f.to_string(index=False))
+
+    o = r["oos"]
+    typer.echo(f"\n拼接后的真·样本外（{r['n_oos_samples']:,} 条 / {o['n_days']} 个交易日）：")
+    typer.echo(f"  IC {o['ic_mean']:+.4f}  ICIR {o['icir']:+.3f}  胜率 {o['ic_win_rate']:.0%}"
+               f"\n  t {o['t_stat']:+.2f} → **重叠修正后 {o['t_stat_nw']:+.2f}**"
+               f"（|t|>2 才谈得上显著）")
+    ics = [float(x) for x in pd.DataFrame(r["folds"])["ic"]]
+    pos = sum(1 for v in ics if v > 0)
+    typer.echo(f"  逐折 IC 为正的：{pos}/{len(ics)} 折"
+               f"（折与折之间符号不稳 = 信号不可靠，比 IC 绝对值更能说明问题）")
+
+
 @ml_app.command("backtest-local",
                 help="把本地模型跑成权益曲线（只在测试段，含 A 股真实成本）")
 def ml_backtest_local(

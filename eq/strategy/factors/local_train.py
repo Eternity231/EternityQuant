@@ -39,7 +39,7 @@ _MIN_UNIVERSE = 30
 
 __all__ = ["load_bars", "build_dataset", "train_local",
            "load_local_model", "predict_local", "factor_scan",
-           "baseline_composite", "score_matrix_local", "backtest_local"]
+           "baseline_composite", "score_matrix_local", "backtest_local", "walk_forward_local"]
 
 
 def load_bars(symbols: list[str], days: int = 1200, workers: int = 8,
@@ -655,9 +655,13 @@ def backtest_local(
     日频 IC 0.01 这个量级，成本大概率把它整个吃掉——但吃掉多少要跑出来才知道。
 
     Returns:
-        ``{"result", "gross", "cost_drag", "start", "n_symbols", "n_days"}``。
-        ``gross`` 是同信号同约束、但**零成本**的对照，``cost_drag`` 是两者的
-        总收益之差——即交易成本实际吃掉了多少。
+        ``{"result", "gross", "cost_drag", "benchmark_return", "excess_return",
+        "start", "n_symbols", "n_days"}``。
+
+        - ``gross``：同信号同约束但**零成本**的对照，``cost_drag`` 是两者之差
+        - ``benchmark_return``：同一批票**等权买入持有**的收益
+        - ``excess_return``：净收益 − 基准。**只有这个为正才说明选股有价值**，
+          纯多头组合的收益里天然混着大盘 beta
     """
     from eq.backtest.portfolio import PortfolioConfig, run_portfolio
 
@@ -684,6 +688,137 @@ def backtest_local(
     gross = run_portfolio(sub, w, free_cfg)
     net_ret = res.metrics.get("total_return", 0.0)
     gross_ret = gross.metrics.get("total_return", 0.0)
+
+    # **等权买入持有基准**：同一批票、同一段时间，开盘全买、期末全卖。
+    # 纯多头组合的收益里天然混着大盘 beta——这段行情整体上涨的话，
+    # 随便选十只票都会赚钱，那不是模型的功劳。
+    # 只有「净收益 − 基准」为正，才谈得上选股创造了价值。
+    bench = _equal_weight_buy_hold(sub)
     return {"result": res, "gross": gross, "start": str(begin.date()),
             "n_symbols": len(sub), "n_days": len(weight),
-            "cost_drag": gross_ret - net_ret}
+            "cost_drag": gross_ret - net_ret,
+            "benchmark_return": bench,
+            "excess_return": net_ret - bench}
+
+
+def _equal_weight_buy_hold(bars: dict[str, pd.DataFrame]) -> float:
+    """等权买入持有的总收益：每只票各买 1/N，期初买入、期末卖出。
+
+    不含成本——基准只买卖各一次，成本可以忽略，而且不扣成本的基准更严格
+    （给策略更高的门槛），宁可保守。
+    """
+    rets = []
+    for df in bars.values():
+        c = df["close"].dropna()
+        if len(c) >= 2 and float(c.iloc[0]) > 0:
+            rets.append(float(c.iloc[-1]) / float(c.iloc[0]) - 1.0)
+    return float(np.mean(rets)) if rets else 0.0
+
+
+# ======================================================================
+# 滚动重训（walk-forward）
+# ======================================================================
+
+def walk_forward_local(
+    symbols: list[str],
+    *,
+    algo: str = "lightgbm",
+    horizon: int = 5,
+    days: int = 1200,
+    n_folds: int = 6,
+    test_days: int = 40,
+    valid_days: int = 60,
+    embargo_days: int | None = None,
+    label_norm: str = "rank",
+    device: str = "cpu",
+    seed: int = 42,
+    n_seeds: int = 1,
+    params: dict[str, Any] | None = None,
+    min_train_days: int = 250,
+) -> dict[str, Any]:
+    """滚动重训：每一折只用**截至当时**的数据训练，预测紧接着的一段。
+
+    **为什么这可能比单次切分更有效**：现在的 :func:`train_local` 是拿最老的 70%
+    训一次、在最新的 15% 上测——等于用 2022 年的规律去预测 2026 年。
+    A 股风格切换频繁，模型学到的关系很可能早就失效了。
+    滚动重训让每一折的模型都只比它要预测的那段早一点点，贴合当下的市场状态。
+
+    另一个同样重要的收益：**样本外样本量翻好几倍**。单次切分只有一段
+    150 天左右的测试段，t 值撑不起来；6 折 × 40 天 = 240 个交易日的
+    真·样本外预测拼在一起，统计上扎实得多。
+
+    切分（每折都严格无泄漏，两处 embargo）::
+
+        [......训练......] --embargo-- [验证] --embargo-- [测试]
+                                                            ↑ 只有这段进最终评估
+
+    Returns:
+        ``{"oos": 拼接后的样本外预测评估, "folds": 每折明细, "n_folds_ok": int}``
+    """
+    from eq.strategy.factors.evaluation import evaluate
+
+    set_seed(seed)
+    embargo = horizon if embargo_days is None else int(embargo_days)
+
+    bars = load_bars(symbols, days=days)
+    if not bars:
+        raise ValueError("一只标的的行情都没拉到")
+    x, y = build_dataset(bars, horizon=horizon, label_norm=label_norm)
+
+    dates = pd.Index(sorted(set(x.index.get_level_values("datetime"))))
+    need = min_train_days + embargo + valid_days + embargo + n_folds * test_days
+    if len(dates) < need:
+        raise ValueError(f"交易日不够：有 {len(dates)} 天，{n_folds} 折至少要 {need} 天"
+                         f"（可减小 --folds/--test-days 或拉长 --days）")
+
+    dt_all = x.index.get_level_values("datetime")
+    folds: list[dict[str, Any]] = []
+    oos_pred: list[pd.Series] = []
+    oos_true: list[pd.Series] = []
+
+    # 从最新往回排 n_folds 段测试窗口，再逐段从早到晚训练
+    starts = [len(dates) - (k + 1) * test_days for k in range(n_folds)][::-1]
+    for i, ts in enumerate(starts, 1):
+        te = ts + test_days
+        test_lo, test_hi = dates[ts], dates[min(te, len(dates)) - 1]
+        vi_hi = ts - embargo
+        vi_lo = vi_hi - valid_days
+        tr_hi = vi_lo - embargo
+        if tr_hi < min_train_days or vi_lo < 0:
+            logger.warning("第 %d 折训练段不足，跳过", i)
+            continue
+
+        m_tr = dt_all < dates[tr_hi]
+        m_va = (dt_all >= dates[vi_lo]) & (dt_all < dates[vi_hi])
+        m_te = (dt_all >= test_lo) & (dt_all <= test_hi)
+        if m_tr.sum() < 100 or m_va.sum() < 20 or m_te.sum() < 20:
+            logger.warning("第 %d 折样本不足（train=%d valid=%d test=%d），跳过",
+                           i, m_tr.sum(), m_va.sum(), m_te.sum())
+            continue
+
+        pipe = pp.default_pipeline().fit(x[m_tr])
+        model, _ = _fit(algo, pipe.transform(x[m_tr]), y[m_tr],
+                        pipe.transform(x[m_va]), y[m_va],
+                        device=device, seed=seed + i, n_seeds=n_seeds, params=params)
+        p = pd.Series(model.predict(pipe.transform(x[m_te])), index=x[m_te].index)
+        rep = evaluate(p, y[m_te], horizon=horizon)
+        folds.append({"fold": i, "train_end": str(dates[tr_hi].date()),
+                      "test": f"{test_lo.date()}~{test_hi.date()}",
+                      "n_train": int(m_tr.sum()), "n_test": int(m_te.sum()),
+                      "ic": rep["ic_mean"], "icir": rep["icir"],
+                      "t_nw": rep["t_stat_nw"], "win": rep["ic_win_rate"]})
+        oos_pred.append(p)
+        oos_true.append(y[m_te])
+        logger.info("  折 %d/%d  训练至 %s  测试 %s  IC %+.4f  t_nw %+.2f",
+                    i, len(starts), dates[tr_hi].date(),
+                    f"{test_lo.date()}~{test_hi.date()}", rep["ic_mean"],
+                    rep["t_stat_nw"])
+
+    if not oos_pred:
+        raise ValueError("没有一折跑成功（多半是交易日不够）")
+    all_pred = pd.concat(oos_pred).sort_index()
+    all_true = pd.concat(oos_true).sort_index()
+    return {"oos": evaluate(all_pred, all_true, horizon=horizon),
+            "folds": folds, "n_folds_ok": len(folds),
+            "n_oos_samples": int(len(all_pred)),
+            "predictions": all_pred}

@@ -592,3 +592,84 @@ def test_explicit_start_overrides(trained_big):
     r, syms = trained_big
     bt = lt.backtest_local(r["model_id"], syms, top_n=5, start="2024-06-03")
     assert bt["start"] >= "2024-06-03"
+
+
+# ---------- 滚动重训 + 基准（v0.43） ----------
+
+def test_walk_forward_folds_are_chronological_and_leak_free(trained_big, monkeypatch):
+    """每折的训练段必须**完全早于**它的测试段——这是滚动重训的全部意义。"""
+    _, syms = trained_big
+    r = lt.walk_forward_local(syms, horizon=5, n_folds=3, test_days=30,
+                              valid_days=40, min_train_days=150, params=FAST)
+    assert r["n_folds_ok"] >= 2
+    prev_end = None
+    for f in r["folds"]:
+        tr_end = pd.Timestamp(f["train_end"])
+        te_lo = pd.Timestamp(f["test"].split("~")[0])
+        assert tr_end < te_lo, f"第 {f['fold']} 折训练段侵入测试段：{f}"
+        if prev_end is not None:
+            assert tr_end >= prev_end, "训练终点必须逐折推进（扩张窗口）"
+        prev_end = tr_end
+
+
+def test_walk_forward_test_windows_do_not_overlap(trained_big):
+    _, syms = trained_big
+    r = lt.walk_forward_local(syms, horizon=5, n_folds=3, test_days=30,
+                              valid_days=40, min_train_days=150, params=FAST)
+    wins = [(pd.Timestamp(f["test"].split("~")[0]),
+             pd.Timestamp(f["test"].split("~")[1])) for f in r["folds"]]
+    wins.sort()
+    for (_, a_hi), (b_lo, _) in zip(wins, wins[1:], strict=False):
+        assert a_hi < b_lo, "测试窗口不能重叠，否则样本外样本被重复计入"
+
+
+def test_walk_forward_oos_is_bigger_than_single_split(trained_big):
+    """滚动重训的价值之一：真·样本外样本量比单次切分大得多。"""
+    r_wf = lt.walk_forward_local(syms := trained_big[1], horizon=5, n_folds=4,
+                                 test_days=30, valid_days=40,
+                                 min_train_days=150, params=FAST)
+    single = trained_big[0]["metrics"]["sizes"]["test"]
+    assert r_wf["n_oos_samples"] > single * 0.5, \
+        f"滚动 {r_wf['n_oos_samples']} vs 单次 {single}"
+    assert len(syms) > 0
+
+
+def test_walk_forward_rejects_too_short_history(tmp_db, monkeypatch):
+    """交易日不够时明确报错并给出怎么办，而不是硬切出一堆空折。"""
+    short = {f"S{i:02d}": _bars(200, seed=i) for i in range(10)}
+    monkeypatch.setattr(lt, "load_bars", lambda *a, **k: short)
+    with pytest.raises(ValueError, match="交易日不够"):
+        lt.walk_forward_local(list(short), n_folds=6, test_days=40)
+
+
+def test_backtest_includes_buy_hold_benchmark(trained_big):
+    """纯多头组合的收益混着大盘 beta，必须给等权买入持有基准才能判断价值。"""
+    r, syms = trained_big
+    bt = lt.backtest_local(r["model_id"], syms, top_n=5)
+    assert "benchmark_return" in bt and "excess_return" in bt
+    assert bt["excess_return"] == pytest.approx(
+        bt["result"].metrics["total_return"] - bt["benchmark_return"])
+
+
+def test_benchmark_matches_manual_equal_weight():
+    """基准 = 每只票期初买期末卖的收益率均值，逐位对得上。"""
+    idx = pd.bdate_range("2024-01-01", periods=50)
+    bars = {
+        "A": pd.DataFrame({"close": np.linspace(10, 20, 50)}, index=idx),   # +100%
+        "B": pd.DataFrame({"close": np.linspace(10, 5, 50)}, index=idx),    # -50%
+    }
+    assert lt._equal_weight_buy_hold(bars) == pytest.approx((1.0 - 0.5) / 2)
+
+
+def test_benchmark_skips_unusable_series():
+    idx = pd.bdate_range("2024-01-01", periods=50)
+    bars = {
+        "ok": pd.DataFrame({"close": np.linspace(10, 12, 50)}, index=idx),
+        "one_row": pd.DataFrame({"close": [10.0]}, index=idx[:1]),
+        "zero": pd.DataFrame({"close": np.zeros(50)}, index=idx),
+    }
+    assert lt._equal_weight_buy_hold(bars) == pytest.approx(0.2)
+
+
+def test_benchmark_empty_is_zero():
+    assert lt._equal_weight_buy_hold({}) == 0.0
