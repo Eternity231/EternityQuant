@@ -34,6 +34,9 @@ from eq.strategy.factors.validation import purged_split, set_seed
 
 logger = logging.getLogger(__name__)
 
+# 截面选股的候选池下限（低于此值只警告不拦截）
+_MIN_UNIVERSE = 30
+
 __all__ = ["load_bars", "build_dataset", "train_local",
            "load_local_model", "predict_local"]
 
@@ -112,6 +115,13 @@ def train_local(
     bars = load_bars(symbols, days=days)
     if not bars:
         raise ValueError("一只标的的行情都没拉到")
+    # 截面选股是「今天这批票里挑哪只」，候选池太小的话每天只在几只之间排序，
+    # IC 的方差极大、几乎没有统计意义。不拦（用户可能就想试试），但要说清楚。
+    if len(bars) < _MIN_UNIVERSE:
+        logger.warning(
+            "候选池只有 %d 只（建议 ≥%d）。截面模型每天只能在这几只之间排序，"
+            "IC 噪声极大；试试 --from A --top 300 或多加些自选股",
+            len(bars), _MIN_UNIVERSE)
     x, y = build_dataset(bars, horizon=horizon, label_norm=label_norm)
 
     split = purged_split(x.index, valid_ratio=valid_ratio, test_ratio=test_ratio,
@@ -130,6 +140,10 @@ def train_local(
                         device=device, seed=seed, n_seeds=n_seeds, params=params)
 
     valid_ic = float(getattr(model, "best_score", 0.0))
+    # 预测塌缩成常数时，截面 IC 恒等于 0（同一天所有票分数相同，排不出序）。
+    # 不诊断的话对外就是一串漂亮的 "IC +0.0000 / 胜率 0%"，
+    # 看着像「这批票没信号」，实际是「模型根本没长出来」——两者的处置完全不同。
+    diagnosis = _diagnose(model, sizes["train"], len(bars))
     test_report = None
     if split.test is not None and split.test.sum() > 0:
         from eq.strategy.factors.evaluation import evaluate
@@ -169,8 +183,34 @@ def train_local(
     )
     return {"model_id": model_id, "model_path": str(model_path),
             "n_symbols": len(bars), "n_samples": int(len(y)),
+            "diagnosis": diagnosis,
             "metrics": {"ic": ic, "valid_ic": valid_ic, "test": test_report,
                         "sizes": sizes}}
+
+
+def _diagnose(model, n_train: int, n_symbols: int) -> list[str]:
+    """训练后自检，返回给人看的问题清单（没问题就是空列表）。
+
+    专治「指标全 0 但不知道为什么」：IC=0 有两种截然不同的原因——
+    模型没长出来（要调参）和这批票真没信号（要换票），必须分清。
+    """
+    out: list[str] = []
+    members = getattr(model, "models", [model])
+    if any(getattr(m, "collapsed", False) for m in members):
+        eff = next((getattr(m, "effective_params", {}) for m in members
+                    if getattr(m, "collapsed", False)), {})
+        out.append(
+            f"模型预测塌缩成常数——没有学到任何分裂，IC 恒为 0。"
+            f"当前 lambda_l1={eff.get('lambda_l1')} lambda_l2={eff.get('lambda_l2')}"
+            f" num_leaves={eff.get('num_leaves')}，训练样本 {n_train} 条。"
+            f"试试更小的正则：--params 或直接扩大候选池")
+    if n_symbols < _MIN_UNIVERSE:
+        out.append(f"候选池只有 {n_symbols} 只（建议 ≥{_MIN_UNIVERSE}）："
+                   f"截面模型每天只在这几只之间排序，IC 噪声极大")
+    if n_train < 20_000:
+        out.append(f"训练样本仅 {n_train:,} 条：Alpha158 有 158 维特征，"
+                   f"样本太少容易记住噪声。加标的或拉长 --days")
+    return out
 
 
 def _fit(algo, x_train, y_train, x_valid, y_valid, *, device, seed, n_seeds, params):

@@ -320,3 +320,34 @@ def test_train_predict_roundtrip_is_deterministic(trained, patched):
     b = lt.predict_local(trained["model_id"], [f"S{i:02d}" for i in range(20)],
                          top_n=10, write=False)
     pd.testing.assert_frame_equal(a, b)
+
+
+# ---------- 训练后自检（v0.39：IC 全 0 时要说清楚为什么） ----------
+
+def test_diagnosis_flags_small_universe(tmp_db, patched):
+    r = lt.train_local([f"S{i:02d}" for i in range(20)], algo="lightgbm", params=FAST)
+    assert any("候选池只有 20 只" in d for d in r["diagnosis"])
+
+
+def test_diagnosis_empty_when_healthy(tmp_db, monkeypatch):
+    """标的够多、样本够大时不该报任何问题——否则警告会变成噪声。
+
+    50 只 × 700 根 → 训练段约 2.4 万条，刚好越过「158 个特征至少配 100 倍样本」
+    这条经验线（158 × 100 ≈ 1.6 万）。
+    """
+    big = {f"S{i:03d}": _bars(700, seed=i) for i in range(50)}
+    monkeypatch.setattr(lt, "load_bars", lambda *a, **k: big)
+    r = lt.train_local([f"S{i:03d}" for i in range(50)], algo="lightgbm", params=FAST)
+    assert r["metrics"]["sizes"]["train"] > 20_000
+    assert r["diagnosis"] == [], f"健康训练不该有告警：{r['diagnosis']}"
+
+
+def test_diagnosis_catches_collapse(tmp_db, patched):
+    """强行用官方参数触发塌缩，自检必须点名「预测塌缩成常数」。
+
+    不诊断的话对外只有一串 IC +0.0000，用户分不清「没信号」和「没训练」。
+    """
+    r = lt.train_local([f"S{i:02d}" for i in range(20)], algo="lightgbm",
+                       params={"lambda_l1": 1e6, "lambda_l2": 1e6})
+    assert any("塌缩成常数" in d for d in r["diagnosis"])
+    assert r["metrics"]["ic"] == 0.0, "塌缩时 IC 确实是 0——正因如此才必须解释"

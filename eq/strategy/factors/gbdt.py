@@ -50,6 +50,50 @@ LGB_PARAMS: dict[str, Any] = {
 DEFAULT_ROUNDS = 1000
 DEFAULT_EARLY_STOP = 50
 
+# 上面那套官方参数是在 csi300 上调的：约 300 只 × 上千个交易日 ≈ 40 万样本。
+# LightGBM 的 lambda_l1/l2 是**绝对量**惩罚（作用在叶子的梯度和上），
+# 而梯度和随样本数线性增长——所以同一个 lambda 在小数据上等价于强了几十倍。
+_REF_SAMPLES = 400_000
+
+
+def scale_params_to_size(params: dict[str, Any], n_train: int) -> dict[str, Any]:
+    """按训练样本量缩放正则强度和树容量。
+
+    **这是一个实测出来的坑**：拿 5 只自选股训练（约 4000 个样本）时，
+    ``lambda_l1=205.7`` 会让任何分裂的增益都盖不过惩罚项，LightGBM 直接退化成
+    **一个常数叶子**——预测值全场相同，``best_iteration=1``。
+
+    LightGBM 的 L1 是对叶子内**梯度和**做软阈值：``|Σg| ≤ lambda_l1`` 时叶子输出直接归零。
+    所以塌缩与否同时取决于两件事——样本量（决定 Σg 能累到多大）和**标签尺度**。
+    本项目默认对标签做截面 rank 归一化，把它压到 ±1.7，梯度和比原始收益率标签
+    小得多，更容易被削平（实测：同样 336 个样本，原始收益率标签不塌缩、rank 标签塌缩）。
+    截面 IC 于是恒等于 0（同一天所有票分数一样，排不出序），
+    输出一串 ``IC +0.0000 / ICIR 0.000 / 胜率 0%``，看起来像"这批票没信号"，
+    实际是"模型根本没长出来"。实测同一份数据换轻正则后 valid IC 有 0.127。
+
+    缩放规则：
+
+    - ``lambda_l1/lambda_l2`` 按 ``n_train / 40 万`` 线性缩放（有下限，别缩到 0）
+    - ``num_leaves`` 不超过 ``n_train / 100``——4000 个样本配 210 片叶子，
+      平均每片不到 20 个样本，纯粹在记噪声
+    - ``min_data_in_leaf`` 不超过 ``n_train / 50``，否则小数据上没有一个分裂合法
+
+    显式传了这些键就照传的来，不缩放。
+    """
+    out = dict(params)
+    if n_train <= 0 or n_train >= _REF_SAMPLES:
+        return out
+    ratio = n_train / _REF_SAMPLES
+    for key, floor in (("lambda_l1", 0.1), ("lambda_l2", 0.1)):
+        if key in out:
+            out[key] = max(floor, float(out[key]) * ratio)
+    if "num_leaves" in out:
+        out["num_leaves"] = int(max(7, min(int(out["num_leaves"]), n_train // 100)))
+    if "min_data_in_leaf" in out:
+        out["min_data_in_leaf"] = int(max(5, min(int(out["min_data_in_leaf"]),
+                                                 n_train // 50)))
+    return out
+
 
 class GBDTModel:
     """训练好的 LightGBM，接口对齐项目里的自写 torch 模型。
@@ -66,6 +110,9 @@ class GBDTModel:
         self.best_iteration = int(best_iteration)
         self.best_score = float(best_score)
         self.best_step = int(best_iteration)     # 和 torch 模型的字段名对齐
+        # 预测是否塌缩成常数（由 train_gbdt 回填），供上层给出人话诊断
+        self.collapsed = False
+        self.effective_params: dict[str, Any] = {}
 
     def predict(self, x):
         if isinstance(x, pd.DataFrame):
@@ -95,6 +142,7 @@ def train_gbdt(
     device: str = "cpu",
     seed: int = 42,
     verbose: bool = False,
+    auto_scale: bool = True,
 ) -> GBDTModel:
     """训练一个 LightGBM。有验证集就按验证集早停。
 
@@ -104,7 +152,9 @@ def train_gbdt(
     """
     import lightgbm as lgb
 
-    p = dict(LGB_PARAMS)
+    # 先按样本量缩放默认正则，再让用户显式传的参数覆盖——
+    # 顺序反过来的话用户传的值会被缩放掉
+    p = scale_params_to_size(LGB_PARAMS, len(y_train)) if auto_scale else dict(LGB_PARAMS)
     p.update(params or {})
     p["seed"] = seed
     dev = {"cuda": "gpu"}.get(str(device).lower(), str(device).lower())
@@ -137,6 +187,7 @@ def train_gbdt(
 
     best_iter = booster.best_iteration or num_boost_round
     best_score = 0.0
+    collapsed = False
     if has_valid:
         # 用**每日横截面 Rank IC** 记分，和早停口径、最终验收保持同一把尺
         # （早停本身只能用 LightGBM 的 mse，那是它内部的事）
@@ -144,8 +195,22 @@ def train_gbdt(
 
         pred = booster.predict(x_valid[feats].to_numpy(dtype="float64"),
                                num_iteration=best_iter)
+        # 预测塌缩成常数 = 模型没长出来。这种情况下截面 IC 恒为 0
+        # （同一天所有票分数相同，排不出序），报出来是一串漂亮的 0，
+        # 看着像"没信号"其实是"没训练"——必须当场喊出来。
+        if float(np.std(pred)) < 1e-12:
+            collapsed = True
+            logger.error(
+                "LightGBM 预测塌缩成常数（best_iteration=%d）——模型没有学到任何分裂。"
+                "常见原因：正则太强 / 样本太少 / 特征全是常数。"
+                "当前 lambda_l1=%s lambda_l2=%s num_leaves=%s min_data_in_leaf=%s，"
+                "训练样本 %d 条", best_iter, p.get("lambda_l1"), p.get("lambda_l2"),
+                p.get("num_leaves"), p.get("min_data_in_leaf"), len(y_train))
         ics = daily_ic(pd.Series(pred, index=y_valid.index), y_valid)
         if len(ics):
             m = float(ics.mean())
             best_score = m if m == m else 0.0
-    return GBDTModel(booster, feats, best_iter, best_score)
+    model = GBDTModel(booster, feats, best_iter, best_score)
+    model.collapsed = collapsed
+    model.effective_params = p
+    return model

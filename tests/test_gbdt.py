@@ -165,3 +165,76 @@ def test_user_params_override_defaults():
     m = train_gbdt(xt, yt, xv, yv, params={**FAST, "num_leaves": 3},
                    num_boost_round=10)
     assert m.booster.params.get("num_leaves") == 3
+
+
+# ---------- 小样本上的正则塌缩（v0.39 实测到的真 BUG） ----------
+
+def _ranked_panel(n_days, n_stocks, seed=0, signal=2.0):
+    """标签做截面 rank 归一化——train_local 的默认口径。
+
+    这一步很关键：rank 归一化把标签压到 ±1.7，梯度和随之变小，
+    更容易被 lambda_l1 的阈值整个削平。同样的样本量，
+    原始收益率标签不塌缩、rank 标签就塌缩（实测）。
+    """
+    from eq.strategy.factors.preprocess import cs_rank_norm
+
+    x, y = _panel(n_days=n_days, n_stocks=n_stocks, seed=seed, signal=signal)
+    return x, cs_rank_norm(y)
+
+
+def test_official_params_collapse_on_small_data():
+    """反证：不缩放的话，官方参数会把模型压成一个常数叶子。
+
+    这是用户实跑 5 只自选股时真实发生的——输出一串 IC +0.0000 / 胜率 0%，
+    看着像「这批票没信号」，实际是「模型根本没长出来」。
+    """
+    from eq.strategy.factors.gbdt import train_gbdt as tg
+
+    xt, yt, xv, yv = _split(*_ranked_panel(60, 8))
+    m = tg(xt, yt, xv, yv, num_boost_round=100, auto_scale=False)
+    assert m.collapsed, "构造前提：官方参数在这个规模上应当塌缩"
+    assert len(np.unique(np.round(m.predict(xv), 12))) == 1
+    assert m.best_iteration == 1, "一个分裂都没成立"
+
+
+def test_auto_scale_prevents_collapse():
+    """开启缩放（默认）后同样的数据能学出东西。"""
+    xt, yt, xv, yv = _split(*_ranked_panel(60, 8))
+    m = train_gbdt(xt, yt, xv, yv, num_boost_round=100)
+    assert not m.collapsed
+    assert len(np.unique(np.round(m.predict(xv), 12))) > 1
+    assert m.best_score > 0.1, f"信号明确时该学得到：{m.best_score}"
+
+
+def test_scale_shrinks_regularization_proportionally():
+    from eq.strategy.factors.gbdt import scale_params_to_size
+
+    small = scale_params_to_size(LGB_PARAMS, 4_000)
+    assert small["lambda_l1"] < LGB_PARAMS["lambda_l1"] / 50
+    assert small["num_leaves"] <= 4_000 // 100
+    assert small["min_data_in_leaf"] <= 4_000 // 50
+
+
+def test_scale_is_identity_on_large_data():
+    """样本量达到参考规模时不缩放——官方参数本来就是给这个量级调的。"""
+    from eq.strategy.factors.gbdt import scale_params_to_size
+
+    assert scale_params_to_size(LGB_PARAMS, 500_000) == LGB_PARAMS
+
+
+def test_scale_has_a_floor():
+    """再小的数据也不能把正则缩到 0，否则纯过拟合。"""
+    from eq.strategy.factors.gbdt import scale_params_to_size
+
+    tiny = scale_params_to_size(LGB_PARAMS, 10)
+    assert tiny["lambda_l1"] >= 0.1 and tiny["lambda_l2"] >= 0.1
+    assert tiny["num_leaves"] >= 7 and tiny["min_data_in_leaf"] >= 5
+
+
+def test_explicit_params_are_not_scaled():
+    """用户显式给的值必须原样生效，不能被缩放偷偷改掉。"""
+    xt, yt, xv, yv = _split(*_panel(n_days=60, n_stocks=8))
+    m = train_gbdt(xt, yt, xv, yv, params={"lambda_l1": 99.0, "num_leaves": 3},
+                   num_boost_round=10)
+    assert m.effective_params["lambda_l1"] == 99.0
+    assert m.effective_params["num_leaves"] == 3

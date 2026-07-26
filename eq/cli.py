@@ -1792,7 +1792,10 @@ def ml_train(
                 help="训练（不用 qlib）：本地 Alpha158 特征，直接吃 eq data 下的行情缓存")
 def ml_train_local(
     source: str = typer.Option("watchlist", "--from", "-f",
-                               help="标的来源：watchlist|portfolio|both|csi300 等预设|逗号分隔代码"),
+                               help="标的来源：watchlist|portfolio|both|A/HK/US（按成交额取前 --top 只）"
+                                    "|逗号分隔代码"),
+    top: int = typer.Option(200, "--top", help="市场榜来源时取前 N 只作为候选池。"
+                                               "截面模型建议 ≥100，太少的话每天只在几只之间排序"),
     algo: str = typer.Option("lightgbm", "--algo", "-a", help="lightgbm | mlp | gru | lstm"),
     horizon: int = typer.Option(5, "--horizon", "-h", help="预测窗口（交易日）"),
     days: int = typer.Option(1200, "--days", "-d", help="每只拉多少根日线"),
@@ -1809,7 +1812,7 @@ def ml_train_local(
     from eq.strategy.factors.local_train import train_local
 
     try:
-        symbols, label_txt = _resolve_symbols(source)
+        symbols, label_txt = _resolve_symbols(source, top_n=top)
     except Exception as e:
         typer.echo(f"标的解析失败：{e}", err=True)
         raise typer.Exit(1) from e
@@ -1841,7 +1844,18 @@ def ml_train_local(
         typer.echo(f"  test ICIR {t.get('icir', 0):+.3f}  t 值 {t.get('t_stat', 0):+.2f}"
                    f"  胜率 {t.get('ic_win_rate', 0):.0%}")
     typer.echo(f"  存盘 {r['model_path']}")
-    typer.echo(f"  用 `eq ml activate {r['model_id']}` 激活")
+
+    # 自检结果放在最后、最显眼的位置。IC=0 有两种完全不同的原因——
+    # 模型没长出来（要调参）和这批票真没信号（要换票），不说清楚没法处置。
+    diag = r.get("diagnosis") or []
+    if diag:
+        typer.echo("\n  ⚠ 这次训练有问题：")
+        for d in diag:
+            typer.echo(f"    · {d}")
+        typer.echo("    建议：eq ml train-local --from A --top 300"
+                   "  （A 股成交额前 300，候选池大得多）")
+    else:
+        typer.echo(f"  用 `eq ml activate {r['model_id']}` 激活")
 
 
 @ml_app.command("predict-local",

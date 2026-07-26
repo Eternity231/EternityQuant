@@ -1262,11 +1262,36 @@ eq ml train-local --from watchlist --algo lightgbm --seeds 3
 完整用法：
 
 ```bash
-eq data a -u watchlist                       # 先把行情下下来
-eq ml train-local --from watchlist --seeds 3 # 训练（多种子集成）
-eq ml predict-local <model_id> --dry-run     # 先看看，不写库
-eq ml predict-local <model_id> --top 10      # 满意了再落 ml_predictions
+eq data a -u watchlist                        # 先把行情下下来
+eq ml train-local --from A --top 300 --seeds 3  # 训练（A 股成交额前 300）
+eq ml predict-local <model_id> --dry-run      # 先看看，不写库
+eq ml predict-local <model_id> --top 10       # 满意了再落 ml_predictions
 ```
+
+**候选池不能太小。** 截面选股是「今天这批票里挑哪只」——只有 5 只自选股的话，
+模型每天只在 5 个名字之间排序，IC 的噪声大到没有意义。建议 ≥100 只。
+
+### 小样本上的正则塌缩（v0.39.1 实测修复）
+
+拿 5 只自选股跑 `train-local`，输出是一串 `IC +0.0000 / ICIR 0.000 / 胜率 0%`。
+看着像「这批票没信号」，实际是**模型根本没长出来**：qlib 那套官方超参
+（`lambda_l1=205.7`）是在 csi300 约 40 万样本上调的，而 LightGBM 的 L1 是对叶子内
+**梯度和**做软阈值——`|Σg| ≤ lambda_l1` 时叶子输出直接归零。几千个样本时任何分裂
+都过不了这个门槛，模型退化成单个常数叶子，`best_iteration=1`，同一天所有票分数
+相同，截面 IC 恒等于 0。
+
+塌缩与否同时取决于两件事：**样本量**和**标签尺度**。本项目默认对标签做截面 rank
+归一化，压到 ±1.7，梯度和比原始收益率标签小得多，更容易被削平（实测：同样 336 个
+样本，原始收益率标签不塌缩、rank 标签塌缩）。
+
+两处修复：
+
+1. `gbdt.scale_params_to_size()` 按训练样本量线性缩放 `lambda_l1/l2`，
+   并把 `num_leaves` 压到 `n/100`（4000 个样本配 210 片叶子，平均每片不到 20 条，
+   纯粹在记噪声）。实测同一份数据：塌缩 → valid IC +0.126。
+2. 训练后自检。IC=0 有两种截然不同的原因——**模型没长出来**（要调参）和
+   **这批票真没信号**（要换票），不区分的话用户没法处置。现在会直接打出
+   「模型预测塌缩成常数」「候选池只有 N 只」「训练样本仅 N 条」。
 
 **模型和预处理管线是一起存的**（`{"model", "pipeline", "features", "horizon"}`）。
 推理时必须复用训练时拟合好的管线——重新 fit 一个，归一化统计量就来自推理数据

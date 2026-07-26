@@ -210,7 +210,14 @@ def quantile_returns(
         return {"group_mean": [], "long_short": 0.0, "monotonic": False,
                 "long_short_series": pd.Series(dtype=float), "n_days": 0}
 
-    group_mean = np.nanmean(np.vstack(per_day_groups), axis=0)
+    # 某个分位组在所有交易日都为空时（股票数刚好等于组数、rank 有并列等），
+    # nanmean 会对空切片报 RuntimeWarning 并返回 NaN。这不是错误，
+    # 是「这个分位没样本」的正常表达，静音后由下游按 NaN 处理。
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        group_mean = np.nanmean(np.vstack(per_day_groups), axis=0)
     ls_series = pd.Series(ls_by_day).sort_index()
     diffs = np.diff(group_mean)
     return {
