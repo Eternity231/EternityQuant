@@ -11,9 +11,14 @@
 
 from __future__ import annotations
 
-from typing import Literal, Union
+import logging
+import os
+import sys
+from typing import Literal
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 SortBy = Literal["change_pct", "volume", "amount"]
 Market = Literal["A", "HK", "US", "CRYPTO"]
@@ -34,15 +39,30 @@ def _akshare_code_to_eq(code: str) -> str:
 
 
 def _norm_cols(df: pd.DataFrame, col_map: dict[str, str], sort_by: SortBy, top_n: int) -> pd.DataFrame:
-    """统一列名 + 排序 + 截取前 N。"""
-    df = df.rename(columns=col_map)[list(col_map.values())]
+    """统一列名 + 排序 + 截取前 N。
+
+    上游 akshare 接口的列名时不时变（或某市场压根没有成交额列），
+    此前用 ``df[list(col_map.values())]`` 硬取会直接 KeyError 整个命令挂掉；
+    改成只取实际存在的列。
+    """
+    df = df.rename(columns=col_map)
+    keep = [c for c in col_map.values() if c in df.columns]
+    if "symbol" not in keep:
+        raise ValueError(f"数据源返回的列不含代码列，实际列：{list(df.columns)[:12]}")
+    df = df[keep].copy()
     for col in ["close", "change_pct", "volume", "amount"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["close", "change_pct"])
+    subset = [c for c in ("close", "change_pct") if c in df.columns]
+    if subset:
+        df = df.dropna(subset=subset)
     if sort_by in df.columns:
-        df = df.sort_values(sort_by, ascending=False).head(top_n).reset_index(drop=True)
-    return df
+        df = df.sort_values(sort_by, ascending=False)
+    elif "change_pct" in df.columns:
+        # 该市场没有这个排序键（如美股知名榜无成交量列）时退回涨跌幅，
+        # 而不是"不排序且不截断"——此前会把全表都返回。
+        df = df.sort_values("change_pct", ascending=False)
+    return df.head(top_n).reset_index(drop=True)
 
 
 def scan_a_share(sort_by: SortBy = "change_pct", top_n: int = 30) -> pd.DataFrame:
@@ -88,8 +108,10 @@ def scan_us(sort_by: SortBy = "change_pct", top_n: int = 30) -> pd.DataFrame:
         "最低价": "low", "昨收价": "prev_close",
     }
     df = _norm_cols(raw, col_map, sort_by, top_n)
-    # 代码格式：105.NVDA → NVDA.US
-    df["symbol"] = df["symbol"].astype(str).str.split(".").str[1] + ".US"
+    # 代码格式：105.NVDA → NVDA.US；东财偶尔回不带交易所前缀的裸代码（NVDA），
+    # 此前无脑取 split(".")[1] 会得到 NaN，整行符号变成 nan → 后续全炸。
+    codes = df["symbol"].astype(str).str.rsplit(".", n=1).str[-1]
+    df["symbol"] = codes.str.upper() + ".US"
     return df
 
 
@@ -133,12 +155,29 @@ _SCANNERS = {
 }
 
 
-def scan(market: Market, sort_by: SortBy = "change_pct", top_n: int = 30) -> pd.DataFrame:
-    """统一入口：按市场选扫描器。"""
-    scanner = _SCANNERS.get(market)
-    if scanner is None:
+def scan(market: Market, sort_by: SortBy = "change_pct", top_n: int = 30,
+         prefer: list[str] | None = None) -> pd.DataFrame:
+    """统一入口：按市场扫描全市场快照。
+
+    v0.26 起先走 :mod:`eq.data.sources` 注册表（东财/Binance/OKX/akshare 依次
+    failover），注册表全挂再退回原来写死的 akshare 扫描器。
+    """
+    if market not in _SCANNERS:
         raise ValueError(f"未知市场 {market}，可选：{list(_SCANNERS)}")
-    return scanner(sort_by=sort_by, top_n=top_n)
+
+    from eq.data import sources as src_reg
+
+    try:
+        df, used = src_reg.fetch_spot(market, top_n=max(top_n * 3, 100), prefer=prefer)
+        logger.debug("%s 全市场快照取自 %s", market, used)
+        sort_key = sort_by if sort_by in df.columns else "change_pct"
+        if sort_key in df.columns:
+            df = df.sort_values(sort_key, ascending=False)
+        return df.head(top_n).reset_index(drop=True)
+    except Exception as e:
+        logger.warning("数据源注册表扫描 %s 失败（%s），退回 akshare 扫描器", market, e)
+
+    return _SCANNERS[market](sort_by=sort_by, top_n=top_n)
 
 
 # ---------- 格式化输出 ----------
@@ -148,25 +187,40 @@ _MARKET_LABELS = {"A": "A 股", "HK": "港股", "US": "美股", "CRYPTO": "加�
 _SORT_LABELS = {"change_pct": "涨跌幅", "volume": "成交量", "amount": "成交额"}
 
 
-def format_scan(df: pd.DataFrame, sort_by: SortBy, market: Market = "A") -> str:
+def use_color() -> bool:
+    """终端是否该上色。重定向到文件 / 设了 NO_COLOR 时关掉，避免报表里混入转义序列。"""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("EQ_FORCE_COLOR"):
+        return True
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def format_scan(df: pd.DataFrame, sort_by: SortBy, market: Market = "A", color: bool | None = None) -> str:
     """格式化扫描结果为文本表格。"""
     sort_label = _SORT_LABELS.get(sort_by, sort_by)
     market_label = _MARKET_LABELS.get(market, market)
+    colorize = use_color() if color is None else color
     lines = [f"\n{market_label} 按 {sort_label} 排序，前 {len(df)} 名：\n"]
+    # 名称列宽此前 header 写 12、数据行写 10，整张表右半边错位
     header = f"{'代码':<14} {'名称':<12} {'最新价':>10} {'涨跌幅':>10} {'成交量':>14} {'成交额':>14}"
     lines.append(header)
-    lines.append("-" * len(header))
+    lines.append("-" * 88)
     for _, row in df.iterrows():
-        arrow = "▲" if row["change_pct"] >= 0 else "▼"
-        color = "\033[91m" if row["change_pct"] >= 0 else "\033[92m"
-        reset = "\033[0m"
-        name = str(row.get("name", ""))[:10]
-        close = row.get("close", 0)
-        volume = row.get("volume", 0)
-        amount = row.get("amount", 0)
+        pct = float(row.get("change_pct", 0) or 0)
+        arrow = "▲" if pct >= 0 else "▼"
+        color_on = ("\033[91m" if pct >= 0 else "\033[92m") if colorize else ""
+        reset = "\033[0m" if colorize else ""
+        name = str(row.get("name", ""))[:12]
+        close = float(row.get("close", 0) or 0)
+        volume = float(row.get("volume", 0) or 0)
+        amount = float(row.get("amount", 0) or 0)
         lines.append(
-            f"{row['symbol']:<14} {name:<10} {close:>10.2f} "
-            f"{color}{arrow}{row['change_pct']:+7.2f}%{reset} "
+            f"{row['symbol']:<14} {name:<12} {close:>10.2f} "
+            f"{color_on}{arrow}{pct:+8.2f}%{reset} "
             f"{volume:>14.0f} {amount:>14.0f}"
         )
     return "\n".join(lines) + "\n"

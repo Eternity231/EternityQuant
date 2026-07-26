@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-import pandas as pd
 
 # 因子：输入价格数据，返回单数列
 FactorFunc = "pd.Series | pd.DataFrame"  # 实为 Callable[[pd.DataFrame], pd.Series]，用字符串避免运行时类型开销

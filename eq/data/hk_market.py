@@ -6,7 +6,7 @@
 - 东财/腾讯/雅虎全被限流（RemoteDisconnected）
 
 港股特征 ~60 维（MA/MACD/布林/KDJ/RSI/波动率/成交量等），
-重塑成 (seq=6, dim=10) 喂给 _SimpleSeqModel(GRU)。
+重塑成 (seq=6, dim=10) 喂给 RecurrentAlphaNet(GRU)。
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def _dl_one(code: str, start: str, end: str) -> tuple:
             df = download_hk_stock(code, start, end)
             if df is not None and len(df) > 5:
                 return (code, len(df))
-        except:
+        except Exception:
             pass
     return (code, 0)
 
@@ -112,10 +112,9 @@ def parse_hk_codes_from_file(path: str | Path, verbose: bool = True) -> list[str
             if not raw.isdigit():
                 continue
             # 5 位数字 → 港股
-            if hk_pattern.match(raw):
-                if raw not in seen:
-                    seen.add(raw)
-                    codes.append(raw)
+            if hk_pattern.match(raw) and raw not in seen:
+                seen.add(raw)
+                codes.append(raw)
 
     if verbose:
         print(f"  品种表 {p.name}: 解析出 {len(codes)} 只港股  前 5: {codes[:5]}", flush=True)
@@ -184,14 +183,15 @@ def update_hk_data(
     if not codes:
         return {"codes": 0, "days": 0, "cache_dir": str(_HK_FEAT_DIR)}
 
-    import time as _t, multiprocessing as _mp
+    import multiprocessing as _mp
+    import time as _t
 
     _t0 = _t.time()
     ok = 0
     with _mp.Pool(processes=workers) as pool:
         results = pool.starmap(_dl_one, [(code, start, end) for code in codes])
         total_days = 0
-        for i, (code, days) in enumerate(results):
+        for i, (_code, days) in enumerate(results):
             if days > 0:
                 ok += 1
                 total_days += days
@@ -318,14 +318,33 @@ def train_hk(
     verbose: bool = True,
     gpu_ids: str | list[int] | None = None,  # 多卡并行
     optimizer: str = "lion",  # 默认 Lion：省显存+抗噪，适合低信噪比金融数据；可切 adamw
+    # --- v0.25 训练策略参数 ---
+    test_ratio: float = 0.2,
+    seed: int = 42,
+    cs_normalize_label: bool = True,
 ) -> dict:
-    """港股 GRU 训练（不走 qlib，自写特征 + _SimpleSeqModel）。
+    """港股 GRU 训练（不走 qlib，自写特征 + RecurrentAlphaNet）。
 
-    walk_forward=True 时用滚动前向验证（Walk-Forward Validation），
-    每 60 天滚动一次，模拟实盘。
+    v0.25 修了三个会让 IC 严重虚高的问题：
+
+    1. **切分按行不按时间**。样本是按标的依次 append 的，原来
+       ``split = int(len(X)*0.8)`` 切出来的"验证集"其实是"最后 20% 只股票"，
+       两段时间范围完全重叠——训练集见过验证期的全部行情。
+       Walk-Forward 那段同样是在行下标上滚，滚的是股票不是时间。
+    2. **没有 purge**。标签用到 T+horizon 的收盘价，训练集尾部
+       ``horizon`` 天的标签已经看过验证期价格。
+    3. **验证集既选模型又报成绩**。``best_score`` 是 200 个 epoch 里
+       验证 IC 的最大值，拿它当模型成绩就是在选择集上报最大值。
+
+    Args:
+        test_ratio: 独立测试段占比，0 = 不切（成绩退化为 valid 口径）
+        cs_normalize_label: 标签按日做横截面 rank 归一化。港股日收益的方差
+            绝大部分来自市场 beta，不归一化的话模型学的是"预测大盘"而非选股。
+        seed: 随机种子
 
     Returns:
-        {"model_id": str, "ic": float, "model_path": str}
+        ``{"model_name", "ic"（测试段 Rank IC）, "valid_ic", "model_path",
+        "symbols", "trading_days", "train_samples", "test_report", "wf_*"}``
     """
     if end is None:
         end = dt.date.today().isoformat()
@@ -338,10 +357,20 @@ def train_hk(
     if not symbols:
         raise RuntimeError("无港股数据，先跑 eq hk update-data")
 
+    from eq.strategy.factors.evaluation import evaluate, format_report
+    from eq.strategy.factors.ml_workflow import RecurrentAlphaNet
+    from eq.strategy.factors.validation import purged_split, set_seed, walk_forward_windows
+
+    set_seed(seed)
+
     # 下载 + 算特征 + 构训练集
-    all_features = []
-    all_labels = []
+    # 关键：**同时记录每个样本的日期和标的**，否则没法按时间切分。
+    all_features: list = []
+    all_labels: list = []
+    sample_dates: list = []
+    sample_syms: list = []
     symbols_ok = []
+    feat_cols: list[str] = []
 
     for code in symbols:
         df = download_hk_stock(code, start, end)
@@ -358,76 +387,116 @@ def train_hk(
         # 特征列（排除 price/volume 原始列 + label）
         exclude = {"open", "high", "low", "close", "volume", "label", "vma5", "vma20"}
         feat_cols = [c for c in feat_df.columns if c not in exclude]
-        # 每只票取最近 time_steps 天的特征（时序样本）
         time_steps = 6
-        feat_dim = len(feat_cols)
-        # 切分成滑动窗口样本
+        # 切分成滑动窗口样本，同时记录该样本对应的「预测日」
+        vals = feat_df[feat_cols].to_numpy(dtype="float32")
+        labels = feat_df["label"].to_numpy(dtype="float32")
+        idx = pd.to_datetime(feat_df.index)
         for i in range(time_steps, len(feat_df)):
-            all_features.append(feat_df[feat_cols].iloc[i - time_steps:i].values.flatten())
-            all_labels.append(feat_df["label"].iloc[i])
+            all_features.append(vals[i - time_steps:i].reshape(-1))
+            all_labels.append(labels[i])
+            sample_dates.append(idx[i])
+            sample_syms.append(code)
         symbols_ok.append(code)
 
     if not all_features:
         raise RuntimeError(f"特征计算后无有效样本（{len(symbols)} 只股票）")
 
-    # 转换为 numpy 数组
     import numpy as _np
-    X = _np.array(all_features, dtype=_np.float32)
-    y = _np.array(all_labels, dtype=_np.float32)
+    X = _np.asarray(all_features, dtype=_np.float32)
+    y = _np.asarray(all_labels, dtype=_np.float32)
+    dates = pd.DatetimeIndex(sample_dates)
+    panel_index = pd.MultiIndex.from_arrays([dates, sample_syms], names=["datetime", "instrument"])
+
+    # 标签横截面标准化：原来直接用 h 日原始收益。港股日收益里绝大部分方差
+    # 是市场 beta（大盘涨全体涨），模型只要学会"预测大盘"pooled IC 就很好看，
+    # 但那对**选股**毫无用处。按日做横截面 rank 归一化后，模型被迫学相对强弱。
+    if cs_normalize_label:
+        y_s = pd.Series(y, index=panel_index)
+        ranked = y_s.groupby(level=0).rank(pct=True)
+        counts = y_s.groupby(level=0).transform("size")
+        # 当日股票太少时 rank 无意义，保留原值
+        y = _np.where(counts.to_numpy() >= 5, ranked.to_numpy() - 0.5, y).astype("float32")
 
     seq_len = time_steps
     input_size = len(feat_cols)
 
-    # 导入模型
-    from eq.strategy.factors.ml_workflow import _SimpleSeqModel
+    def _new_model(steps: int):
+        return RecurrentAlphaNet(
+            input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
+            hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
+            lr=1e-3, max_steps=steps, batch_size=batch_size,
+            device=device, dropout=dropout, use_scheduler=True, optimizer=optimizer,
+            seed=seed,
+        )
 
-    # Walk-Forward Validation：滚动 60 天窗口，每滚一次训一次，取平均 IC
-    if walk_forward and len(X) > 240:
-        window = 60  # 验证窗口 60 天
-        step = 30    # 每 30 天滚一次
-        wf_ics = []
-        if verbose:
-            print(f"  Walk-Forward Validation: 窗口={window}天 步长={step}天", flush=True)
-        for wf_start in range(window, len(X) - window, step):
-            wf_train_x = X[:wf_start]
-            wf_train_y = y[:wf_start]
-            wf_valid_x = X[wf_start:wf_start + window]
-            wf_valid_y = y[wf_start:wf_start + window]
-            if len(wf_train_x) < 120 or len(wf_valid_x) < 10:
-                continue
-            wf_model = _SimpleSeqModel(
-                input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
-                hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
-                lr=1e-3, max_steps=100, batch_size=batch_size,
-                device=device, dropout=dropout, use_scheduler=True, optimizer=optimizer,
-            )
-            wf_model.fit(wf_train_x, wf_train_y, wf_valid_x, wf_valid_y, early_stop=15)
-            wf_ics.append(float(wf_model.best_score))
-        if wf_ics:
-            avg_ic = sum(wf_ics) / len(wf_ics)
-            if verbose:
-                print(f"  Walk-Forward IC: mean={avg_ic:+.4f}  "
-                      f"min={min(wf_ics):+.4f}  max={max(wf_ics):+.4f}  "
-                      f"({len(wf_ics)} 窗口)", flush=True)
-
-    # 固定切分验证（与 Walk-Forward 对比）
-    split = int(len(X) * 0.8)
-    x_train, y_train = X[:split], y[:split]
-    x_valid, y_valid = X[split:], y[split:]
-
+    n_days = dates.nunique()
     if verbose:
-        print(f"港股数据集：{len(x_train)} 训练 + {len(x_valid)} 验证  "
-              f"（{len(symbols_ok)} 只股票，{len(feat_cols)} 维特征，dropout={dropout}）", flush=True)
+        print(f"港股样本：{len(X)} 条 / {len(symbols_ok)} 只 / {n_days} 个交易日 / "
+              f"{input_size} 维特征 × {seq_len} 步  (dropout={dropout}, seed={seed})", flush=True)
 
-    # 训练
-    model = _SimpleSeqModel(
-        input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
-        hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
-        lr=1e-3, max_steps=max_steps, batch_size=batch_size,
-        device=device, dropout=dropout, use_scheduler=True, optimizer=optimizer,
-    )
-    model.fit(x_train, y_train, x_valid, y_valid, early_stop=20)
-    ic = float(model.best_score)
+    # ---- Walk-Forward：按**时间**滚动，每窗 purge horizon 天 ----
+    wf_stats: dict = {}
+    if walk_forward:
+        windows = walk_forward_windows(
+            panel_index, n_splits=4, valid_days=60,
+            embargo_days=horizon, expanding=True, min_train_days=120,
+        )
+        if not windows:
+            if verbose:
+                print(f"  [Walk-Forward] 交易日仅 {n_days} 天，不足以滚动验证，跳过", flush=True)
+        else:
+            wf_ics = []
+            if verbose:
+                print(f"  [Walk-Forward] {len(windows)} 个窗口，每窗验证 60 交易日，purge={horizon} 天", flush=True)
+            for k, w in enumerate(windows, 1):
+                m = _new_model(100)
+                m.fit(X[w.train], y[w.train], X[w.valid], y[w.valid], early_stop=15)
+                rep = evaluate(
+                    pd.Series(m.predict(X[w.valid]), index=panel_index[w.valid]),
+                    pd.Series(y[w.valid], index=panel_index[w.valid]),
+                )
+                wf_ics.append(rep["ic_mean"])
+                if verbose:
+                    print(f"    窗口 {k}/{len(windows)} {w.describe()}  Rank IC={rep['ic_mean']:+.4f}"
+                          f"  ICIR={rep['icir']:+.2f}", flush=True)
+            if wf_ics:
+                wf_stats = {
+                    "wf_ic_mean": float(_np.mean(wf_ics)),
+                    "wf_ic_std": float(_np.std(wf_ics)),
+                    "wf_ic_min": float(min(wf_ics)),
+                    "wf_ic_max": float(max(wf_ics)),
+                    "wf_windows": len(wf_ics),
+                }
+                if verbose:
+                    print(f"  [Walk-Forward] 跨窗 Rank IC: mean={wf_stats['wf_ic_mean']:+.4f} "
+                          f"std={wf_stats['wf_ic_std']:.4f} "
+                          f"[{wf_stats['wf_ic_min']:+.4f}, {wf_stats['wf_ic_max']:+.4f}]", flush=True)
+
+    # ---- 最终模型：按时间切 train/valid/test，段间 purge ----
+    # 原来是 split = int(len(X)*0.8) 按**行**切。样本是按标的依次 append 的，
+    # 所以"后 20%"其实是"最后那批股票"，两段的时间范围完全重叠——
+    # 训练集见过验证期的所有行情，验证 IC 严重虚高。
+    sp = purged_split(panel_index, valid_ratio=0.15, test_ratio=test_ratio,
+                      embargo_days=horizon, with_test=test_ratio > 0)
+    if verbose:
+        print(f"  [切分] {sp.describe()}", flush=True)
+
+    model = _new_model(max_steps)
+    model.fit(X[sp.train], y[sp.train], X[sp.valid], y[sp.valid], early_stop=20)
+    valid_ic = float(model.best_score)
+
+    # 成绩只在**独立测试段**上报——valid 用来选模型，不能同时用来报成绩
+    test_report = None
+    if sp.test is not None and sp.test.sum() > 0:
+        test_report = evaluate(
+            pd.Series(model.predict(X[sp.test]), index=panel_index[sp.test]),
+            pd.Series(y[sp.test], index=panel_index[sp.test]),
+        )
+        if verbose:
+            lo, hi = sp.bounds.get("test", ("?", "?"))
+            print(format_report(test_report, title=f"港股测试段评估（{str(lo)[:10]}~{str(hi)[:10]}）"), flush=True)
+    ic = test_report["ic_mean"] if test_report else valid_ic
 
     # 存盘
     import pickle as _pkl
@@ -437,18 +506,20 @@ def train_hk(
     with open(model_path, "wb") as f:
         _pkl.dump(model, f)
 
-    # 登记 ml_models 表（复用 A 股的表结构）
-    name_field = model_name
-
     result = {
-        "model_name": name_field,
-        "ic": ic,
+        "model_name": model_name,
+        "ic": ic,                    # 测试段 Rank IC（无 test 段时退化为 valid）
+        "valid_ic": valid_ic,        # 旧口径：选择集上的最优 pooled IC，偏高
         "model_path": str(model_path),
         "symbols": len(symbols_ok),
-        "train_samples": len(x_train),
+        "trading_days": int(n_days),
+        "train_samples": int(sp.train.sum()),
+        "test_report": test_report,
+        **wf_stats,
     }
     if verbose:
-        print(f"\n港股训练完成：IC={ic:+.4f}  {len(symbols_ok)} 只股票  {model_path.name}", flush=True)
+        print(f"\n港股训练完成：测试段 Rank IC={ic:+.4f}（验证段 {valid_ic:+.4f}）  "
+              f"{len(symbols_ok)} 只股票  {model_path.name}", flush=True)
     return result
 
 
@@ -512,7 +583,6 @@ def _load_hk_cache(code: str, freq: str = "daily") -> pd.DataFrame:
     Args:
         freq: daily | 5m | 1m
     """
-    import os
     if freq == "daily":
         path = _HK_DAILY_DIR / f"{code}.csv"
     elif freq == "5m":
@@ -686,7 +756,7 @@ def train_hk_minute(
     seq_len = time_steps
     input_size = len(feat_cols)
 
-    from eq.strategy.factors.ml_workflow import _SimpleSeqModel
+    from eq.strategy.factors.ml_workflow import RecurrentAlphaNet
 
     # Walk-Forward Validation
     if walk_forward and len(X) > 240:
@@ -702,7 +772,7 @@ def train_hk_minute(
             wf_valid_y = y[wf_start:wf_start + window]
             if len(wf_train_x) < 120 or len(wf_valid_x) < 10:
                 continue
-            wf_model = _SimpleSeqModel(
+            wf_model = RecurrentAlphaNet(
                 input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
                 hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
                 lr=1e-3, max_steps=100, batch_size=batch_size,
@@ -723,7 +793,7 @@ def train_hk_minute(
         print(f"分钟线数据集({freq})：{len(x_train)} 训练 + {len(x_valid)} 验证  "
               f"（{len(symbols_ok)} 只，{len(feat_cols)} 维特征）", flush=True)
 
-    model = _SimpleSeqModel(
+    model = RecurrentAlphaNet(
         input_dim=seq_len * input_size, seq_len=seq_len, input_size=input_size,
         hidden_size=hidden_size, num_layers=num_layers, cell_type=cell_type,
         lr=1e-3, max_steps=max_steps, batch_size=batch_size,
@@ -864,7 +934,9 @@ def predict_hk_ensemble(
     df["score"] = 0.0
     for key in ("daily", "5m", "1m"):
         if key in models:
-            df["score"] += df.apply(lambda r: _w(r, key) * weights[key], axis=1)
+            # key 用默认参数绑定：lambda 虽然在本轮就被 apply 消费掉了，
+            # 但显式绑定能避免后续有人把它改成延迟执行时踩闭包late-binding坑
+            df["score"] += df.apply(lambda r, k=key: _w(r, k) * weights[k], axis=1)
     df["score"] = df["score"] / total_w
 
     cols = ["symbol", "score"]

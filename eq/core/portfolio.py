@@ -16,12 +16,21 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from eq.data.market import detect_market
+from eq.data.market import detect_market, normalize_symbol
 from eq.db import execute, execute_write, get_state_conn
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return {k: row[k] for k in row.keys()}
+    return dict(row)
+
+
+def _norm(symbol: str) -> str:
+    """符号规整。``600519``/``600519.sh``/``SH600519`` 都落到同一行持仓，
+    否则同一只票会因写法不同建出多条 open 持仓。"""
+    try:
+        return normalize_symbol(symbol)
+    except ValueError:
+        return str(symbol).strip().upper()
 
 
 def open_position(
@@ -33,6 +42,11 @@ def open_position(
     note: str = "",
 ) -> int:
     """建仓。若已存在 open 持仓则改用 add 加仓，避免 UNIQUE 冲突。"""
+    symbol = _norm(symbol)
+    if shares <= 0:
+        raise ValueError(f"建仓股数必须为正：{shares}")
+    if price <= 0:
+        raise ValueError(f"成交价必须为正：{price}")
     existing = get_open(symbol)
     if existing is not None:
         return add(symbol, shares, price, note=note)
@@ -51,6 +65,11 @@ def open_position(
 
 def add(symbol: str, shares: float, price: float, note: str = "") -> int:
     """加仓。加权平均更新成本价。持仓不存在则抛错。"""
+    symbol = _norm(symbol)
+    if shares <= 0:
+        raise ValueError(f"加仓股数必须为正：{shares}")
+    if price <= 0:
+        raise ValueError(f"成交价必须为正：{price}")
     pos = get_open(symbol)
     if pos is None:
         raise ValueError(f"无 open 持仓：{symbol}")
@@ -68,6 +87,11 @@ def add(symbol: str, shares: float, price: float, note: str = "") -> int:
 
 def trim(symbol: str, shares: float, price: float, note: str = "") -> int:
     """减仓。不动成本价，累加已实现盈亏。减到 0 自动转清仓。"""
+    symbol = _norm(symbol)
+    if shares <= 0:
+        raise ValueError(f"减仓股数必须为正：{shares}")
+    if price <= 0:
+        raise ValueError(f"成交价必须为正：{price}")
     pos = get_open(symbol)
     if pos is None:
         raise ValueError(f"无 open 持仓：{symbol}")
@@ -94,6 +118,7 @@ def trim(symbol: str, shares: float, price: float, note: str = "") -> int:
 
 def set_stops(symbol: str, stop_loss: float | None = None, take_profit: float | None = None) -> bool:
     """更新止损/止盈价。返回是否真的更新了一行。"""
+    symbol = _norm(symbol)
     sets, params = [], []
     if stop_loss is not None:
         sets.append("stop_loss = ?")
@@ -132,6 +157,7 @@ def list_closed(limit: int = 20) -> list[dict[str, Any]]:
 
 def get_open(symbol: str) -> dict[str, Any] | None:
     """查单只 open 持仓。"""
+    symbol = _norm(symbol)
     rows = execute(
         """SELECT id, symbol, name, market, shares, cost_price, opened_at,
                   stop_loss, take_profit, status, realized_pnl
@@ -143,6 +169,7 @@ def get_open(symbol: str) -> dict[str, Any] | None:
 
 def trade_history(symbol: str, limit: int = 50) -> list[dict[str, Any]]:
     """查某标的全部交易历史。"""
+    symbol = _norm(symbol)
     rows = execute(
         "SELECT id, symbol, action, shares, price, executed_at, note FROM trade_history WHERE symbol = ? ORDER BY executed_at DESC LIMIT ?",
         (symbol, limit),
@@ -162,20 +189,32 @@ def summary() -> dict[str, Any]:
 
     返回字典：
         ``positions``: 每只持仓的明细（含当前价/总市值/浮盈/浮盈%/
-            距止损%/距止盈%/今日涨跌%）
+            距止损%/距止盈%/今日涨跌%/仓位占比%/风险敞口）
         ``total_market_value``: 全持仓总市值
+        ``total_cost``: 全持仓成本
         ``total_unrealized_pnl``: 全持仓浮盈合计
         ``total_realized_pnl``: 全持仓已实现盈亏合计
         ``total_today_pnl``: 全持仓今日盈亏合计（按市值 * 今日涨跌%）
+        ``max_weight_pct`` / ``max_weight_symbol``: 最大单票集中度
+        ``risk_at_stop``: 全部触发止损时的合计亏损（未设止损的按 0 计）
+        ``no_stop``: 没设止损的标的列表（裸奔仓位）
+        ``stale``: 行情拉取失败、只能用成本价占位的标的列表
     """
-    from eq.data.market import get_snapshot
+    from eq.data.market import get_snapshots
 
     rows = list_open()
     positions: list[dict[str, Any]] = []
     total_mv = 0.0
+    total_cost = 0.0
     total_unrealized = 0.0
     total_realized = 0.0
     total_today = 0.0
+    risk_at_stop = 0.0
+    no_stop: list[str] = []
+    stale: list[str] = []
+
+    # 并发拉全部行情：持仓 20 只时串行要 20 次网络往返，体检命令要等半分钟
+    snaps = get_snapshots([r["symbol"] for r in rows]) if rows else {}
 
     for r in rows:
         sym = r["symbol"]
@@ -185,14 +224,14 @@ def summary() -> dict[str, Any]:
         target = r.get("take_profit")
         realized = float(r["realized_pnl"] or 0)
 
-        # 拉最新行情
-        try:
-            snap = get_snapshot(sym)
-            close = float(snap["close"])
-            change_pct = float(snap["change_pct"])
-        except Exception:
+        snap = snaps.get(sym)
+        if snap is None:
             close = cost  # 拉不到行情时退化为用成本价占位
             change_pct = 0.0
+            stale.append(sym)
+        else:
+            close = float(snap["close"])
+            change_pct = float(snap["change_pct"])
 
         mv = shares * close
         unrealized = (close - cost) * shares
@@ -218,16 +257,37 @@ def summary() -> dict[str, Any]:
             "dist_to_stop_pct": dist_stop,
             "dist_to_target_pct": dist_target,
             "realized_pnl": realized,
+            "weight_pct": 0.0,      # 总市值算完后回填
+            "risk_at_stop": (close - stop) * shares if stop else None,
+            "quote_ok": snap is not None,
         })
         total_mv += mv
+        total_cost += cost * shares
         total_unrealized += unrealized
         total_realized += realized
         total_today += today_pnl
+        if stop:
+            risk_at_stop += max(0.0, (close - float(stop)) * shares)
+        else:
+            no_stop.append(sym)
+
+    # 回填仓位占比（集中度体检：单票超 30% 就该警觉了）
+    for p in positions:
+        p["weight_pct"] = (p["market_value"] / total_mv * 100) if total_mv else 0.0
+
+    heaviest = max(positions, key=lambda p: p["weight_pct"], default=None)
 
     return {
         "positions": positions,
         "total_market_value": total_mv,
+        "total_cost": total_cost,
         "total_unrealized_pnl": total_unrealized,
+        "total_unrealized_pct": (total_unrealized / total_cost * 100) if total_cost else 0.0,
         "total_realized_pnl": total_realized,
         "total_today_pnl": total_today,
+        "max_weight_pct": heaviest["weight_pct"] if heaviest else 0.0,
+        "max_weight_symbol": heaviest["symbol"] if heaviest else "",
+        "risk_at_stop": risk_at_stop,
+        "no_stop": no_stop,
+        "stale": stale,
     }

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eternityquant"
-version = "0.12.0"
+version = "0.33.0"
 description = "EternityQuant — 个人散户量化助手（CLI + 定时推送 + Streamlit 仪表盘）"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,13 +23,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-web = ["streamlit>=1.30", "plotly>=5.20"]
+# streamlit 1.49 起 use_container_width 被 width= 取代（旧参数已过移除期）
+web = ["streamlit>=1.49", "plotly>=5.20"]
 ml = ["qlib>=0.9", "lightgbm>=4.0", "torch>=2.0"]
 # CUDA 版 torch 需从 https://download.pytorch.org/whl/cu121 等官方源装，
 # pip 默认装的是 CPU 版；装完 CUDA 版后 ml-cuda 与 ml 等价。
 ml-cuda = ["torch>=2.0"]
 crypto = ["ccxt>=4.0"]
-dev = ["pytest>=8.0", "ruff>=0.5"]
+dev = ["pytest>=8.0", "ruff>=0.5", "openpyxl>=3.1"]
 
 [project.scripts]
 eq = "eq.cli:app"
@@ -47,3 +48,24 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# notebooks 是 Colab/Kaggle 里逐格执行的，cell 级 import 顺序不适用常规规则
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+# E4/E7/E9 语法与运行时错误、F 未定义名/未用导入、B bugbear 真坑、SIM 明显啰嗦。
+# 不开 I（isort）：项目大量使用「函数内延迟 import」规避重依赖启动开销，
+# 也不开 RUF001-003（中文全角标点会被判成"歧义 unicode"，本项目注释文案全中文）。
+select = ["E4", "E7", "E9", "F", "B", "SIM"]
+ignore = [
+    "E501",     # 行宽交给 formatter，注释里贴 URL/表格不必硬折
+    "B008",     # typer 的整套 API 就是 `x: T = typer.Option(...)`，误报
+    "SIM105",   # contextlib.suppress 在这些兜底路径上不比 try/except 清晰
+    "SIM108",   # 三元表达式不总是更好读
+    "SIM117",   # 嵌套 with 在测试里分层更清楚
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里 import pytest 是为了 raises/mark，不算未使用
+"tests/*" = ["F401"]
+# qlib/torch 的部分 import 有注册副作用，删了会改变行为
+"eq/strategy/factors/ml_workflow.py" = ["F401"]

@@ -29,7 +29,10 @@ def adx_trend(df: pd.DataFrame, period: int = 14, threshold: float = 25.0) -> pd
     adx_val = adx(df, period)
     ema20 = ema(df, 20)
     above = df["close"] > ema20
-    prev_above = above.shift(1)
+    # bool Series 做无填充的 shift 会引入 NaN 并把 dtype 退化成 object，
+    # 之后的 `~prev_above` 直接 TypeError: bad operand type for unary ~: 'float'
+    # ——adx_trend 此前在任何数据上都必崩。用 fill_value=False 保住 bool dtype。
+    prev_above = above.shift(1, fill_value=False)
     signal = pd.Series(HOLD, index=df.index, name="adx_trend")
     strong = adx_val > threshold
     signal[strong & above & ~prev_above] = BUY

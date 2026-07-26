@@ -12,12 +12,15 @@
 from __future__ import annotations
 
 import datetime as dt
-import os
 import time
-from pathlib import Path
 
 import pandas as pd
 import requests
+
+from eq.data.paths import (
+    HK_DAILY_DIR, HK_5M_DIR, HK_1M_DIR,
+    US_DAILY_DIR, ensure_data_dirs,
+)
 
 
 # ---------- 东财 push2his 统一 K 线拉取器（A/港/美三市场统一接口，免费无 key） ----------
@@ -111,7 +114,9 @@ def _em_kline(code: str, market: str, start: str, end: str,
             txt = txt[1:-2]
         if txt.startswith('"') or txt.startswith("'"):
             txt = txt.strip('"').strip("'")
-        j = pd.io.json.loads(txt) if hasattr(pd.io.json, "loads") else __import__("json").loads(txt)
+        import json as _json
+
+        j = _json.loads(txt)
         kl = j.get("data", {}).get("klines", [])
         if not kl:
             return pd.DataFrame()
@@ -133,11 +138,6 @@ def _em_kline(code: str, market: str, start: str, end: str,
         return pd.DataFrame()  # 调用方 fallback
 
 
-
-from eq.data.paths import (
-    HK_DAILY_DIR, HK_5M_DIR, HK_1M_DIR,
-    US_DAILY_DIR, ensure_data_dirs,
-)
 
 
 def _fmt_yf_hk(code: str) -> str:
@@ -195,8 +195,7 @@ def collect_hk_daily(
     failed = []
     # 并发池：东财源无限流，8 并发拉取替串行（串行卡 timeout 8s 等待就是"后台网络不动"根因）
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    targets = [c for c in codes[:top_n]]
-    pre_ok = 0  # 已有缓存的直接算成功（但不再卡 len>=300，新上市股不足 300 行也允许）
+    targets = list(codes[:top_n])
 
     def _dl_one(code):
         path = out / f"{code}.csv"
@@ -454,17 +453,18 @@ def collect_us_daily(
     start: str = "2024-01-01",
     end: str | None = None,
 ):
-    """美股日线（yfinance）。"""
-    import yfinance as yf
-
+    """美股日线（东财 push2his 主源，yfinance fallback）。"""
     if end is None:
         end = dt.date.today().isoformat()
     if codes is None:
         codes = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "QQQ", "SPY"]
+    else:
+        codes = [str(c).strip().upper() for c in codes if str(c).strip()]
 
     out = US_DAILY_DIR
     ensure_data_dirs()
     ok = 0
+    failed: list[str] = []
     for code in codes[:top_n]:
         path = out / f"{code}.csv"
         if path.exists() and path.stat().st_size > 1000:
@@ -476,25 +476,36 @@ def collect_us_daily(
             if df.empty:
                 # fallback: yfinance（东财被限流时）
                 import yfinance as yf
-                df = yf.download(code, start=start, end=end, progress=False)
+                df = yf.download(code, start=start, end=end, progress=False, auto_adjust=False)
                 if df.empty:
+                    failed.append(code)
                     continue
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
-                df = df[["Open", "High", "Low", "Close", "Volume"]].rename(
-                    columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-                ).reset_index().rename(columns={"Date": "date"})
+                # 落盘格式必须和东财分支一致：日期做索引 + 同样的列序。
+                # 此前这里 reset_index() 把日期变成普通列，两个分支写出的 CSV
+                # 结构不同，下游 read_csv(index_col=0) 读到的索引是行号而非日期。
+                df = df[["Open", "High", "Close", "Low", "Volume"]].rename(
+                    columns={"Open": "open", "High": "high", "Close": "close",
+                             "Low": "low", "Volume": "volume"}
+                )
+                df.index = pd.to_datetime(df.index)
+                df.index.name = "date"
             else:
                 df = df.set_index("date")[["open", "close", "high", "low", "volume"]]
             if df.empty:
+                failed.append(code)
                 continue
             df.to_csv(path)
             ok += 1
             print(f"  ✓ 美股日线 {code}  {len(df)} 行", flush=True)
         except Exception as e:
+            failed.append(code)
             print(f"  ✗ 美股日线 {code}  {str(e)[:50]}", flush=True)
-        time.sleep(0.3)  # 东财源比 yfinance 快，间隔从 0.3→0.3
-    print(f"  美股日线完成: {ok}/{min(top_n, len(codes))}")
+        time.sleep(0.3)
+    print(f"  美股日线完成: {ok}/{min(top_n, len(codes))}  失败 {len(failed)} 只")
+    if failed:
+        print(f"  失败清单: {','.join(failed[:20])}{'...' if len(failed) > 20 else ''}")
 
 
 def collect_a_share(start: str = "2026-01-01", universe: str = "csi300", workers: int = 10, extra_codes: list[str] | None = None):

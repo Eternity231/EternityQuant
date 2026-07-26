@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import datetime as dt
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -19,7 +18,11 @@ import requests as _req
 
 from eq.data.paths import QLIB_CN_DATA_DIR as _QLIB_DATA_DIR, ensure_data_dirs
 
-_FEATURES = ["open", "high", "low", "close", "volume", "factor", "change"]
+# 腾讯 API 只给 OHLCV，没有成交额，因此 vwap 用典型价 (H+L+C)/3 近似。
+# 为什么必须有 vwap：qlib Alpha158 的 price 组默认包含 VWAP0 = $vwap/$close，
+# 缺 $vwap 时这一列被 Fillna 填成 0（158 维里有 1 维是死的）；
+# 而 Alpha360（RNN 模型的官方特征集）有 60 列直接依赖 $vwap，缺了就完全不可用。
+_FEATURES = ["open", "high", "low", "close", "volume", "vwap", "factor", "change"]
 _FLOAT32_NAN = np.float32(np.nan)
 
 # 腾讯 API 基础 URL
@@ -272,7 +275,7 @@ def _tencent_trading_days(start: str, end: str) -> list[str]:
         days = [bar[0] for bar in bars if len(bar) >= 1]
         return sorted(set(days))
     except Exception as e:
-        raise RuntimeError(f"腾讯 API 拉交易日失败：{e}")
+        raise RuntimeError(f"腾讯 API 拉交易日失败：{e}") from e
 
 
 # ---------- 股池列表（新浪源） ----------
@@ -317,7 +320,7 @@ def _proc_one_stock(code, start, end, new_days, qlib_feats_dir, expected_floats=
     days_list = list(new_days)
     n_days = len(days_list)
 
-    # 完整性检测：所有 7 个特征 .bin 都必须存在且长度精确等于交易日数，
+    # 完整性检测：所有特征 .bin 都必须存在且长度精确等于交易日数，
     # 才视为「已完整下载」可跳过。任一缺失/长度不符/全 NaN（未上市）→ 视为
     # 损坏或不完整，覆盖重下。这样能抓到中途崩溃留下的半截 .bin。
     if expected_floats > 0:
@@ -400,6 +403,9 @@ def _proc_one_stock(code, start, end, new_days, qlib_feats_dir, expected_floats=
 
     df["factor"] = 1.0
     df["change"] = df["close"].pct_change(fill_method=None).fillna(0.0)
+    # vwap 近似：腾讯无成交额，用典型价 (H+L+C)/3——技术分析里的标准代理，
+    # 比直接缺列（整列 NaN→Fillna→0）强得多。
+    df["vwap"] = (df["high"] + df["low"] + df["close"]) / 3.0
     # 转 .bin（覆盖写，保证顺序无关）
     for feat in _FEATURES:
         if feat in df.columns:

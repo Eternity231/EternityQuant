@@ -23,10 +23,8 @@ import json
 import sqlite3
 from typing import Any
 
-import pandas as pd
-
 from eq.core.notifier import dispatch
-from eq.data.market import detect_market, get_recent_bars, get_snapshot
+from eq.data.market import bare_code, detect_market, get_recent_bars, get_snapshot, normalize_symbol
 from eq.db import execute, execute_write, get_state_conn
 
 
@@ -61,13 +59,25 @@ def add_rule(
     rule_type: str,
     params: dict[str, Any],
     channels: list[str] | None = None,
+    cooldown_minutes: int = 0,
 ) -> int:
-    """注册监控规则。symbol=None 表示全市场规则。返回 rule_id。"""
+    """注册监控规则。symbol=None 表示全市场规则。返回 rule_id。
+
+    Args:
+        cooldown_minutes: 冷却期。同一条规则在上次触发后的 N 分钟内不再推送。
+            0 = 不冷却（历史行为）。定时任务里 ``monitor_run`` 每 5 分钟跑一次时，
+            一条"跌破 1700"的规则会每 5 分钟推一遍，冷却期就是治这个的。
+    """
     if rule_type not in RULE_TYPES:
         raise ValueError(f"未知规则类型 {rule_type}，可选：{sorted(RULE_TYPES)}")
     _validate_params(rule_type, params)
     if channels is None:
         channels = ["desktop"]  # 默认仅桌面通知
+    if symbol:
+        symbol = normalize_symbol(symbol)
+    params = dict(params)
+    if cooldown_minutes > 0:
+        params["cooldown_minutes"] = int(cooldown_minutes)
     row_id = execute_write(
         """INSERT INTO rules (symbol, type, params, channels) VALUES (?, ?, ?, ?)""",
         (symbol, rule_type, json.dumps(params, ensure_ascii=False), json.dumps(channels)),
@@ -89,6 +99,28 @@ def set_enabled(rule_id: int, enabled: bool) -> bool:
         return cur.rowcount > 0
 
 
+def set_cooldown(rule_id: int, minutes: int) -> bool:
+    """给已有规则改冷却期（存在 params 的 ``cooldown_minutes`` 键里）。"""
+    with get_state_conn() as conn:
+        row = conn.execute("SELECT params FROM rules WHERE id = ?", (rule_id,)).fetchone()
+        if row is None:
+            return False
+        try:
+            params = json.loads(row["params"] or "{}")
+        except json.JSONDecodeError:
+            params = {}
+        if minutes > 0:
+            params["cooldown_minutes"] = int(minutes)
+        else:
+            params.pop("cooldown_minutes", None)
+        conn.execute(
+            "UPDATE rules SET params = ? WHERE id = ?",
+            (json.dumps(params, ensure_ascii=False), rule_id),
+        )
+        conn.commit()
+        return True
+
+
 def list_rules(enabled_only: bool = False) -> list[dict[str, Any]]:
     """列出所有规则，按 id 升序。"""
     q = "SELECT id, symbol, type, params, channels, enabled, created_at, last_fired_at, fire_count FROM rules"
@@ -98,7 +130,7 @@ def list_rules(enabled_only: bool = False) -> list[dict[str, Any]]:
     rows = execute(q)
     out = []
     for r in rows:
-        d = {k: r[k] for k in r.keys()}
+        d = dict(r)
         d["params"] = json.loads(d["params"] or "{}")
         d["channels"] = json.loads(d["channels"] or "[]")
         out.append(d)
@@ -106,7 +138,7 @@ def list_rules(enabled_only: bool = False) -> list[dict[str, Any]]:
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return {k: row[k] for k in row.keys()}
+    return dict(row)
 
 
 def _mark_fired(rule_id: int) -> None:
@@ -119,7 +151,7 @@ def _mark_fired(rule_id: int) -> None:
 
 # ----------------- 评估引擎 -----------------
 
-def run_all() -> int:
+def run_all(*, verbose: bool = False) -> int:
     """对所有 enabled 规则逐根评估，触发则推送。返回触发条数。"""
     rules = list_rules(enabled_only=True)
     fired = 0
@@ -127,21 +159,85 @@ def run_all() -> int:
         try:
             if _evaluate(rule):
                 fired += 1
+                if verbose:
+                    print(f"[monitor] 规则 #{rule['id']} ({rule['type']}) 触发")
         except Exception as e:
             print(f"[monitor] 规则 #{rule['id']} 评估异常：{e}")
     return fired
 
 
+def _in_cooldown(rule: dict[str, Any]) -> bool:
+    """规则是否还在冷却期内（上次触发后 cooldown_minutes 分钟内不重复推）。"""
+    minutes = int(rule.get("params", {}).get("cooldown_minutes", 0) or 0)
+    if minutes <= 0:
+        return False
+    last = rule.get("last_fired_at")
+    if not last:
+        return False
+    if isinstance(last, dt.datetime):
+        last_dt = last
+    else:
+        try:
+            last_dt = dt.datetime.fromisoformat(str(last).replace("Z", ""))
+        except ValueError:
+            return False
+    # SQLite CURRENT_TIMESTAMP 写的是 UTC，naive
+    now_utc = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    return (now_utc - last_dt).total_seconds() < minutes * 60
+
+
 def _evaluate(rule: dict[str, Any]) -> bool:
-    """评估单条规则，返回是否触发。"""
+    """评估单条规则，返回是否触发（冷却期内直接跳过，不打网络）。"""
     handler = _HANDLERS.get(rule["type"])
     if handler is None:
+        return False
+    if _in_cooldown(rule):
         return False
     fired, title, body = handler(rule)
     if fired:
         dispatch(rule["channels"], title, body, rule_id=rule["id"])
         _mark_fired(rule["id"])
+        _record_signal(rule, title, body)
     return fired
+
+
+def _record_signal(rule: dict[str, Any], title: str, body: str) -> None:
+    """把触发写进 signals 表，供仪表盘"最近信号"和事后复盘用。
+
+    此前 signals 表建了但从没人写过，触发历史只能看 fire_count 计数。
+    """
+    try:
+        execute_write(
+            "INSERT INTO signals (symbol, signal_type, strength, context) VALUES (?, ?, ?, ?)",
+            (
+                rule["symbol"] or "*",
+                rule["type"],
+                1.0,
+                json.dumps({"rule_id": rule["id"], "title": title, "body": body},
+                           ensure_ascii=False),
+            ),
+        )
+    except Exception as e:  # pragma: no cover - 记录失败不该阻断推送
+        print(f"[monitor] 信号落库失败：{e}")
+
+
+def recent_signals(limit: int = 50, symbol: str | None = None) -> list[dict[str, Any]]:
+    """最近触发的信号（仪表盘 / ``eq monitor signals`` 用）。"""
+    q = "SELECT id, symbol, signal_type, strength, context, created_at FROM signals"
+    params: tuple = ()
+    if symbol:
+        q += " WHERE symbol = ?"
+        params = (normalize_symbol(symbol),)
+    q += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    out = []
+    for r in execute(q, params + (limit,)):
+        d = dict(r)
+        try:
+            d["context"] = json.loads(d["context"] or "{}")
+        except json.JSONDecodeError:
+            d["context"] = {}
+        out.append(d)
+    return out
 
 
 # ----------------- 规则处理器 -----------------
@@ -193,17 +289,38 @@ def _h_volume_spike(rule: dict[str, Any]) -> tuple[bool, str, str]:
     return fired, title, body
 
 
+def limit_band(symbol: str) -> float:
+    """A 股当日涨跌停幅度（小数）。
+
+    此前一律按 ±10% 算，创业板（30xxxx）/科创板（688xxx）/北交所实际是
+    ±20%/±30%，导致这些板块的涨跌停规则永远差 10 个点触发不了。
+    """
+    code = bare_code(symbol)
+    suffix = normalize_symbol(symbol).partition(".")[2]
+    if suffix == "BJ" or code.startswith(("4", "8", "92")):
+        return 0.30  # 北交所 ±30%
+    if code.startswith(("300", "301", "688", "689")):
+        return 0.20  # 创业板 / 科创板 ±20%
+    return 0.10
+
+
 def _h_limit(rule: dict[str, Any], is_up: bool) -> tuple[bool, str, str]:
-    snap = _snap(rule)
     market = detect_market(rule["symbol"])
     if market != "A":
         return False, "", ""  # 涨跌停规则仅适用 A 股
-    # A 股涨跌停 ±10%（ST/创业板 20%，简化第一版只用 10%）
-    limit_pct = 0.10
+    snap = _snap(rule)
+    limit_pct = limit_band(rule["symbol"])
     expected = snap["prev_close"] * (1 + (limit_pct if is_up else -limit_pct))
-    fired = abs(snap["close"] - expected) < 0.01 or (snap["high"] >= expected if is_up else snap["low"] <= expected)
+    # 板价按交易所规则四舍五入到分，直接用 <0.01 容差比更贴近实际
+    expected = round(expected, 2)
+    fired = abs(snap["close"] - expected) < 0.011 or (
+        snap["high"] >= expected if is_up else snap["low"] <= expected
+    )
     title = f"{'涨停' if is_up else '跌停'} {rule['symbol']}"
-    body = f"收盘 {snap['close']:.2f}  前收 {snap['prev_close']:.2f}\n预期板价 {expected:.2f}"
+    body = (
+        f"收盘 {snap['close']:.2f}  前收 {snap['prev_close']:.2f}\n"
+        f"预期板价 {expected:.2f}（±{limit_pct:.0%} 板）"
+    )
     return fired, title, body
 
 
@@ -298,15 +415,20 @@ def _h_news(rule: dict[str, Any]) -> tuple[bool, str, str]:
         return False, "", ""
     import akshare as ak
     try:
-        df = ak.stock_news_em(symbol=rule["symbol"])
+        # akshare 要裸代码（600519），传 600519.SH 会返回空 / 报错，
+        # 结果是 news 规则永远不触发。
+        df = ak.stock_news_em(symbol=bare_code(rule["symbol"]))
     except Exception:
         return False, "", ""
-    if df.empty:
+    if df is None or df.empty:
         return False, "", ""
     # 最近一条新闻
     latest = df.iloc[0]
     title = f"新闻推送 {rule['symbol']}"
-    body = f"{latest['新闻标题']}\n来源：{latest['文章来源']}  {latest['发布时间']}"
+    body = (
+        f"{latest.get('新闻标题', '')}\n"
+        f"来源：{latest.get('文章来源', '?')}  {latest.get('发布时间', '')}"
+    )
     return True, title, body
 
 
@@ -350,7 +472,6 @@ def _h_flow(rule: dict[str, Any]) -> tuple[bool, str, str]:
     p = rule["params"]
     source = p.get("source", "northbound")
     threshold = float(p.get("threshold", 100_000_000))  # 默认 1 亿
-    kwargs = {}
 
     if source == "northbound":
         import akshare as ak
@@ -367,7 +488,7 @@ def _h_flow(rule: dict[str, Any]) -> tuple[bool, str, str]:
         prev_inflow = float(prev["当日成交净买额"]) * 1e4
         fired = abs(net_inflow) >= threshold
         direction = "流入" if net_inflow >= 0 else "流出"
-        title = f"北向资金异动"
+        title = "北向资金异动"
         body = (
             f"当日净{direction} {abs(net_inflow) / 1e8:.2f}亿  "
             f"（前日 {abs(prev_inflow) / 1e8:.2f}亿）\n"

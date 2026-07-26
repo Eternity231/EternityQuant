@@ -7,10 +7,10 @@ qlib 数据集截至 2020-09-25，训练区间用 2015-01-01~2020-08-31，验证
 from __future__ import annotations
 
 import datetime as dt
-import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np  # _patched_corr_load 里用到（此前漏 import，补丁一触发就 NameError）
 import pandas as pd
 import torch  # _LionOpt 继承 torch.optim.Optimizer 须顶层可见
 
@@ -184,20 +184,31 @@ def train(
     algo: str = "lightgbm",
     device: str = "cpu",
     name: str | None = None,
+    # --- v0.25 训练策略参数 ---
+    test_ratio: float = 0.2,
+    embargo_days: int | None = None,
+    seed: int = 42,
+    feature_set: str = "Alpha158",
+    params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """走 qlib 标准 pipeline 训练一个 LightGBM 模型。
 
     Args:
         device: "cpu" | "gpu" | "cuda"（cuda 需编译时开 USE_CUDA=1，本机不可用）
+        test_ratio/embargo_days/seed: 见 :func:`train_torch`
+        params: 覆盖默认 LightGBM 超参（见 :data:`LGB_PARAMS`）
     Returns:
         {"model_id": str, "metrics": dict, "model_path": str}
     """
     _qlib_init()
     from qlib.data import D
 
-    from qlib.contrib.data.handler import Alpha158
     from qlib.contrib.model import LGBModel
-    from qlib.utils import init_instance_by_config
+
+    from eq.strategy.factors.validation import set_seed
+
+    set_seed(seed)
+    embargo = horizon if embargo_days is None else int(embargo_days)
 
     # 1. 标的池（csi300 默认；qlib 本地数据支持）
     try:
@@ -229,7 +240,7 @@ def train(
         {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
     ]
     label_expr = [f"Ref($close, -{horizon}) / Ref($close, -1) - 1"]
-    handler = Alpha158(
+    handler = _resolve_handler(feature_set)(
         instruments=universe,
         start_time=train_start,
         end_time=valid_end,
@@ -240,40 +251,29 @@ def train(
         label=label_expr,
     )
 
-    # 3. 数据集切片
+    # 3. 数据集切片：train / valid / test，段间 purge horizon 天
     from qlib.data.dataset import DatasetH
-    segments = {
-        "train": (train_start, train_end),
-        "valid": (valid_start, valid_end),
-    }
+    segments = _build_segments(train_start, train_end, valid_start, valid_end,
+                               test_ratio=test_ratio, embargo_days=embargo)
+    print("  [切分] " + "  ".join(f"{k}={v[0]}~{v[1]}" for k, v in segments.items())
+          + f"  (purge={embargo}日, seed={seed})", flush=True)
     dataset = DatasetH(handler=handler, segments=segments)
 
     # 4. 训练 LightGBM（device 透传：cpu|gpu|cuda）
     if algo != "lightgbm":
         raise NotImplementedError(f"algo {algo} 待集成，第一版只支持 lightgbm")
-    model = LGBModel(
-        loss="mse", num_leaves=64, learning_rate=0.05, n_estimators=200, colsample_bytree=0.9,
-        device=device,
-    )
+    lgb_kwargs = dict(LGB_PARAMS)
+    lgb_kwargs.update(params or {})
+    lgb_kwargs["device"] = device
+    lgb_kwargs.setdefault("seed", seed)
+    model = LGBModel(**lgb_kwargs)
+    # 有 valid 段时交给 LightGBM 自己早停（qlib LGBModel 内部用 valid 做 early stopping）
     model.fit(dataset)
 
-    # 5. 评估（predict 直接接 dataset + segment="valid"）
-    valid_pred = model.predict(dataset, segment="valid")
-    valid_data = dataset.prepare("valid", col_set="label")
-    valid_label = valid_data
-    # IC 指标
-    valid_pred_df = valid_pred if isinstance(valid_pred, pd.DataFrame) else pd.DataFrame(valid_pred)
-    valid_label_df = valid_label if isinstance(valid_label, pd.DataFrame) else pd.DataFrame(valid_label)
-    aligned = valid_pred_df.align(valid_label_df, axis=0, join="inner")
-    pred_series = aligned[0].iloc[:, 0] if not aligned[0].empty else pd.Series(dtype=float)
-    label_series = aligned[1].iloc[:, 0] if not aligned[1].empty else pd.Series(dtype=float)
-    if pred_series.empty or label_series.empty:
-        ic = 0.0
-    else:
-        cov = pred_series.cov(label_series)
-        std_p = pred_series.std()
-        std_l = label_series.std()
-        ic = cov / (std_p * std_l) if std_p > 0 and std_l > 0 else 0.0
+    # 5. 评估：valid（选择集，偏乐观）+ test（独立，真成绩）
+    valid_report = _eval_segment(model, dataset, "valid", segments)
+    test_report = _eval_on_test(model, dataset, segments)
+    ic = (test_report or valid_report or {}).get("ic_mean", 0.0)
 
     # 6. 模型存盘（pickle 直存，绕开 qlib dump API 复杂性）
     import pickle as _pkl
@@ -283,20 +283,189 @@ def train(
 
     # 7. 登记 ml_models 表
     model_name = name or f"{universe}_{algo}_h{horizon}_{dt.date.today().strftime('%Y%m%d')}"
-    features = ["Alpha158(158 个 qlib 标准特征)"]
     model_id = register_model(
         name=model_name,
         universe=universe,
-        features=features,
+        features=[feature_set],
         algo=algo,
         horizon=horizon,
-        train_period=f"{train_start}~{train_end}",
-        valid_period=f"{valid_start}~{valid_end}",
-        metrics={"ic": ic, "algo": algo, "horizon": horizon, "device": device},
+        train_period=f"{segments['train'][0]}~{segments['train'][1]}",
+        valid_period=f"{segments['valid'][0]}~{segments['valid'][1]}",
+        metrics={"ic": ic, "valid_ic": (valid_report or {}).get("ic_mean", 0.0),
+                 "algo": algo, "horizon": horizon, "device": device, "seed": seed,
+                 "embargo_days": embargo, "feature_set": feature_set,
+                 **{f"test_{k}": v for k, v in (test_report or {}).items()
+                    if k != "ic_series" and not isinstance(v, list)}},
         model_path=str(model_path),
-        notes="qlib workflow 真集成训练",
+        notes=f"qlib LightGBM（{feature_set}，官方调优超参，purge={embargo}日）",
     )
-    return {"model_id": model_id, "metrics": {"ic": ic}, "model_path": str(model_path)}
+    return {"model_id": model_id,
+            "metrics": {"ic": ic, "valid_ic": (valid_report or {}).get("ic_mean", 0.0),
+                        "test": test_report},
+            "model_path": str(model_path)}
+
+
+# ---------- 训练策略公共件（v0.25） ----------
+
+_FEATURE_SETS = {"alpha158": "Alpha158", "alpha360": "Alpha360"}
+
+# LightGBM 超参：直接采用 qlib 官方 benchmark 调优结果
+# （examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml）。
+#
+# 原来的配置是 num_leaves=64, lr=0.05, n_estimators=200, colsample=0.9，
+# **没有任何 L1/L2 正则、没有行采样**。股票日频截面数据信噪比极低
+# （单因子 IC 通常 0.02~0.05），这种配置几乎必然过拟合训练段：
+# 官方调出来的 lambda_l1=205 / lambda_l2=580 是常规 GBDT 任务的几百倍，
+# 正是为了压住这种低信噪比数据上的过拟合。
+LGB_PARAMS: dict[str, Any] = {
+    "loss": "mse",
+    "learning_rate": 0.0421,
+    "colsample_bytree": 0.8879,
+    "subsample": 0.8789,
+    "lambda_l1": 205.6999,
+    "lambda_l2": 580.9769,
+    "max_depth": 8,
+    "num_leaves": 210,
+    "feature_fraction": 0.8879,
+    "bagging_fraction": 0.8789,
+    "bagging_freq": 1,
+    "min_data_in_leaf": 50,
+    "num_boost_round": 1000,      # 配合 early stopping，不会真跑满
+    "early_stopping_rounds": 50,
+    "num_threads": 20,
+}
+
+
+def _resolve_handler(feature_set: str):
+    """按名取 qlib handler 类。
+
+    - ``Alpha158``：158 个横截面因子，适合 LightGBM / MLP
+    - ``Alpha360``：6 个价量字段 × 60 天 = 360，**真时序**，
+      是 qlib 官方 GRU/LSTM/ALSTM benchmark 的配置
+    """
+    key = str(feature_set).strip().lower()
+    if key not in _FEATURE_SETS:
+        raise ValueError(f"未知特征集 {feature_set}，可选：Alpha158 / Alpha360")
+    from qlib.contrib.data import handler as _h
+
+    return getattr(_h, _FEATURE_SETS[key])
+
+
+def _shift_trading_days(date_str: str, n: int) -> str:
+    """在 qlib 交易日历上把日期前后挪 n 个交易日（n<0 往前）。
+
+    日历读不到时退化为自然日——purge 会略微保守，但绝不会漏 purge。
+    """
+    import datetime as _dt
+
+    try:
+        from qlib.data import D
+
+        cal = list(D.calendar(start_time="1990-01-01", end_time="2099-12-31", freq="day"))
+        target = pd.Timestamp(date_str)
+        # bisect：找到 <= target 的最后一个交易日下标
+        import bisect
+
+        i = bisect.bisect_right(cal, target) - 1
+        j = min(max(i + n, 0), len(cal) - 1)
+        return pd.Timestamp(cal[j]).date().isoformat()
+    except Exception:
+        d = _dt.date.fromisoformat(str(date_str)[:10])
+        # 自然日换算：1 个交易日 ≈ 1.45 自然日，向上取整更保守
+        return (d + _dt.timedelta(days=int(n * 1.5))).isoformat()
+
+
+def _build_segments(
+    train_start: str, train_end: str, valid_start: str, valid_end: str,
+    test_ratio: float = 0.2, embargo_days: int = 5,
+) -> dict[str, tuple[str, str]]:
+    """构造 qlib ``DatasetH`` 的 segments：train / valid / test，段间 purge。
+
+    - train 尾部 purge ``embargo_days`` 个交易日（标签用到 T+h 的价格）
+    - 原 valid 区间尾部按 ``test_ratio`` 切出 test，valid 尾部同样 purge
+    """
+    segs: dict[str, tuple[str, str]] = {}
+    e = max(0, int(embargo_days))
+    segs["train"] = (train_start, _shift_trading_days(train_end, -e) if e else train_end)
+
+    if test_ratio and test_ratio > 0:
+        v0, v1 = pd.Timestamp(valid_start), pd.Timestamp(valid_end)
+        span = (v1 - v0).days
+        if span >= 10:  # 太短就不切了，切了两段都没样本
+            cut = v0 + pd.Timedelta(days=int(span * (1 - test_ratio)))
+            segs["valid"] = (valid_start, _shift_trading_days(cut.date().isoformat(), -e) if e else cut.date().isoformat())
+            segs["test"] = ((cut + pd.Timedelta(days=1)).date().isoformat(), valid_end)
+            return segs
+        print(f"  [warn] 验证区间只有 {span} 天，太短无法再切 test，退化为 train/valid 两段", flush=True)
+    segs["valid"] = (valid_start, valid_end)
+    return segs
+
+
+def _prepare_xy(dataset, segment: str):
+    """从 qlib dataset 取一段的 (feature, label)，**保留 (datetime, instrument) 索引**。
+
+    原 ``_align_dropna`` 直接 ``.values`` 转 numpy，把 MultiIndex 丢了——
+    丢了日期就没法算「每日横截面 IC」，只能退回被日间漂移污染的 pooled IC。
+    这里保留索引，只在喂给 torch 时才转 numpy。
+    """
+    import numpy as _np
+
+    data = dataset.prepare(segment, col_set=["feature", "label"])
+    x = data["feature"]
+    y = data["label"]
+    if isinstance(y, pd.DataFrame):
+        y = y.iloc[:, 0]
+    # feature 有 NaN/Inf 或 label 有 NaN 的样本一起剔掉（按索引对齐）
+    x = x.replace([_np.inf, -_np.inf], _np.nan)
+    mask = y.notna() & x.notna().all(axis=1)
+    return x[mask], y[mask]
+
+
+def _eval_segment(model, dataset, segment: str, segments: dict[str, tuple[str, str]],
+                  quiet: bool = True) -> dict[str, Any] | None:
+    """在指定段上评估。qlib 原生模型走 ``model.predict(dataset, segment=...)``，
+    自写模型走 ``model.predict(x)``——两种签名都兼容。"""
+    if segment not in segments:
+        return None
+    from eq.strategy.factors.evaluation import evaluate, format_report
+
+    try:
+        x, y = _prepare_xy(dataset, segment)
+        if len(y) == 0:
+            return None
+        try:
+            pred = model.predict(dataset, segment=segment)   # qlib 原生签名
+            pred_s = pred.iloc[:, 0] if isinstance(pred, pd.DataFrame) else pd.Series(pred)
+            pred_s = pred_s.reindex(y.index).dropna()
+            y = y.reindex(pred_s.index)
+        except TypeError:
+            pred = model.predict(x)                          # 自写模型签名
+            pred_s = pd.Series(np.asarray(pred).reshape(-1), index=x.index)
+    except Exception as e:
+        print(f"  [warn] {segment} 段评估失败：{e}", flush=True)
+        return None
+    report = evaluate(pred_s, y)
+    if not quiet:
+        lo, hi = segments[segment]
+        print(format_report(report, title=f"{segment} 段评估（{lo}~{hi}）"), flush=True)
+    return report
+
+
+def _eval_on_test(model, dataset, segments: dict[str, tuple[str, str]]) -> dict[str, Any] | None:
+    """在**独立测试段**上评估模型，返回 :func:`evaluation.evaluate` 的报告。
+
+    没有 test 段（区间太短）时返回 None，调用方退化为报 valid IC——
+    但那个数字是选择集上的最大值，会偏高，注册进 ml_models 时用
+    ``valid_ic`` 键区分。
+    """
+    report = _eval_segment(model, dataset, "test", segments, quiet=True)
+    if report is None:
+        return None
+    from eq.strategy.factors.evaluation import format_report
+
+    lo, hi = segments["test"]
+    print(format_report(report, title=f"测试段评估（{lo}~{hi}，训练/选模型都没见过）"), flush=True)
+    return report
 
 
 # ---------- qlib PyTorch 模型（走 CUDA，CUDA GPU 主场） ----------
@@ -332,39 +501,50 @@ def _build_torch_model(algo: str, device: str):
 
 # ---------- 自写最简 MLP（走 torch.cuda，绕开 qlib DNNModelPytorch nan 坑） ----------
 
-class _SimpleMLP:
+class MLPAlphaNet:
     """最简 MLP：158 -> 256 -> 1，走 BatchNorm1d + Adam，支持 CUDA。
 
     qlib DNNModelPytorch 在 torch 2.13 + Alpha158 默认配置下 loss 全 nan（BatchNorm1d 坑），
     自写此绕开，只取 qlib handler 的 feature 和 label 做数据，训练用原生 torch。
     """
 
-    def __init__(self, input_dim: int = 158, hidden: int | tuple = 256, lr: float = 1e-3, max_steps: int = 300, batch_size: int = 2000, device: str = "cuda", optimizer: str = "lion"):
+    def __init__(self, input_dim: int = 158, hidden: int | tuple = 256, lr: float = 1e-3,
+                 max_steps: int = 300, batch_size: int = 2000, device: str = "cuda",
+                 optimizer: str = "lion", dropout: float = 0.3, seed: int | None = None,
+                 weight_decay: float = 1e-5):
         import torch
         import torch.nn as nn
+
+        if seed is not None:
+            from eq.strategy.factors.validation import set_seed
+            set_seed(seed)
         self.device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
         self.lr = lr
         self.max_steps = max_steps
         self.batch_size = batch_size
+        self.dropout = dropout
+        self.seed = seed
         # hidden 支持 int（单隐层）或 tuple（多隐层，如 (512,256,128)）
         if isinstance(hidden, int):
             hidden_layers = [hidden]
         else:
             hidden_layers = list(hidden)
         # 构造 158 → h1 → h2 → ... → 1 的 Sequential，每层 Linear+BN+ReLU+Dropout
+        # dropout 此前硬编码 0.05 且不接受参数——CLI 的 --dropout 对 MLP 完全无效。
+        # 金融数据信噪比极低，0.05 基本等于没正则。
         layers = []
         prev = input_dim
         for h in hidden_layers:
-            layers.extend([nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(0.05)])
+            layers.extend([nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(dropout)])
             prev = h
         layers.append(nn.Linear(prev, 1))
         self.net = nn.Sequential(*layers).to(self.device)
         # 默认 Lion：显存省半 + 符号操作抗噪，适合低信噪比金融数据；
         # optimizer="adamw" 可切回（reduce_lr/warmup 都走 param_groups[0]["lr"] 兼容）
         if optimizer.lower() == "lion":
-            self.opt = _LionOpt(self.net.parameters(), lr=lr, weight_decay=1e-6)
+            self.opt = _LionOpt(self.net.parameters(), lr=lr, weight_decay=weight_decay)
         else:
-            self.opt = torch.optim.AdamW(self.net.parameters(), lr=lr, weight_decay=1e-5)
+            self.opt = torch.optim.AdamW(self.net.parameters(), lr=lr, weight_decay=weight_decay)
         self.loss_fn = nn.MSELoss()
         self.best_score = -float("inf")
         self.best_state = None
@@ -445,7 +625,7 @@ class _SimpleMLP:
 
 # ---------- 自写时序模型（LSTM/GRU + 动态学习率，走 torch.cuda） ----------
 
-class _SimpleSeqModel:
+class RecurrentAlphaNet:
     """自写时序模型：支持 LSTM/GRU，ReduceLROnPlateau 动态学习率，AdamW 优化器。
 
     把 Alpha158 的 158 维特征重塑成 (batch, seq_len=6, input_size=26) 喂给 RNN。
@@ -461,11 +641,31 @@ class _SimpleSeqModel:
                  hidden_size: int = 64, num_layers: int = 2, cell_type: str = "gru",
                  lr: float = 1e-3, max_steps: int = 200, batch_size: int = 4000,
                  device: str = "cuda", dropout: float = 0.1, use_scheduler: bool = True,
-                 optimizer: str = "lion"):
+                 optimizer: str = "lion", seed: int | None = None):
+        import math
+
         import torch
         import torch.nn as nn
+
+        if seed is not None:
+            from eq.strategy.factors.validation import set_seed
+            set_seed(seed)
         self.device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
         self.seq_len = seq_len
+        # 特征丢失修复：原来 cut = seq_len*input_size = 6*26 = 156 < input_dim=158，
+        # `_reshape` 走的是 x[:, :cut]，**静默丢掉最后 2 维特征**——而它的 docstring
+        # 却写着"保证 158 维全保留"。这里把 input_size 上调到能覆盖 input_dim 的最小值，
+        # 不足部分由 _reshape 补零（补零对 RNN 贡献为 0，不污染信号）。
+        need = math.ceil(input_dim / seq_len) if seq_len > 0 else input_size
+        if seq_len * input_size < input_dim:
+            print(
+                f"  [warn] seq_len({seq_len})×input_size({input_size})={seq_len * input_size}"
+                f" < input_dim({input_dim})，会丢 {input_dim - seq_len * input_size} 维特征；"
+                f"已自动把 input_size 调到 {need}（不足部分补零）",
+                flush=True,
+            )
+            input_size = need
+        self.input_dim = input_dim
         self.input_size = input_size
         self.lr = lr
         self.max_steps = max_steps
@@ -515,16 +715,23 @@ class _SimpleSeqModel:
         self._warmup_steps = 5  # 首 5 步 lr 从 1e-4 线性升到 lr，防首步塌缩
 
     def _reshape(self, x):
-        """把 (batch, 158) 重塑成 (batch, seq_len=6, input_size=26)。
+        """把 (batch, input_dim) 重塑成 (batch, seq_len, input_size)。
 
-        不丢特征：若 cut < input_dim，用零向量 pad 到 cut 长度再重塑，
-        保证 158 维全保留（pad 部分对 LSTM 贡献为 0，不污染）。
+        构造函数已保证 ``seq_len * input_size >= input_dim``，所以这里
+        只会补零、不会截断——不再静默丢特征。
+
+        .. warning::
+           对 **Alpha158** 而言这个"时间轴"是假的：158 个特征之间没有时间
+           顺序（是 KBAR/MA/STD/BETA/RSQR 等各类横截面因子），把它 view 成
+           (6, 26) 后 RNN 在"时间轴"上跑的是任意特征分组，GRU/LSTM 实际退化
+           成一个参数共享的 MLP。真要做时序建模应该用 **Alpha360**
+           （6 个价量字段 × 60 天，天然时序），即 qlib 官方 GRU/LSTM
+           benchmark 的配置——见 ``train_torch(feature_set="Alpha360")``。
         """
         import torch
         cut = self.seq_len * self.input_size
         if x.size(1) < cut:
-            # pad 到 cut 长度
-            pad = torch.zeros(x.size(0), cut - x.size(1), device=x.device)
+            pad = torch.zeros(x.size(0), cut - x.size(1), device=x.device, dtype=x.dtype)
             x = torch.cat([x, pad], dim=1)
         return x[:, :cut].view(x.size(0), self.seq_len, self.input_size)
 
@@ -639,8 +846,13 @@ class _SimpleSeqModel:
             return pred.cpu().numpy()
 
 
-# 向后兼容别名
-_SimpleLSTM = _SimpleSeqModel
+# ---- 向后兼容别名 ----
+# 训练好的模型是 pickle 整个实例存盘的，pickle 记的是「模块路径 + 类名」。
+# 直接改名会让 v0.26 之前存下来的所有 .pkl 加载不了（AttributeError），
+# 所以旧名字必须留着指向新类。
+_SimpleMLP = MLPAlphaNet
+_SimpleSeqModel = RecurrentAlphaNet
+_SimpleLSTM = RecurrentAlphaNet
 
 
 def train_torch(
@@ -665,6 +877,11 @@ def train_torch(
     seq_len: int = 0,
     num_heads: int = 4,
     gpu_ids: str | list[int] | None = None,  # 多卡并行
+    # --- v0.25 训练策略参数 ---
+    test_ratio: float = 0.2,
+    embargo_days: int | None = None,
+    seed: int = 42,
+    feature_set: str = "Alpha158",
 ) -> dict[str, Any]:
     """走 qlib PyTorch pipeline 训练 ALSTM/GRU/LSTM/MLP/DeepLOB/TFT，用 CUDA。
 
@@ -678,10 +895,27 @@ def train_torch(
         orthogonalize: 特征正交化去 Beta
         seq_len: DeepLOB/TFT 输入窗口
         num_heads: TFT 注意力头数
+        test_ratio: 从 [valid_start, valid_end] 尾部切出的**独立测试段**比例。
+            0 = 沿用旧行为（只有 train/valid，报告的 IC 会偏高）。
+        embargo_days: 段间 purge 的交易日数，缺省 = horizon。标签是
+            ``Ref($close,-h)/Ref($close,-1)-1``，训练集尾部 h 天的标签
+            已经看过验证期价格，不 purge 就是泄漏。
+        seed: 随机种子。此前没有种子控制，同一条命令两次跑出的 IC 能差一大截。
+        feature_set: ``Alpha158``（默认）| ``Alpha360``。RNN 类模型（gru/lstm/alstm）
+            建议用 Alpha360——它是 6 个价量字段 × 60 天的真时序张量，
+            而 Alpha158 被 reshape 成 (6,26) 的"时间轴"是假的。
+
     Returns:
-        {"model_id": str, "metrics": dict, "model_path": str}
+        {"model_id", "metrics", "model_path"}。``metrics`` 里
+        ``ic`` 是**测试段**的 Rank IC（test_ratio>0 时），
+        ``valid_ic`` 才是旧口径的验证集最优值。
     """
     _qlib_init()
+    from eq.strategy.factors.evaluation import evaluate, format_report
+    from eq.strategy.factors.validation import purged_split, set_seed
+
+    set_seed(seed)
+    embargo = horizon if embargo_days is None else int(embargo_days)
 
     # Alpha158 handler（feature 158 维）
     # 权威处理器链（对标 qlib examples/benchmarks/GRU/workflow_config_gru_Alpha158.yaml）：
@@ -691,7 +925,7 @@ def train_torch(
     #   learn_processors (标签): DropnaLabel → CSRankNorm
     #     - CSRankNorm 横截面排序归一化，把未来收益转成 [0,1] 均匀分布
     #     - 这是官方 GRU/ALSTM/LSTM benchmark 的标准配置，比 CSZScoreNorm 更抗异常
-    from qlib.contrib.data.handler import Alpha158
+    handler_cls = _resolve_handler(feature_set)
     infer_procs = [
         {"class": "ProcessInf", "kwargs": {}},
         {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
@@ -702,7 +936,7 @@ def train_torch(
         {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
     ]
     label_expr = [f"Ref($close, -{horizon}) / Ref($close, -1) - 1"]
-    handler = Alpha158(
+    handler = handler_cls(
         instruments=universe,
         start_time=train_start,
         end_time=valid_end,
@@ -714,31 +948,32 @@ def train_torch(
     )
 
     from qlib.data.dataset import DatasetH
-    segments = {"train": (train_start, train_end), "valid": (valid_start, valid_end)}
+    # 三段切分：从原 valid 区间尾部切出独立 test。
+    # 之所以必须有 test：fit() 用 valid IC 做 early stopping + best_state 选择，
+    # 旧代码又把同一个 best_score（200 个 epoch 里的最大值）当模型成绩报出去——
+    # 在选择集上报最大值，纯噪声也能"跑出" IC=0.03~0.05。
+    segments = _build_segments(
+        train_start, train_end, valid_start, valid_end,
+        test_ratio=test_ratio, embargo_days=embargo,
+    )
+    print("  [切分] " + "  ".join(f"{k}={v[0]}~{v[1]}" for k, v in segments.items())
+          + f"  (purge={embargo}日, seed={seed}, 特征集={feature_set})", flush=True)
     dataset = DatasetH(handler=handler, segments=segments)
 
     # --- 高级模型路径：DeepLOB / TFT ---
     if algo in ("deeplob", "tft"):
         from eq.strategy.factors.advanced_models import (
-            AdvancedTrainer, DeepLOB, TemporalFusionTransformer,
+            DeepAlphaTrainer, DeepLOB, TemporalFusionTransformer,
         )
 
-        train_data = dataset.prepare("train", col_set=["feature", "label"])
-        valid_data = dataset.prepare("valid", col_set=["feature", "label"])
-        x_train, y_train = train_data["feature"], train_data["label"]
-        x_valid, y_valid = valid_data["feature"], valid_data["label"]
-        if hasattr(y_train, "values"):
-            y_train = y_train.squeeze() if y_train.ndim > 1 else y_train
-        if hasattr(y_valid, "values"):
-            y_valid = y_valid.squeeze() if y_valid.ndim > 1 else y_valid
+        x_train, y_train = _prepare_xy(dataset, "train")
+        x_valid, y_valid = _prepare_xy(dataset, "valid")
 
         # 构建模型
-        input_dim = 158
         _seq_len = seq_len if seq_len > 0 else (120 if algo == "deeplob" else 60)
         _hidden = hidden_size if hidden_size > 0 else (64 if algo == "deeplob" else 256)
         _batch = batch_size if batch_size > 0 else (512 if algo == "deeplob" else 256)
         input_size = 26  # 6×26 时序重塑的每步维度
-        model_input_dim = _seq_len * input_size
 
         if algo == "deeplob":
             model = DeepLOB(
@@ -758,7 +993,7 @@ def train_torch(
             notes = f"TFT（seq={_seq_len}, hidden={_hidden}, heads={num_heads}, dropout={dropout}）"
 
         # 用 AdvancedTrainer 训练
-        trainer = AdvancedTrainer(
+        trainer = DeepAlphaTrainer(
             model=model,
             optimizer_type=optimizer,
             loss_type=loss_type,
@@ -774,9 +1009,12 @@ def train_torch(
             device=device,
             gpu_ids=gpu_ids,
             verbose=True,
+            seed=seed,
         )
         result = trainer.fit(x_train, y_train, x_valid, y_valid)
-        ic = float(result["best_ic"])
+        valid_ic = float(result["best_ic"])
+        test_report = _eval_on_test(model, dataset, segments)
+        ic = test_report["ic_mean"] if test_report else valid_ic
 
         # 存盘
         import pickle as _pkl
@@ -787,71 +1025,69 @@ def train_torch(
         model_id = register_model(
             name=name or f"{universe}_{algo}_h{horizon}_{dt.date.today().strftime('%Y%m%d')}",
             universe=universe,
-            features=["Alpha158(158 个 qlib 标准特征)"],
+            features=[f"{feature_set}"],
             algo=algo,
             horizon=horizon,
-            train_period=f"{train_start}~{train_end}",
-            valid_period=f"{valid_start}~{valid_end}",
-            metrics={"ic": ic, "algo": algo, "horizon": horizon, "device": device,
-                     "optimizer": optimizer, "loss": loss_type,
-                     "adversarial": adversarial, "orthogonalize": orthogonalize},
+            train_period=f"{segments['train'][0]}~{segments['train'][1]}",
+            valid_period=f"{segments['valid'][0]}~{segments['valid'][1]}",
+            metrics={"ic": ic, "valid_ic": valid_ic, "algo": algo, "horizon": horizon,
+                     "device": device, "optimizer": optimizer, "loss": loss_type,
+                     "adversarial": adversarial, "orthogonalize": orthogonalize,
+                     "seed": seed, "embargo_days": embargo, "feature_set": feature_set,
+                     **{f"test_{k}": v for k, v in (test_report or {}).items()
+                        if k != "ic_series" and not isinstance(v, list)}},
             model_path=str(model_path),
             notes=notes,
         )
-        return {"model_id": model_id, "metrics": {"ic": ic, "epochs": result["best_step"] + 1}, "model_path": str(model_path)}
+        return {"model_id": model_id,
+                "metrics": {"ic": ic, "valid_ic": valid_ic, "epochs": result["best_step"] + 1,
+                            "test": test_report},
+                "model_path": str(model_path)}
 
     # --- 原有 PyTorch 模型路径（MLP / LSTM / GRU / ALSTM） ---
     if algo in ("mlp", "lstm", "gru", "alstm"):
         # 自写 MLP/LSTM 路径：从 dataset 取 feature 和 label，用 torch.cuda 训练
-        train_data = dataset.prepare("train", col_set=["feature", "label"])
-        valid_data = dataset.prepare("valid", col_set=["feature", "label"])
-        x_train, y_train = train_data["feature"], train_data["label"]
-        x_valid, y_valid = valid_data["feature"], valid_data["label"]
-        if hasattr(y_train, "values"):
-            y_train = y_train.squeeze() if y_train.ndim > 1 else y_train
-        if hasattr(y_valid, "values"):
-            y_valid = y_valid.squeeze() if y_valid.ndim > 1 else y_valid
-        # Dropna：qlib Alpha158 的 DropnaLabel processor 只对训练集删了 NaN label，
-        # 但切到 y_train.squeeze() 后仍可能残留 NaN（337 个），MSELoss 对 NaN 标签
-        # 算 loss 会把权重拉塌缩成常数 → LSTM IC=0 恒不更新。喂 fit 前同步删
-        # feature/label 任一 NaN 的样本（按 index 对齐）。
-        import numpy as _np
-        def _align_dropna(x, y):
-            xv = x.values if hasattr(x, "values") else _np.asarray(x)
-            yv = y.values if hasattr(y, "values") else _np.asarray(y)
-            yv = yv.reshape(yv.shape[0], -1).squeeze(-1) if yv.ndim > 1 else yv
-            mask = ~_np.isnan(yv)
-            if xv.ndim == 2:
-                mask &= ~_np.isnan(xv).any(axis=1)
-            return xv[mask], yv[mask]
-        x_train, y_train = _align_dropna(x_train, y_train)
-        x_valid, y_valid = _align_dropna(x_valid, y_valid)
-        # 诊断探针：dropna 后 feature/label 是否真有信号
-        _xt_std = float(_np.std(x_train))
-        _yt_std = float(_np.std(y_train))
-        print(f"  [DIAG] dropna 后: xt.std={_xt_std:.4f} yt.std={_yt_std:.4f} 样本数={len(y_train)}", flush=True)
-        if _yt_std == 0 or len(y_train) < 10:
-            print(f"  [DIAG] 警告: yt.std=0 或样本过少（{len(y_train)}），LSTM 无信号可学", flush=True)
+        # _prepare_xy 保留 (datetime, instrument) 索引，测试段才能算每日横截面 IC
+        x_train, y_train = _prepare_xy(dataset, "train")
+        x_valid, y_valid = _prepare_xy(dataset, "valid")
+        n_feat = x_train.shape[1]
+        print(f"  [DIAG] 样本 train={len(y_train)} valid={len(y_valid)}  "
+              f"特征 {n_feat} 维  yt.std={float(y_train.std()):.4f}", flush=True)
+        if float(y_train.std()) == 0 or len(y_train) < 10:
+            print(f"  [DIAG] 警告: 标签无方差或样本过少（{len(y_train)}），无信号可学", flush=True)
+
         if algo == "mlp":
-            model = _SimpleMLP(input_dim=158, hidden=(512, 256, 128), lr=1e-3, max_steps=300, batch_size=8000, device=device, optimizer=optimizer)
-            notes = f"自写 _SimpleMLP 真集成训练（{device}, {optimizer}），绕开 qlib DNNModelPytorch nan 坑"
+            model = MLPAlphaNet(
+                input_dim=n_feat, hidden=(512, 256, 128), lr=1e-3, max_steps=300,
+                batch_size=8000, device=device, optimizer=optimizer,
+                dropout=dropout, seed=seed,
+            )
+            notes = f"自写 MLPAlphaNet（{device}, {optimizer}, dropout={dropout}, {feature_set}）"
         else:
-            # 研究结论：GRU > LSTM（S&P 500 84%准确率），浅层 2-3 层最优
+            # 研究结论：GRU > LSTM（2 门 vs 3 门，参数少不易过拟合），浅层 2-3 层最优
             cell = "lstm" if algo == "lstm" else "gru"
-            # 如果 CLI 指定了 hidden/layers/batch 则覆盖默认
             _hs = hidden_size if hidden_size > 0 else 64
             _nl = num_layers if num_layers > 0 else 2
             _bs = batch_size if batch_size > 0 else 4000
-            model = _SimpleSeqModel(
-                input_dim=158, seq_len=6, input_size=26,
+            # Alpha360 是 (60 天 × 6 字段) 的真时序；Alpha158 只能假装 (6, ceil(158/6))
+            if feature_set.lower() == "alpha360":
+                _seq, _in = 60, 6
+            else:
+                _seq, _in = 6, 26
+            model = RecurrentAlphaNet(
+                input_dim=n_feat, seq_len=_seq, input_size=_in,
                 hidden_size=_hs, num_layers=_nl, cell_type=cell,
                 lr=1e-3, max_steps=200, batch_size=_bs, device=device,
-                use_scheduler=True, optimizer=optimizer,
+                dropout=dropout, use_scheduler=True, optimizer=optimizer, seed=seed,
             )
-            notes = f"自写 {cell.upper()} 眯集成训练（{device}, {optimizer}），ReduceLROnPlateau 动态学习率"
+            notes = (f"自写 {cell.upper()}（{device}, {optimizer}, dropout={dropout}, "
+                     f"{feature_set}, seq={_seq}×{_in}）")
         model.fit(x_train, y_train, x_valid, y_valid, early_stop=20 if algo != "mlp" else 30)
-        ic = float(model.best_score)
+        valid_ic = float(model.best_score)
         epochs = model.best_step + 1
+
+        test_report = _eval_on_test(model, dataset, segments)
+        ic = test_report["ic_mean"] if test_report else valid_ic
 
         # 存盘（pickle 整个模型实例，含 net state_dict）
         import pickle as _pkl
@@ -862,16 +1098,22 @@ def train_torch(
         model_id = register_model(
             name=name or f"{universe}_{algo}_h{horizon}_{dt.date.today().strftime('%Y%m%d')}",
             universe=universe,
-            features=["Alpha158(158 个 qlib 标准特征)"],
+            features=[feature_set],
             algo=algo,
             horizon=horizon,
-            train_period=f"{train_start}~{train_end}",
-            valid_period=f"{valid_start}~{valid_end}",
-            metrics={"ic": ic, "algo": algo, "horizon": horizon, "device": device, "epochs": epochs},
+            train_period=f"{segments['train'][0]}~{segments['train'][1]}",
+            valid_period=f"{segments['valid'][0]}~{segments['valid'][1]}",
+            metrics={"ic": ic, "valid_ic": valid_ic, "algo": algo, "horizon": horizon,
+                     "device": device, "epochs": epochs, "seed": seed,
+                     "embargo_days": embargo, "dropout": dropout, "feature_set": feature_set,
+                     **{f"test_{k}": v for k, v in (test_report or {}).items()
+                        if k != "ic_series" and not isinstance(v, list)}},
             model_path=str(model_path),
             notes=notes,
         )
-        return {"model_id": model_id, "metrics": {"ic": ic, "epochs": epochs}, "model_path": str(model_path)}
+        return {"model_id": model_id,
+                "metrics": {"ic": ic, "valid_ic": valid_ic, "epochs": epochs, "test": test_report},
+                "model_path": str(model_path)}
 
     # qlib 原生 ALSTM/GRU/LSTM 路径
     model = _build_torch_model(algo, device)
@@ -977,8 +1219,7 @@ def predict_batch(
     meta_rows = execute("SELECT universe, horizon, model_path FROM ml_models WHERE id = ?", (model_id,))
     if not meta_rows:
         raise KeyError(f"模型 {model_id} 不存在")
-    meta = {k: meta_rows[0][k] for k in meta_rows[0].keys()}
-    horizon = int(meta["horizon"])
+    meta = dict(meta_rows[0])
     model_path = meta["model_path"]
     universe = meta["universe"] or universe
 
@@ -1014,7 +1255,7 @@ def predict_batch(
 
     # 按 algo 分路预测：
     # - LightGBM（qlib LGBModel）：model.predict(dataset, segment="test") 返回 pd.Series
-    # - 自写 LSTM/MLP（_SimpleLSTM/_SimpleMLP）：从 dataset 取 feature DataFrame，model.predict(x) 返回 ndarray
+    # - 自写 LSTM/MLP（_SimpleLSTM/MLPAlphaNet）：从 dataset 取 feature DataFrame，model.predict(x) 返回 ndarray
     from eq.db import execute as _execute
     algo_row = _execute("SELECT algo FROM ml_models WHERE id = ?", (model_id,))
     algo = algo_row[0]["algo"] if algo_row else "lightgbm"
@@ -1146,7 +1387,7 @@ def search_lstm(
                     print(f"[{idx}/{total}] hidden={hidden_size} layers={num_layers} lr={lr} batch={batch_size}", flush=True)
                     try:
                         cell = "lstm" if algo == "lstm" else "gru"
-                        model = _SimpleSeqModel(
+                        model = RecurrentAlphaNet(
                             input_dim=158, seq_len=6, input_size=26,
                             hidden_size=hidden_size, num_layers=num_layers,
                             cell_type=cell,
@@ -1157,8 +1398,10 @@ def search_lstm(
                         valid_data = dataset.prepare("valid", col_set=["feature", "label"])
                         x_train, y_train = train_data["feature"], train_data["label"]
                         x_valid, y_valid = valid_data["feature"], valid_data["label"]
-                        if hasattr(y_train, "values"): y_train = y_train.squeeze() if y_train.ndim > 1 else y_train
-                        if hasattr(y_valid, "values"): y_valid = y_valid.squeeze() if y_valid.ndim > 1 else y_valid
+                        if hasattr(y_train, "values") and y_train.ndim > 1:
+                            y_train = y_train.squeeze()
+                        if hasattr(y_valid, "values") and y_valid.ndim > 1:
+                            y_valid = y_valid.squeeze()
                         model.fit(x_train, y_train, x_valid, y_valid, early_stop=early_stop)
                         ic = float(model.best_score)
                         results.append({
@@ -1173,7 +1416,7 @@ def search_lstm(
     results.sort(key=lambda r: r["ic"], reverse=True)
     print(f"\n{'='*60}")
     print(f"  搜索完成 {len(results)}/{total} 组合")
-    print(f"  Top3：")
+    print("  Top3：")
     for i, r in enumerate(results[:3]):
         print(f"  #{i+1}: hidden={r['hidden_size']} layers={r['num_layers']} "
               f"lr={r['lr']} batch={r['batch_size']}  IC={r['ic']:+.4f}")
@@ -1184,7 +1427,7 @@ def search_lstm(
         hs, nl, lr, bs = best["hidden_size"], best["num_layers"], best["lr"], best["batch_size"]
         best_step = best["epochs"]
         print(f"自动训练最佳参数: hidden={hs} layers={nl} lr={lr} batch={bs}  (搜索 best_step={best_step})", flush=True)
-        model = _SimpleSeqModel(
+        model = RecurrentAlphaNet(
             input_dim=158, seq_len=6, input_size=26,
             hidden_size=hs, num_layers=nl, cell_type="lstm" if algo == "lstm" else "gru",
             lr=lr, max_steps=best_step + 10, batch_size=bs, device=device,  # 不多跑，留 10 步余量
@@ -1194,8 +1437,10 @@ def search_lstm(
         valid_data = dataset.prepare("valid", col_set=["feature", "label"])
         x_tr, y_tr = train_data["feature"], train_data["label"]
         x_va, y_va = valid_data["feature"], valid_data["label"]
-        if hasattr(y_tr, "values"): y_tr = y_tr.squeeze() if y_tr.ndim > 1 else y_tr
-        if hasattr(y_va, "values"): y_va = y_va.squeeze() if y_va.ndim > 1 else y_va
+        if hasattr(y_tr, "values") and y_tr.ndim > 1:
+            y_tr = y_tr.squeeze()
+        if hasattr(y_va, "values") and y_va.ndim > 1:
+            y_va = y_va.squeeze()
         model.fit(x_tr, y_tr, x_va, y_va, early_stop=20)
         ic_full = float(model.best_score)
         print(f"\n全量训练完成: IC={ic_full:+.4f} (搜索阶段 IC={best['ic']:+.4f})", flush=True)

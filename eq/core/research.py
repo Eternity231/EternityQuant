@@ -19,8 +19,6 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-import pandas as pd
-
 from eq.data.market import detect_market, get_recent_bars, get_snapshot
 
 
@@ -104,7 +102,7 @@ def _h_financial(symbol: str, market: str) -> dict[str, Any]:
     try:
         df = ak.stock_individual_info_em(symbol=bare)
         # df 是两列 DataFrame：item / value
-        info = dict(zip(df.iloc[:, 0], df.iloc[:, 1].astype(str)))
+        info = dict(zip(df.iloc[:, 0], df.iloc[:, 1].astype(str), strict=False))
         return {"info": info}
     except Exception as e:
         return {"error": f"akshare stock_individual_info_em 失败：{repr(e)[:150]}"}
@@ -248,12 +246,30 @@ def _h_sector(symbol: str, market: str) -> dict[str, Any]:
         return {"hint": "板块归属仅 A 股有"}
     import akshare as ak
     bare = symbol.split(".")[0]
+    out: dict[str, Any] = {}
+    # 先查个股自身的行业归属（此前只返回了"全市场有多少个板块"，对个股研究没用）
     try:
-        df = ak.stock_board_industry_name_em()  # 行业板块列表
-        # 找本股所属行业（需要逐板块查 constituent，简化第一版只返回板块列表）
-        return {"industries_total": len(df), "hint": "个股所属板块明细建议调 vibe-trading MCP get_sector_info"}
+        info = ak.stock_individual_info_em(symbol=bare)
+        kv = dict(zip(info.iloc[:, 0], info.iloc[:, 1].astype(str), strict=False))
+        industry = kv.get("行业")
+        if industry:
+            out["industry"] = industry
+    except Exception:
+        pass
+    # 再补该行业当日的板块表现（涨跌幅/成交额），判断是不是板块整体在动
+    try:
+        boards = ak.stock_board_industry_name_em()
+        out["industries_total"] = len(boards)
+        if out.get("industry") is not None and "板块名称" in boards.columns:
+            row = boards[boards["板块名称"] == out["industry"]]
+            if not row.empty:
+                out["industry_today"] = row.iloc[0].to_dict()
     except Exception as e:
-        return {"error": f"akshare 板块失败：{repr(e)[:150]}"}
+        if not out:
+            return {"error": f"akshare 板块失败：{repr(e)[:150]}"}
+    if not out:
+        return {"hint": "未查到板块归属，可调 vibe-trading MCP get_sector_info 补全"}
+    return out
 
 
 def _h_profile(symbol: str, market: str) -> dict[str, Any]:

@@ -9,11 +9,41 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 from eq.core.python_dotenv_loader import DEFAULT_HOME
+
+# Python 3.12 起废弃了内置的 date/datetime 适配器与转换器（3.14 会持续告警）。
+# 这里显式注册自己的版本：行为与旧内置一致，但不再触发 DeprecationWarning，
+# 也不会在某天内置版被移除时把整个数据层带崩。
+sqlite3.register_adapter(dt.date, lambda d: d.isoformat())
+sqlite3.register_adapter(dt.datetime, lambda d: d.isoformat(sep=" "))
+
+
+def _convert_date(raw: bytes) -> dt.date:
+    return dt.date.fromisoformat(raw.decode())
+
+
+def _convert_timestamp(raw: bytes) -> dt.datetime:
+    text = raw.decode()
+    try:
+        return dt.datetime.fromisoformat(text)
+    except ValueError:
+        # SQLite CURRENT_TIMESTAMP 写的是 "YYYY-MM-DD HH:MM:SS"，
+        # 老数据里也可能混入带小数秒或纯日期的值，全部兜住。
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return dt.datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        raise
+
+
+sqlite3.register_converter("DATE", _convert_date)
+sqlite3.register_converter("TIMESTAMP", _convert_timestamp)
 
 _SCHEMA_STATE = """
 CREATE TABLE IF NOT EXISTS watchlist (
@@ -135,6 +165,29 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_enabled ON scheduled_jobs(enabled);
 
+-- 纸面交易日志（v0.32）：把策略每天的推荐记下来，到期后用真实行情结算，
+-- 和基准（沪深300）比超额。这是**前向的、样本外的**验证——回测可以过拟合，
+-- 但从记录之日起的表现没法作弊。
+CREATE TABLE IF NOT EXISTS paper_recos (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    reco_date       DATE    NOT NULL,              -- 推荐日（该日收盘价为入场价）
+    symbol          TEXT    NOT NULL,
+    strategy        TEXT    NOT NULL,
+    entry_price     REAL    NOT NULL,
+    horizon_days    INTEGER NOT NULL DEFAULT 10,   -- 持有多少个交易日后结算
+    benchmark       TEXT,                          -- 基准符号，如 000300.SH
+    benchmark_entry REAL,
+    status          TEXT    NOT NULL DEFAULT 'open',  -- open / closed
+    exit_date       DATE,
+    exit_price      REAL,
+    benchmark_exit  REAL,
+    note            TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(reco_date, symbol, strategy)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_recos(status);
+
 CREATE TABLE IF NOT EXISTS backtest_runs (
     id            TEXT    PRIMARY KEY,                  -- UUID
     symbol        TEXT    NOT NULL,
@@ -162,6 +215,18 @@ CREATE TABLE IF NOT EXISTS bar_cache (
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (symbol, date)
 );
+
+CREATE INDEX IF NOT EXISTS idx_bar_cache_symbol ON bar_cache(symbol);
+
+-- 每只标的最近一次「真的走了网络」的时间，用于 TTL 判断：
+-- 缓存里已有区间数据时，TTL 未过期就不再打网络。
+CREATE TABLE IF NOT EXISTS cache_meta (
+    symbol      TEXT PRIMARY KEY,
+    fetched_at  TIMESTAMP,
+    first_date  DATE,
+    last_date   DATE,
+    rows        INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -172,20 +237,48 @@ def _home_dir() -> Path:
     return DEFAULT_HOME
 
 
+class _Conn(sqlite3.Connection):
+    """sqlite3.Connection 但 ``with`` 退出时 **关闭** 连接。
+
+    标准 ``sqlite3.Connection`` 的上下文管理器只负责 commit/rollback，
+    **不关闭连接**。本项目所有数据访问都写成 ``with get_state_conn() as conn:``，
+    用原生连接会导致每次 CRUD 泄漏一个连接 + 文件句柄（长跑 daemon / Streamlit
+    会话下最终 "too many open files" 或 Windows 上的文件占用）。
+    """
+
+    def __exit__(self, exc_type, exc_val, exc_tb):  # type: ignore[override]
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self.close()
+
+
+# 已建过表的库文件（进程内记忆）。executescript 幂等但有开销，
+# 每次 CRUD 都跑一遍 20+ 条 DDL 会让批量写入慢一个数量级。
+_SCHEMA_DONE: set[str] = set()
+
+
 def _connect(name: str) -> sqlite3.Connection:
     """Open a connection to one of the two SQLite files and ensure schema."""
     path = _home_dir() / name
-    conn = sqlite3.connect(path, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn = sqlite3.connect(
+        path, detect_types=sqlite3.PARSE_DECLTYPES, timeout=30.0, factory=_Conn
+    )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    schema = _SCHEMA_STATE if name == "eternityquant.db" else _SCHEMA_CACHE
-    conn.executescript(schema)
-    conn.commit()
+    key = str(path)
+    if key not in _SCHEMA_DONE:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(_SCHEMA_STATE if name == "eternityquant.db" else _SCHEMA_CACHE)
+        conn.commit()
+        _SCHEMA_DONE.add(key)
     return conn
 
 
 def get_state_conn() -> sqlite3.Connection:
-    """Connection to the state database (watchlist/portfolio/rules/...)."""
+    """Connection to the state database (watchlist/portfolio/rules/...)。
+
+    用作上下文管理器时（``with get_state_conn() as conn:``）退出会提交并关闭。
+    """
     return _connect("eternityquant.db")
 
 
@@ -206,3 +299,13 @@ def execute_write(query: str, params: tuple[Any, ...] = ()) -> int:
         cur = conn.execute(query, params)
         conn.commit()
         return cur.lastrowid
+
+
+def execute_many(query: str, seq_of_params: list[tuple[Any, ...]]) -> int:
+    """批量写状态库（一个事务），返回受影响行数。"""
+    if not seq_of_params:
+        return 0
+    with get_state_conn() as conn:
+        cur = conn.executemany(query, seq_of_params)
+        conn.commit()
+        return cur.rowcount

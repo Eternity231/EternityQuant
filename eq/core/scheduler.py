@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import threading
 from typing import Any
 
@@ -112,7 +111,7 @@ def list_jobs(enabled_only: bool = False) -> list[dict[str, Any]]:
     rows = execute(q)
     out = []
     for r in rows:
-        d = {k: r[k] for k in r.keys()}
+        d = dict(r)
         d["params"] = json.loads(d["params"] or "{}")
         d["channels"] = json.loads(d["channels"] or "[]")
         out.append(d)

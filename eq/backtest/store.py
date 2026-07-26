@@ -76,7 +76,7 @@ def list_runs(symbol: str | None = None, limit: int = 20) -> list[dict[str, Any]
     rows = execute(q, params)
     out = []
     for r in rows:
-        d = {k: r[k] for k in r.keys()}
+        d = dict(r)
         d["metrics"] = json.loads(d["metrics"] or "{}")
         out.append(d)
     return out
@@ -87,7 +87,7 @@ def load_result(run_id: str) -> dict[str, Any]:
     rows = execute("SELECT * FROM backtest_runs WHERE id = ?", (run_id,))
     if not rows:
         raise KeyError(f"回测记录 {run_id} 不存在")
-    meta = {k: rows[0][k] for k in rows[0].keys()}
+    meta = dict(rows[0])
     meta["config"] = json.loads(meta["config"] or "{}")
     meta["metrics"] = json.loads(meta["metrics"] or "{}")
     artifact = Path(meta["artifact_path"])

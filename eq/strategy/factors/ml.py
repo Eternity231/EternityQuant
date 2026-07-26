@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import sqlite3
 from typing import Any
 
 import pandas as pd
@@ -106,7 +105,7 @@ def list_models(universe: str | None = None) -> list[dict[str, Any]]:
     rows = execute(q, params)
     out = []
     for r in rows:
-        d = {k: r[k] for k in r.keys()}
+        d = dict(r)
         d["metrics"] = json.loads(d["metrics"] or "{}")
         out.append(d)
     return out

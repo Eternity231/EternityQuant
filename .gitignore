@@ -36,3 +36,6 @@ skills/
 # qlib/MLflow 训练元数据（每次训练产生，不进仓库）
 mlruns/
 .qlib/
+
+# 数据源自检结果（每台机器不同，不该进版本库）
+.eternityquant/source_health.json

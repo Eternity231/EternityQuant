@@ -86,7 +86,7 @@ class DeepLOB(nn.Module):
         # 输入: (B, 1, seq_len, input_dim)  →  Conv2d 处理
         in_channels = 1
         conv_layers = []
-        for i, out_c in enumerate(conv_filters):
+        for out_c in conv_filters:
             conv_layers.extend([
                 nn.Conv2d(in_channels, out_c, kernel_size=(1, 2), padding=(0, 1)),
                 nn.BatchNorm2d(out_c),
@@ -1092,7 +1092,7 @@ def adversarial_train_step(
 # 第 7 部分：高级训练器（集成所有技术）
 # =============================================================================
 
-class AdvancedTrainer:
+class DeepAlphaTrainer:
     """高级训练器 — 整合 DeepLOB/TFT + 高级优化器 + 可微夏普比率 + 对抗训练。
 
     用法:
@@ -1135,7 +1135,12 @@ class AdvancedTrainer:
         device: str = "cuda",
         gpu_ids: str | list[int] | None = None,  # 多卡: "0,1,2,3" 或 [0,1,2,3]
         verbose: bool = True,
+        seed: int | None = None,
     ):
+        if seed is not None:
+            from eq.strategy.factors.validation import set_seed
+            set_seed(seed)
+        self.seed = seed
         self.model = model
         self.optimizer_type = optimizer_type
         self.learning_rate = learning_rate
@@ -1341,14 +1346,20 @@ class AdvancedTrainer:
                 if self.orthogonalize:
                     xv_input = feature_orthogonalize_tensor(xv)
                 vp = self.model(xv_input)
-                if len(vp) >= 2 and vp.std().item() > 0 and yv.std().item() > 0:
-                    cov = torch.cov(torch.stack([vp, yv]))[0, 1]
-                    score = cov / (vp.std().item() * yv.std().item())
+                # 输出塌缩成常数（std=0）时**不能**记 -inf：那样 best_score 永远
+                # 不会更新，best_state 一直是 None，训练结束时 _load_raw_state_dict
+                # 根本不会被调用——返回的是一个从未被选中过的模型。
+                # 记 0（中性）让训练能继续推进，塌缩问题由 IC 恒为 0 显式暴露。
+                # （同样的坑此前已在 RecurrentAlphaNet 修过，这里是漏网的一处。）
+                vp_std, yv_std = vp.std().item(), yv.std().item()
+                if len(vp) >= 2 and yv_std > 0:
+                    cov = torch.cov(torch.stack([vp, yv]))[0, 1].item()
+                    score = float(cov / (vp_std * yv_std + 1e-8))
                 else:
-                    score = -float("inf")
+                    score = 0.0
 
             # 调度器
-            if self.scheduler is not None and score != -float("inf"):
+            if self.scheduler is not None:
                 if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step(score)
                 else:
@@ -1404,3 +1415,6 @@ class AdvancedTrainer:
                 xt = feature_orthogonalize_tensor(xt)
             pred = self._raw_model(xt)
             return pred.cpu().numpy()
+
+# 向后兼容别名（理由同 ml_workflow：pickle 记的是类名）
+AdvancedTrainer = DeepAlphaTrainer
