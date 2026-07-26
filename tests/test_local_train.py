@@ -358,7 +358,8 @@ def test_diagnosis_catches_collapse(tmp_db, patched):
 def test_factor_scan_shape(patched):
     df = lt.factor_scan([f"S{i:02d}" for i in range(20)], top_k=8)
     assert len(df) == 8
-    assert list(df.columns) == ["factor", "ic", "icir", "t_stat", "win_rate", "n_days"]
+    assert list(df.columns) == ["factor", "ic", "icir", "t_stat", "t_nw",
+                               "win_rate", "n_days"]
     assert df["factor"].nunique() == 8
 
 
@@ -438,3 +439,69 @@ def test_baseline_flips_negative_factors(patched, monkeypatch):
     # 只要选出的因子里有负 IC 的，就说明反向逻辑被触发过
     if (r["singles"]["valid_ic"] < 0).any():
         assert r["composite"]["n_days"] > 0
+
+
+# ---------- 向量化 IC 矩阵（v0.41.1） ----------
+
+def test_ic_matrix_matches_reference_daily_ic(fake_bars):
+    """向量化实现必须和逐列 spearman 逐位一致——这是替换的前提。"""
+    from eq.strategy.factors.evaluation import daily_ic
+
+    x, y = lt.build_dataset(fake_bars, horizon=5)
+    keep = x.notna().all(axis=1) & y.notna()
+    xs, ys = x[keep], y[keep]
+    m = lt.daily_ic_matrix(xs, ys)
+    for col in ("MA20", "RSQR20", "CORR60", "KMID"):
+        ref = daily_ic(xs[col], ys)
+        got = m[col].reindex(ref.index).dropna()
+        assert (got - ref.reindex(got.index)).abs().max() < 1e-12, col
+
+
+def test_ic_matrix_shape_and_index(fake_bars):
+    x, y = lt.build_dataset(fake_bars, horizon=5)
+    m = lt.daily_ic_matrix(x, y)
+    assert m.shape[1] == 158
+    assert m.index.is_monotonic_increasing
+
+
+def test_ic_matrix_empty_input():
+    empty = pd.DataFrame(columns=["a"], dtype=float)
+    assert lt.daily_ic_matrix(empty, pd.Series(dtype=float)).empty
+
+
+def test_ic_matrix_rejects_missing_date_level():
+    """没有 datetime 索引层就算不出「横截面」IC——要直接报错，不能悄悄给个数。"""
+    x = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+    with pytest.raises(ValueError, match="datetime 索引层"):
+        lt.daily_ic_matrix(x, pd.Series([1.0, 2.0, 3.0]))
+
+
+def test_summarize_reports_both_t_values(fake_bars):
+    """t_stat 和 t_nw 都要有，且 horizon>1 时两者必须不同。"""
+    x, y = lt.build_dataset(fake_bars, horizon=5)
+    m = lt.daily_ic_matrix(x, y)
+    s1 = lt.summarize_ic_matrix(m, horizon=1)
+    s5 = lt.summarize_ic_matrix(m, horizon=5)
+    assert set(s5.columns) == {"factor", "ic", "icir", "t_stat", "t_nw",
+                               "win_rate", "n_days"}
+    import numpy as np
+    assert np.allclose(s1["t_stat"], s5["t_stat"]), "普通 t 不随 horizon 变"
+    assert not np.allclose(s1["t_nw"], s5["t_nw"]), "修正 t 必须随 horizon 变"
+
+
+def test_factor_scan_emits_t_nw(patched):
+    """回归：t_nw 曾经只加在空表分支上，非空分支漏了，CLI 直接 KeyError。
+
+    根因是我用 str.replace 改代码但没断言匹配成功——静默 no-op，
+    而当时的用例断言的是旧列名，所以也没拦住。
+    """
+    df = lt.factor_scan([f"S{i:02d}" for i in range(20)], top_k=3)
+    assert "t_nw" in df.columns and df["t_nw"].notna().all()
+
+
+def test_factor_scan_empty_and_nonempty_have_same_columns(patched, monkeypatch):
+    """空表分支和正常分支必须返回同样的列——之前它们不一致。"""
+    normal = lt.factor_scan([f"S{i:02d}" for i in range(20)], top_k=3)
+    monkeypatch.setattr(lt, "daily_ic_matrix", lambda *a, **k: pd.DataFrame())
+    empty = lt.factor_scan([f"S{i:02d}" for i in range(20)], top_k=3)
+    assert list(normal.columns) == list(empty.columns)

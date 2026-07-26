@@ -384,7 +384,6 @@ def factor_scan(
         扣掉了重叠标签造成的自相关——**该看的是它，不是 t_stat**。
         IC 为负的因子反向用同样有效，所以排序看绝对值，``ic`` 列保留原始符号。
     """
-    from eq.strategy.factors.evaluation import evaluate
 
     embargo = horizon if embargo_days is None else int(embargo_days)
     bars = load_bars(symbols, days=days)
@@ -397,25 +396,92 @@ def factor_scan(
     x_t, y_t = x[mask], y[mask]
     logger.info("单因子扫描：%d 个因子 × %d 条测试样本", x_t.shape[1], len(y_t))
 
-    rows = []
-    for col in x_t.columns:
-        f = x_t[col]
-        if f.notna().sum() < 100 or f.nunique() < 2:
-            continue
-        try:
-            rep = evaluate(f, y_t, horizon=horizon)
-        except Exception as e:
-            logger.debug("因子 %s 评估失败：%s", col, e)
-            continue
-        rows.append({"factor": col, "ic": rep["ic_mean"], "icir": rep["icir"],
-                     "t_stat": rep["t_stat"], "win_rate": rep["ic_win_rate"],
-                     "n_days": rep["n_days"]})
-    if not rows:
+    df = daily_ic_matrix(x_t, y_t)
+    if df.empty:
         return pd.DataFrame(columns=["factor", "ic", "icir", "t_stat", "t_nw",
                                      "win_rate", "n_days"])
-    df = pd.DataFrame(rows)
-    return (df.reindex(df["ic"].abs().sort_values(ascending=False).index)
+    stats = summarize_ic_matrix(df, horizon=horizon)
+    return (stats.reindex(stats["ic"].abs().sort_values(ascending=False).index)
             .head(top_k).reset_index(drop=True))
+
+
+def daily_ic_matrix(x: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+    """一次算出**所有因子**的每日横截面 Rank IC，返回 ``日期 × 因子`` 矩阵。
+
+    改之前是 158 个因子各调一次 :func:`evaluation.evaluate`，而 ``evaluate``
+    每次要跑三遍数据（Rank IC + 分层收益 + Pearson IC），每遍都按日 groupby。
+    300 只票的实测规模上要跑十几分钟，用户等到以为卡死了。
+
+    这里只算需要的那一样，并且把 158 列一起做：
+
+    - ``groupby(日期).rank()`` 一次把整张表按日排名（158 列同时）
+    - 逐日去均值后，Rank IC = 中心化秩的相关，可以写成几个 groupby 求和
+
+    数值上和逐列跑 ``spearman`` 一致，但快两个数量级。
+
+    **缺失值处理**：只保留特征全非空的行（Alpha158 前 60 根是暖机期，
+    必然有 NaN）。保留比例会打日志——比例过低说明历史长度不够。
+    """
+    if len(x) == 0 or len(y) == 0 or x.shape[1] == 0:
+        return pd.DataFrame()
+    if "datetime" not in (x.index.names or []):
+        # 没有日期层就算不了「横截面」IC，这是调用方丢了索引，直接说清楚
+        raise ValueError("特征面板缺少 datetime 索引层，无法计算横截面 IC")
+    dates = x.index.get_level_values("datetime")
+    keep = x.notna().all(axis=1) & y.notna()
+    if keep.sum() == 0:
+        return pd.DataFrame()
+    if keep.mean() < 0.99:
+        logger.info("单因子扫描保留 %.1f%% 的行（其余含 NaN，多为暖机期）",
+                    keep.mean() * 100)
+    xs, ys, ds = x[keep], y[keep], dates[keep]
+
+    # 每天至少要有这么多只票才算得出有意义的横截面相关
+    from eq.strategy.factors.evaluation import MIN_STOCKS_PER_DAY
+
+    counts = ys.groupby(ds).transform("size")
+    ok = counts >= MIN_STOCKS_PER_DAY
+    xs, ys, ds = xs[ok.to_numpy()], ys[ok.to_numpy()], ds[ok.to_numpy()]
+    if len(ys) == 0:
+        return pd.DataFrame()
+
+    g = ds.to_numpy()
+    rx = xs.groupby(g).rank()
+    ry = ys.groupby(g).rank()
+    cx = rx - rx.groupby(g).transform("mean")
+    cy = ry - ry.groupby(g).transform("mean")
+
+    num = cx.mul(cy, axis=0).groupby(g).sum()
+    sxx = (cx * cx).groupby(g).sum()
+    syy = (cy * cy).groupby(g).sum()
+    den = np.sqrt(sxx.mul(syy, axis=0))
+    ic = num / den.replace(0, np.nan)
+    # 当日预测或标签无区分度（分母 0）时记 0（中性），和 daily_ic 的口径一致
+    return ic.fillna(0.0)
+
+
+def summarize_ic_matrix(ic: pd.DataFrame, horizon: int = 1) -> pd.DataFrame:
+    """把 ``日期 × 因子`` 的 IC 矩阵汇总成每因子一行的指标表。
+
+    ``t_nw`` 是 Newey-West 修正后的 t 值（滞后阶 ``horizon-1``），
+    扣掉重叠标签造成的自相关——**该看的是它，不是 t_stat**。
+    """
+    from eq.strategy.factors.evaluation import _newey_west_t
+
+    n = len(ic)
+    mean = ic.mean()
+    std = ic.std(ddof=1) if n > 1 else pd.Series(0.0, index=ic.columns)
+    std = std.where(std >= 1e-12, 0.0)
+    icir = (mean / std).where(std > 0, 0.0)
+    return pd.DataFrame({
+        "factor": ic.columns,
+        "ic": mean.to_numpy(),
+        "icir": icir.to_numpy(),
+        "t_stat": (icir * np.sqrt(n)).where(std > 0, 0.0).to_numpy(),
+        "t_nw": [_newey_west_t(ic[c].dropna(), horizon) for c in ic.columns],
+        "win_rate": (ic > 0).mean().to_numpy(),
+        "n_days": n,
+    })
 
 
 def baseline_composite(
@@ -459,22 +525,17 @@ def baseline_composite(
     x_v, y_v = x[split.valid], y[split.valid]
     x_t, y_t = x[split.test], y[split.test]
 
-    # 1) 在验证段给每个因子打分（选择只用验证段，测试段完全不参与）
-    scored = []
-    for col in x_v.columns:
-        f = x_v[col]
-        if f.notna().sum() < 100 or f.nunique() < 2:
-            continue
-        try:
-            ic = float(evaluate(f, y_v, horizon=horizon)["ic_mean"])
-        except Exception:
-            continue
-        if ic == ic:
-            scored.append((col, ic))
-    if not scored:
+    # 1) 在验证段给每个因子打分（选择只用验证段，测试段完全不参与）。
+    #    走 daily_ic_matrix 一次算完 158 列——逐列调 evaluate 在 300 只票的
+    #    规模上要几分钟，而这里只需要 IC 均值。
+    ic_v = daily_ic_matrix(x_v, y_v)
+    if ic_v.empty:
         raise ValueError("验证段上没有可用因子")
-    scored.sort(key=lambda kv: abs(kv[1]), reverse=True)
-    picked = scored[:top_k]
+    means = ic_v.mean().dropna()
+    if means.empty:
+        raise ValueError("验证段上没有可用因子")
+    picked = [(c, float(means[c]))
+              for c in means.abs().sort_values(ascending=False).index[:top_k]]
 
     # 2) 按验证段 IC 的符号取向，逐因子做截面 rank 归一化后等权相加。
     #    先归一化再相加是必须的：158 个因子的量纲天差地别，

@@ -1302,6 +1302,28 @@ eq ml factor-scan --from A --top 300
 Bonferroni 校正后排第一的那个要 `|t| > 3.6` 才谈得上显著。这个命令是给模型当参照物的，
 不是用来挖因子的。
 
+### factor-scan 慢到以为卡死（v0.41.1 修）
+
+300 只票跑 `factor-scan` 要十几分钟才出结果。原因是 158 个因子各调一次
+`evaluate()`，而 `evaluate` 每次要跑三遍数据（Rank IC + 分层收益 + Pearson IC），
+每遍都按日 groupby。
+
+改成一次算完整张 `日期 x 因子` 的 IC 矩阵：`groupby(日期).rank()` 把 158 列同时
+排名，逐日去均值后 Rank IC = 中心化秩的相关，写成几个 groupby 求和。
+实测 **422 秒 -> 1.45 秒（约 290 倍）**，数值和逐列 spearman 差 1.11e-16（机器精度）。
+
+`baseline` 的因子选择也走同一条路。
+
+### 一个自己造的 KeyError（v0.41.1 修）
+
+`factor-scan` 直接崩在 `KeyError: 't_nw'`：CLI 要显示这一列，但 `factor_scan`
+的 `rows.append` 里根本没加。根因是我用 `str.replace` 改代码却**没断言匹配成功**
+——不匹配时它静默 no-op。更糟的是空表分支加了这列、非空分支没加，
+同一个函数返回两种 schema。
+
+而当时的用例断言的是**旧列名**，所以它"通过"了，没拦住。现在加了三条：
+`t_nw` 必须存在且非空、空表与非空分支列名必须一致、向量化实现与逐列 spearman 必须逐位一致。
+
 ### 重叠标签让 t 值虚高（v0.41 修）
 
 `horizon=5` 的标签是 `close[t+5]/close[t]-1`，**相邻交易日的标签共用 4 天行情**。
