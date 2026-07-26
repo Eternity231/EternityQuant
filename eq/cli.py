@@ -1788,6 +1788,62 @@ def ml_train(
     typer.echo(f"  用 `eq ml activate {result['model_id']}` 激活，再 `eq ml predict-batch` 批量预测")
 
 
+@ml_app.command("train-local",
+                help="训练（不用 qlib）：本地 Alpha158 特征，直接吃 eq data 下的行情缓存")
+def ml_train_local(
+    source: str = typer.Option("watchlist", "--from", "-f",
+                               help="标的来源：watchlist|portfolio|both|csi300 等预设|逗号分隔代码"),
+    algo: str = typer.Option("lightgbm", "--algo", "-a", help="lightgbm | mlp | gru | lstm"),
+    horizon: int = typer.Option(5, "--horizon", "-h", help="预测窗口（交易日）"),
+    days: int = typer.Option(1200, "--days", "-d", help="每只拉多少根日线"),
+    device: str = typer.Option("cpu", "--device", help="cpu | gpu（LightGBM）| cuda（torch）"),
+    seed: int = typer.Option(42, "--seed", help="随机种子"),
+    seeds: int = typer.Option(1, "--seeds", help="多种子集成，跑 N 次取平均"),
+    test_ratio: float = typer.Option(0.15, "--test-ratio", help="独立测试段占比，0=不切"),
+    embargo: int = typer.Option(-1, "--embargo",
+                                help="段间 purge 的交易日数，-1=自动取 horizon"),
+    label: str = typer.Option("rank", "--label", help="标签归一化：rank | zscore | none"),
+    name: str = typer.Option("", "--name", "-n", help="模型名"),
+):
+    """和 `eq ml train` 的区别只有数据从哪来：这条路完全不碰 qlib。"""
+    from eq.strategy.factors.local_train import train_local
+
+    try:
+        symbols, label_txt = _resolve_symbols(source)
+    except Exception as e:
+        typer.echo(f"标的解析失败：{e}", err=True)
+        raise typer.Exit(1) from e
+    if not symbols:
+        typer.echo(f"候选池为空（{source}），先 eq watchlist add 加几只", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"\n本地训练（无 qlib）：{label_txt} {len(symbols)} 只  algo={algo}  "
+               f"horizon={horizon}d  seeds={seeds}")
+    try:
+        r = train_local(
+            symbols, algo=algo, horizon=horizon, days=days, device=device,
+            seed=seed, n_seeds=seeds, test_ratio=test_ratio,
+            embargo_days=(None if embargo < 0 else embargo),
+            label_norm=label, name=name or None, universe_label=source,
+        )
+    except Exception as e:
+        typer.echo(f"训练失败：{e}", err=True)
+        raise typer.Exit(1) from e
+
+    m = r["metrics"]
+    typer.echo(f"\n模型 {r['model_id']}")
+    typer.echo(f"  标的 {r['n_symbols']} 只  样本 {r['n_samples']:,}  切分 {m['sizes']}")
+    typer.echo(f"  valid IC {m['valid_ic']:+.4f}"
+               + (f"   **test IC {m['ic']:+.4f}**（这个才是真成绩）" if m.get("test")
+                  else "   （无独立测试段，valid IC 偏乐观）"))
+    if m.get("test"):
+        t = m["test"]
+        typer.echo(f"  test ICIR {t.get('icir', 0):+.3f}  t 值 {t.get('t_stat', 0):+.2f}"
+                   f"  胜率 {t.get('ic_win_rate', 0):.0%}")
+    typer.echo(f"  存盘 {r['model_path']}")
+    typer.echo(f"  用 `eq ml activate {r['model_id']}` 激活")
+
+
 @ml_app.command("predict-batch", help="用激活模型批量预测全 universe，写入 ml_predictions 表")
 def ml_predict_batch(
     model_id: str = typer.Argument(help="模型 id"),

@@ -133,6 +133,7 @@ eq --help                               # 看所有命令
 | `eq paper` | 纸面战绩：前向推荐 vs 基准的超额 t 检验 | v0.32 |
 | `eq ml train/activate/list/info/predict/predict-batch/update-data` | ML 因子（LightGBM + PyTorch + 数据更新） | v0.6~v0.15 |
 | `eq data a/hk/hk-5min/hk-1min/us/all` | 统一数据收集（A股/港股日线/分钟线/美股） | v0.19 |
+| `eq ml train-local` | 训练（不用 qlib）：本地 Alpha158 + 项目自己的行情缓存 | v0.39 |
 | `eq dash` | Streamlit 9 页看板 | v0.1/v0.11/v0.24/v0.33 |
 | `eq theme <图片>` | 看板换肤：自动取色 + 背景图 + 侧栏看板娘 | v0.33 |
 
@@ -1232,60 +1233,70 @@ eq dash --no-theme                   # 本次禁用主题（排查显示问题�
 sqlite3 date/timestamp 适配器显式注册（消除 Python 3.12+ 废弃告警）；
 Streamlit `use_container_width` → `width="stretch"`（旧参数已过移除期）。
 
-## 脱离 qlib：第一步（v0.38）
+## 脱离 qlib（v0.38 第一步 / v0.39 第二步）
 
 qlib 在本项目里贴了 5 个 monkey patch 绕它的 bug（ReduceLROnPlateau 的版本号
 字符串比较 `'2.13.0' <= '2.6.0'` 字典序为真、issue #1949 的位置参数重复传值、
-`Corr._load_internal` 空序列崩溃、`provider_uri` 必须是 dict）。v0.38 把便宜的
-部分全部接管过来，qlib 从「贯穿全项目」缩成**一个 Alpha158/360 特征计算器**。
+`Corr._load_internal` 空序列崩溃、`provider_uri` 必须是 dict）。两步做完之后，
+**存在一条完全不碰 qlib 的训练链路**。
 
-| 原来由 qlib 提供 | v0.38 | 位置 |
+```bash
+eq ml train-local --from watchlist --algo lightgbm --seeds 3
+```
+
+这条命令从 `eq data a` 下下来的行情缓存直接出模型，全程不 import qlib。
+
+| 原来由 qlib 提供 | 现在 | 位置 |
 |---|---|---|
-| `contrib.model.LGBModel` | 原生 lightgbm | `factors/gbdt.py` |
-| `contrib.model.ALSTM/GRU/LSTM/DNNModelPytorch` | **删除**（早就是死代码） | — |
-| 5 个处理器（RobustZScoreNorm / CSRankNorm / …） | 自写 | `factors/preprocess.py` |
-| ReduceLROnPlateau 补丁 | **删除**（只为 qlib 原生模型存在） | — |
-| **Alpha158 / Alpha360 特征** | 仍用 qlib | 第二步再说 |
+| `contrib.model.LGBModel` | 原生 lightgbm | `factors/gbdt.py`（v0.38）|
+| `contrib.model.ALSTM/GRU/LSTM/DNN` | **删除**（早就是死代码） | —（v0.38）|
+| 5 个处理器 | 自写 | `factors/preprocess.py`（v0.38）|
+| ReduceLROnPlateau 补丁 | **删除** | —（v0.38）|
+| **Alpha158 特征** | 自写 158 个 | `factors/alpha.py`（v0.39）|
+| **数据层（.bin + 表达式引擎）** | 直接吃项目的行情缓存 | `factors/local_train.py`（v0.39）|
 
-### 接管的收益不只是少个依赖
+老的 `eq ml train` 仍然走 qlib，两条路共用切分/预处理/模型/评估/集成/注册，
+所以成绩可以直接比——比的是特征实现，不是别的东西。
 
-**能测了。** qlib 的处理器要跑起来得先有 qlib + 一整套 .bin 数据，边界行为
-（全 NaN 列、单股票截面、MAD=0 的常数列）从来没验证过。接管后是纯 pandas，
-`tests/test_preprocess.py` 26 例、`tests/test_gbdt.py` 14 例全部真跑。
+### 自写 Alpha158 的验证方式
 
-**fit 窗口从隐式变显式。** 归一化统计量必须只用训练段拟合，否则验证/测试段的
-分布信息会顺着中位数和 MAD 漏进训练。以前这藏在 handler 的 `fit_start_time`
-参数里看不见，现在 `Pipeline.fit()` 收什么就是拟合什么，还有一条专门的
-反证用例（全样本 fit 会给出不同的统计量）。
+没装 qlib、也没有 .bin 数据，所以**不是**和 qlib 逐位对拍，而是验证性质：
 
-### 顺带修的两个东西
+- **无前视**（最关键）：在序列尾部追加或篡改未来数据，已有行的特征值必须一字不变
+- **算子正确**：等差数列上 MA/BETA/RSQR/RESI 都有闭式解，直接手算比对
+- **尺度不变**：价格和成交量整体放大 1000 倍，特征值不变
+  （这是「5 元的票和 500 元的票能否放进同一截面」的前提）
+- **边界不炸**：停牌零成交量、一字板常数序列、超短历史
 
-- **rank 归一化没有精确居中**：qlib 的 `rank(pct=True) - 0.5` 残留 `+1/(2n)`
-  的偏移（n=30 时是 +0.058），于是「当天有多少只票」被编码进了因子值，
-  变成纯粹由样本量制造的跨日水平差。改用 `(rank-(n+1)/2)/n`，对任意 n 严格居中。
-- **预测路径的 lightgbm 分支已经坏了**：它调的是 qlib LGBModel 的
-  `predict(dataset, segment=)` 签名，换成原生 lightgbm 后只接一个位置参数，
-  那条路会直接 TypeError。两个分支的后处理本来一模一样，合并掉。
+想和 qlib 对拍就在装了 qlib 的机器上跑 `alpha.compare_with_qlib(symbol, start, end)`，
+它逐特征报最大绝对差。
 
-### 没验证的部分（重要）
+**已知有意不同**：`IMAX/IMIN` 返回的是「距最高/最低点过去了几天」（今天创新高＝0），
+按 Alpha158 自己的文字描述实现；qlib 内部用的是 argmax 原始下标还是回溯距离未经确认。
 
-本机**没装 qlib、qlib 数据目录是空的**，所以：
+### 顺带修的几个问题
 
-- `preprocess.py` 是照 qlib 处理器的**语义**写的，没做过逐位对拍。
-  装了 qlib 的机器上跑 `preprocess.compare_with_qlib(features)` 可以比对。
-- 改动过的 `train()` / `predict_batch()` 里**碰 qlib handler 的那几行没跑过**。
-  自写部分（preprocess / gbdt / 集成 / 评估）全部有测试覆盖。
-- 项目当前已注册模型数为 0，所以数值口径变化不存在新旧模型可比性问题。
+- **rank 归一化没精确居中**（v0.38）：qlib 的 `rank(pct=True) - 0.5` 残留 `+1/(2n)`
+  偏移（n=30 时 +0.058），等于把「当天有多少只票」编码进因子值，制造出纯粹由
+  样本量产生的跨日水平差。改用 `(rank-(n+1)/2)/n`。
+- **预测路径的 lightgbm 分支已经坏了**（v0.38）：调的是 qlib LGBModel 的
+  `predict(dataset, segment=)` 签名，换原生 lightgbm 后会直接 TypeError。
+- **fit 窗口从隐式变显式**（v0.38）：归一化统计量只能用训练段拟合，
+  以前藏在 handler 的 `fit_start_time` 里看不见。
 
-### 第二步（未做）：自写 Alpha158
+### 还没验证的部分
 
-Alpha158 不是 158 个手写公式，是约 30 个滚动算子模板 × 5 个窗口生成的
-（ROC / MA / STD / MAX / MIN / QTLU / RANK / CORR / CNTP / SUMP / VMA / WVMA…），
-本质是 pandas rolling 的批量套用，和已有的 `technical.py` 是同一个套路。
-做完就能把 qlib 从依赖里彻底移除（数据层的 `.bin` 读写本来就是本项目自己的代码）。
+- `preprocess.py` / `alpha.py` 是照 qlib 的**语义**实现的，没做逐位对拍。
+- 老的 `eq ml train`（走 qlib handler）那几行在本机跑不了，改动未经端到端验证。
+  新的 `eq ml train-local` 有 19 个用例覆盖，其中一条专门把 qlib 变成不可 import
+  来确认整条链路真的不依赖它。
+- 项目当前已注册模型数为 0，数值口径变化不存在新旧可比性问题。
 
-**前提**：必须验证自写版和 qlib 版在同一份数据上算出的因子值一致，
-否则历史训练结果全部不可比。这需要先把 qlib 数据拉回来。
+### 要彻底删掉 qlib 依赖还差什么
+
+`eq ml train` / `predict-batch` / `update-data` 这几条老路仍然用 qlib 的 .bin。
+如果 `train-local` 用下来没问题，可以把老路一起摘掉、`.bin` 数据也不用维护了。
+建议先两条路并行跑一段，比较 test IC 之后再决定。
 
 ## 事件因子（v0.37）
 
