@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 _MIN_UNIVERSE = 30
 
 __all__ = ["load_bars", "build_dataset", "train_local",
-           "load_local_model", "predict_local"]
+           "load_local_model", "predict_local", "factor_scan"]
 
 
 def load_bars(symbols: list[str], days: int = 1200, workers: int = 8,
@@ -345,3 +345,72 @@ def predict_local(
             )
     scored.attrs["date"] = target.date().isoformat()
     return scored
+
+
+# ======================================================================
+# 单因子基准扫描
+# ======================================================================
+
+def factor_scan(
+    symbols: list[str],
+    *,
+    horizon: int = 5,
+    days: int = 1200,
+    test_ratio: float = 0.15,
+    valid_ratio: float = 0.15,
+    embargo_days: int | None = None,
+    top_k: int = 15,
+) -> pd.DataFrame:
+    """在**和模型完全相同的测试段**上，逐个评估 158 个单因子。
+
+    这是训练结果唯一有意义的参照物。模型 test IC 报出来 +0.011 时，
+    单看这个数没法判断——它可能意味着两件完全不同的事：
+
+    - 最好的单因子也只有 0.01 → 这段行情/这批票就是难，模型没做错什么
+    - 有单因子能到 0.05 → 158 维模型跑输一个不用训练的公式，管线有问题
+
+    不训练、不调参，纯算截面 Rank IC，所以很快。
+
+    **多重检验警告**：这是从 158 个因子里挑最大值，不是单次检验。零假设下
+    扫 158 个因子，最大 |t| 本来就期望在 3 附近——在纯随机数据上实测能挑出
+    ``t=4.85`` 的"因子"。Bonferroni 校正（α=0.05/158）后，**排第一的那个**
+    要 ``|t| > 3.6`` 才谈得上显著。这个函数的用途是给模型成绩当**参照物**，
+    不是用来挖因子的。
+
+    Returns:
+        按 |IC| 降序的前 ``top_k`` 行，列：``factor / ic / icir / t_stat /
+        win_rate / n_days``。IC 为负的因子反向用同样有效，所以排序看绝对值，
+        ``ic`` 列保留原始符号。
+    """
+    from eq.strategy.factors.evaluation import evaluate
+
+    embargo = horizon if embargo_days is None else int(embargo_days)
+    bars = load_bars(symbols, days=days)
+    if not bars:
+        raise ValueError("一只标的的行情都没拉到")
+    x, y = build_dataset(bars, horizon=horizon)
+    split = purged_split(x.index, valid_ratio=valid_ratio, test_ratio=test_ratio,
+                         embargo_days=embargo, with_test=test_ratio > 0)
+    mask = split.test if split.test is not None else split.valid
+    x_t, y_t = x[mask], y[mask]
+    logger.info("单因子扫描：%d 个因子 × %d 条测试样本", x_t.shape[1], len(y_t))
+
+    rows = []
+    for col in x_t.columns:
+        f = x_t[col]
+        if f.notna().sum() < 100 or f.nunique() < 2:
+            continue
+        try:
+            rep = evaluate(f, y_t)
+        except Exception as e:
+            logger.debug("因子 %s 评估失败：%s", col, e)
+            continue
+        rows.append({"factor": col, "ic": rep["ic_mean"], "icir": rep["icir"],
+                     "t_stat": rep["t_stat"], "win_rate": rep["ic_win_rate"],
+                     "n_days": rep["n_days"]})
+    if not rows:
+        return pd.DataFrame(columns=["factor", "ic", "icir", "t_stat",
+                                     "win_rate", "n_days"])
+    df = pd.DataFrame(rows)
+    return (df.reindex(df["ic"].abs().sort_values(ascending=False).index)
+            .head(top_k).reset_index(drop=True))

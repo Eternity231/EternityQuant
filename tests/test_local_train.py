@@ -351,3 +351,41 @@ def test_diagnosis_catches_collapse(tmp_db, patched):
                        params={"lambda_l1": 1e6, "lambda_l2": 1e6})
     assert any("塌缩成常数" in d for d in r["diagnosis"])
     assert r["metrics"]["ic"] == 0.0, "塌缩时 IC 确实是 0——正因如此才必须解释"
+
+
+# ---------- 单因子基准扫描 ----------
+
+def test_factor_scan_shape(patched):
+    df = lt.factor_scan([f"S{i:02d}" for i in range(20)], top_k=8)
+    assert len(df) == 8
+    assert list(df.columns) == ["factor", "ic", "icir", "t_stat", "win_rate", "n_days"]
+    assert df["factor"].nunique() == 8
+
+
+def test_factor_scan_sorted_by_abs_ic(patched):
+    """按 |IC| 排序——负 IC 的因子反向用同样有效，不能只看正的。"""
+    df = lt.factor_scan([f"S{i:02d}" for i in range(20)], top_k=20)
+    absic = df["ic"].abs().to_numpy()
+    assert (absic[:-1] >= absic[1:] - 1e-12).all(), "必须按 |IC| 降序"
+
+
+def test_factor_scan_uses_test_segment_only(patched):
+    """扫描必须在和模型同一个测试段上做，否则没有可比性。"""
+    from eq.strategy.factors.validation import purged_split
+
+    x, _ = lt.build_dataset(patched, horizon=5)
+    sp = purged_split(x.index, valid_ratio=0.15, test_ratio=0.15, embargo_days=5)
+    n_test_days = len(set(x[sp.test].index.get_level_values("datetime")))
+    df = lt.factor_scan([f"S{i:02d}" for i in range(20)], top_k=3)
+    assert int(df["n_days"].iloc[0]) == n_test_days
+
+
+def test_factor_scan_no_test_segment_falls_back_to_valid(patched):
+    df = lt.factor_scan([f"S{i:02d}" for i in range(20)], test_ratio=0.0, top_k=3)
+    assert len(df) == 3
+
+
+def test_factor_scan_needs_bars(monkeypatch):
+    monkeypatch.setattr(lt, "load_bars", lambda *a, **k: {})
+    with pytest.raises(ValueError, match="一只标的的行情都没拉到"):
+        lt.factor_scan(["600519.SH"])

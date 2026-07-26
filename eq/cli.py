@@ -1858,6 +1858,64 @@ def ml_train_local(
         typer.echo(f"  用 `eq ml activate {r['model_id']}` 激活")
 
 
+@ml_app.command("factor-scan",
+                help="单因子基准：在和模型同一个测试段上逐个评估 158 个因子（不训练，很快）")
+def ml_factor_scan(
+    source: str = typer.Option("watchlist", "--from", "-f",
+                               help="标的来源，同 train-local"),
+    top: int = typer.Option(200, "--top", help="市场榜来源时取前 N 只"),
+    horizon: int = typer.Option(5, "--horizon", "-h", help="预测窗口（交易日）"),
+    days: int = typer.Option(1200, "--days", "-d", help="每只拉多少根日线"),
+    test_ratio: float = typer.Option(0.15, "--test-ratio", help="测试段占比"),
+    top_k: int = typer.Option(15, "--top-k", help="显示 |IC| 最高的前 K 个因子"),
+):
+    """给模型成绩找参照物。
+
+    模型 test IC 报 +0.011 时单看这个数没法判断：可能是「这段行情就是难」，
+    也可能是「158 维模型跑输一个不用训练的公式」——两者的处置完全不同。
+    """
+    from eq.strategy.factors.local_train import factor_scan
+
+    try:
+        symbols, label_txt = _resolve_symbols(source, top_n=top)
+    except Exception as e:
+        typer.echo(f"标的解析失败：{e}", err=True)
+        raise typer.Exit(1) from e
+    if not symbols:
+        typer.echo(f"候选池为空（{source}）", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"\n单因子扫描：{label_txt} {len(symbols)} 只  horizon={horizon}d")
+    try:
+        df = factor_scan(symbols, horizon=horizon, days=days,
+                         test_ratio=test_ratio, top_k=top_k)
+    except Exception as e:
+        typer.echo(f"扫描失败：{e}", err=True)
+        raise typer.Exit(1) from e
+    if df.empty:
+        typer.echo("没有可评估的因子")
+        return
+
+    show = df.copy()
+    show["ic"] = show["ic"].map(lambda v: f"{v:+.4f}")
+    show["icir"] = show["icir"].map(lambda v: f"{v:+.3f}")
+    show["t_stat"] = show["t_stat"].map(lambda v: f"{v:+.2f}")
+    show["win_rate"] = show["win_rate"].map(lambda v: f"{v:.0%}")
+    typer.echo(f"\n测试段 {int(df['n_days'].iloc[0])} 个交易日，|IC| 前 {len(df)}：\n")
+    typer.echo(show.to_string(index=False))
+    best = df.iloc[0]
+    typer.echo(f"\n最强单因子 {best['factor']}：IC {best['ic']:+.4f}  "
+               f"t 值 {best['t_stat']:+.2f}")
+    typer.echo("  · 模型 test IC 明显高于它 → 模型确实学到了组合效应")
+    typer.echo("  · 模型 test IC 还不如它 → 158 维模型跑输一个公式，管线有问题")
+    typer.echo("  · 两者都接近 0 → 这段行情/这批票就是难，不是模型的错")
+    typer.echo("\n⚠ 多重检验：这是从 158 个因子里挑最大值，不是单次检验。"
+               "\n  零假设下扫 158 个因子，最大 |t| 本来就期望在 3 附近——"
+               "纯随机数据上实测能挑出 t=4.85 的「因子」。"
+               "\n  Bonferroni 校正后，**最强的那个**要 |t| > 3.6 才算数；"
+               "别拿排第一的因子当发现。")
+
+
 @ml_app.command("predict-local",
                 help="用 train-local 训出的模型给一批标的打分（不用 qlib）")
 def ml_predict_local(
