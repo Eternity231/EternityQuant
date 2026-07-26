@@ -1564,6 +1564,8 @@ run_portfolio(bars, strategy, cfg, industries={"600519.SH": "白酒", ...})
 
 ## 实测记录：Alpha158 日频选股在 A 股成不成立（2026-07-27）
 
+> 原始数据、可复现脚本和股票池都在 [`docs/experiments/`](docs/experiments/)。
+
 520 只（A 股成交额前 600 中历史 >=900 根的），1023 根日线（数据源上限约 4 年），
 `horizon {5,10,20} x rebalance {weekly,monthly} x positions {10,20}` 共 12 格，
 每个 horizon 一个 3 种子集成模型 + 一个无参数单因子基准。
