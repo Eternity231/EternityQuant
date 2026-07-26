@@ -673,3 +673,56 @@ def test_benchmark_skips_unusable_series():
 
 def test_benchmark_empty_is_zero():
     assert lt._equal_weight_buy_hold({}) == 0.0
+
+
+# ---------- 阳性对照：管线能不能检测出信号（v0.43） ----------
+
+def test_pipeline_detects_planted_signal(tmp_db, monkeypatch):
+    """**阳性对照**：往特征里塞一个「知道未来」的列，管线必须报出高 IC。
+
+    这是「没信号」这个结论成立的前提。全链路报零可能有两种原因：
+      (a) 市场上确实没有可提取的信号
+      (b) 我的管线根本检测不出信号（特征对齐错位、标签接反、评估口径坏了……）
+    两者的结论完全相反，必须能区分。
+
+    做法：真实特征 + 一列 = 未来收益 + 噪声。如果管线是好的，
+    模型会几乎只用这一列，test IC 必然很高。报不出来就是 (b)，
+    此时任何「市场没信号」的结论都不成立。
+    """
+    bars = {f"S{i:03d}": _bars(500, seed=i) for i in range(30)}
+    monkeypatch.setattr(lt, "load_bars", lambda *a, **k: bars)
+
+    x, y = lt.build_dataset(bars, horizon=5)
+    rng = np.random.default_rng(0)
+    planted = x.copy()
+    # 标签本身 + 等量噪声：不是完美泄漏，但信号强到管线不可能漏掉
+    planted["ORACLE"] = y.to_numpy() + rng.normal(scale=1.0, size=len(y))
+
+    monkeypatch.setattr(lt, "build_dataset", lambda *a, **k: (planted, y))
+    r = lt.train_local(list(bars), algo="lightgbm", horizon=5, params=FAST)
+
+    ic = r["metrics"]["ic"]
+    assert ic > 0.3, (
+        f"管线检测不出人为植入的强信号（test IC {ic:+.4f}）——"
+        "说明特征/标签/评估这条链路本身有问题，"
+        "此时任何『市场没信号』的结论都不成立")
+
+
+def test_pipeline_reports_zero_on_pure_noise(tmp_db, monkeypatch):
+    """阴性对照：特征与标签完全无关时，IC 必须接近 0 而不是虚高。
+
+    和上一条配对——一个证明管线**测得出**信号，一个证明它**不会无中生有**。
+    两条都过，零结果才可信。
+    """
+    bars = {f"S{i:03d}": _bars(500, seed=i) for i in range(30)}
+    monkeypatch.setattr(lt, "load_bars", lambda *a, **k: bars)
+
+    x, y = lt.build_dataset(bars, horizon=5)
+    rng = np.random.default_rng(1)
+    noise = pd.DataFrame(rng.normal(size=(len(x), 20)), index=x.index,
+                         columns=[f"n{i}" for i in range(20)])
+    monkeypatch.setattr(lt, "build_dataset", lambda *a, **k: (noise, y))
+    r = lt.train_local(list(bars), algo="lightgbm", horizon=5, params=FAST)
+
+    assert abs(r["metrics"]["ic"]) < 0.06, \
+        f"纯噪声特征上不该有 IC：{r['metrics']['ic']:+.4f}"
