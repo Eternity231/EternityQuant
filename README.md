@@ -15,7 +15,6 @@ eq watch 600519.SH                       # 个股快照（A/HK/US/CRYPTO，自�
 eq watch 600519                          # 符号随手写：裸码/小写/SH 前缀都认（v0.24）
 eq scan A --by change_pct --top 30       # 四市场扫描（A/HK/US/CRYPTO）
 eq screen golden_cross,volume_spike --from watchlist   # 技术选股（14 种条件，v0.24）
-eq research 600519.SH                   # 个股深度研究（15 板块，全本地）
 eq export --format excel                 # 导出全部数据为 Excel（v0.24）
 eq cache stats / warm / clear            # 行情本地缓存管理（v0.24）
 eq watchlist add 600519.SH --reason 白酒龙头
@@ -52,7 +51,7 @@ eq data hk-5min                           # 港股 5 分钟线（yfinance，最�
 eq data hk-1min                           # 港股 1 分钟线（yfinance，最近 7 天）
 eq data us                                # 美股日线（yfinance）
 eq data all                               # 全量数据收集
-eq dash                                 # 启动 Streamlit 10 页看板
+eq dash                                 # 启动 Streamlit 9 页看板
 eq --help                               # 看所有命令
 ```
 
@@ -117,7 +116,6 @@ eq --help                               # 看所有命令
 | `eq export --datasets --format` | 导出 7 类数据为 CSV / Excel | v0.24 |
 | `eq cache stats/warm/clear` | 行情本地缓存管理 | v0.24 |
 | `eq data sources [--test]` | 数据源注册表：13 个源，本机自检可用性 | v0.26 |
-| `eq research <symbol> --sections` | 个股深度研究（15 板块，无外部依赖） | v0.10/v0.34 |
 | `eq watchlist add/import/list/remove/find/quotes` | 自选股 CRUD + 批量实时行情 | v0.1/v0.24 |
 | `eq portfolio buy/add/trim/sell/list/stops/history/summary/closed` | 持仓全生命周期 + 风险体检 | v0.1/v0.24 |
 | `eq monitor add/list/run/enable/disable/signals/cooldown` | 监控规则（11 种类型 + 冷却期 + 信号历史） | v0.1/v0.5/v0.24 |
@@ -135,7 +133,7 @@ eq --help                               # 看所有命令
 | `eq paper` | 纸面战绩：前向推荐 vs 基准的超额 t 检验 | v0.32 |
 | `eq ml train/activate/list/info/predict/predict-batch/update-data` | ML 因子（LightGBM + PyTorch + 数据更新） | v0.6~v0.15 |
 | `eq data a/hk/hk-5min/hk-1min/us/all` | 统一数据收集（A股/港股日线/分钟线/美股） | v0.19 |
-| `eq dash` | Streamlit 10 页看板 | v0.1/v0.11/v0.24/v0.33 |
+| `eq dash` | Streamlit 9 页看板 | v0.1/v0.11/v0.24/v0.33 |
 | `eq theme <图片>` | 看板换肤：自动取色 + 背景图 + 侧栏看板娘 | v0.33 |
 
 ### 符号写法（v0.24 起全面容错）
@@ -999,25 +997,7 @@ EternityQuant 支持在 **Google Colab** 和 **Kaggle** 的免费 GPU 上训练�
 - **qlib ReduceLROnPlateau 版本判断 bug**：qlib 0.9.7 用 `str(torch.__version__).split('+')[0] <= '2.6.0'` 做字符串比较，对 torch 2.13.0 误判（字典序 `'2.13.0' <= '2.6.0'` 为真），走错老分支传 `verbose=True`。monkey patch 绕开：让 `ReduceLROnPlateau.__init__` 接受并忽略 `verbose` 参数。
 - **qlib DNNModelPytorch loss 全 nan**：torch 2.13 + Alpha158 默认配置下 BatchNorm1d �遇全 NaN 列梯度爆。自写 `_SimpleMLP`（158→256→1，BatchNorm1d+Adam+Dropout）绕开，直 API 路径走 `torch.cuda`。
 
-## 个股深度研究 15 板块
-
-按市场自动选板块：
-
-| 市场 | 板块数 | 板块列表 |
-|------|--------|----------|
-| A 股 | 11 | snapshot/financial/fund_flow/news/research/block_trades/margin/shareholders/lockup/northbound/sector |
-| 港股 | 6 | snapshot/profile/financial/news/research/holders |
-| 美股 | 8 | snapshot/profile/financial/news/research/sec_filings/options/holders |
-| 加密 | 1 | snapshot |
-
-港美板块 v0.34 前是占位符（只提示"请用外部工具补全"），现已全部用 yfinance 落地：
-公司画像、财报三期、新闻、分析师目标价与评级、机构持股、SEC 公告、期权链摘要
-（put/call 未平仓比 + 平值隐波）。取不到数据时说明原因，不再指向别的工具。
-
-港股个股资金流没有免费接口（东财那套主力/超大单分类是 A 股独有），
-所以港股默认板块里不放 `fund_flow`，用 `holders` 看机构持股代替。
-
-## Streamlit 10 页看板
+## Streamlit 9 页看板
 
 ```bash
 eq dash --port 8501    # 启动本地看板
@@ -1034,7 +1014,6 @@ eq dash --port 8501    # 启动本地看板
 | 监控规则 | 规则列表+触发统计 |
 | ML 模型 | 模型列表+激活+predict-batch Top10+一键入自选+预测历史 |
 | 下载管理 | A/港/美股下载 + 缓存占用统计与清理 |
-| 深度研究 | 输入 symbol → 15 板块深度研究（结构化展开） |
 
 ### 换肤（v0.33）
 
@@ -1073,8 +1052,8 @@ eq dash --no-theme                   # 本次禁用主题（排查显示问题�
 7. ✅ predict-batch 跑通 + torch DLL 预热（v0.7）
 8. ✅ LightGBM GPU 训练（v0.8，`--device gpu`）
 9. ✅ qlib PyTorch CUDA 集成（v0.9，自写 MLP 走 CUDA GPU）
-10. ✅ 个股深度研究（v0.10 跨市场 14 板块；v0.34 港美板块全部本地实现）
-11. ✅ Streamlit 看板加 ML 交互 + 深度研究页（v0.11）
+10. ✅ 个股深度研究（v0.10~v0.34；v0.35 删除——数据 dump 不喂任何下游，手机 App 做得更好，见下「砍掉的东西」）
+11. ✅ Streamlit 看板加 ML 交互（v0.11）
 12. ✅ 单元测试固化 + CLI CUDA 泄漏修复（v0.12，35 测试）
 13. ✅ 自写 LSTM + CUDA 训练进度 log（v0.13，6×26 时序重塑）
 14. ✅ predict-batch 支持自写 LSTM/MLP 模型（v0.14，按 algo 分路）
@@ -1167,6 +1146,28 @@ eq dash --no-theme                   # 本次禁用主题（排查显示问题�
 建仓/加仓/减仓补零负值校验；`signals` 表从"建了没人写"变成真的记录触发历史；
 sqlite3 date/timestamp 适配器显式注册（消除 Python 3.12+ 废弃告警）；
 Streamlit `use_container_width` → `width="stretch"`（旧参数已过移除期）。
+
+## 砍掉的东西
+
+### 个股深度研究（v0.10 加，v0.35 删）
+
+`eq research <symbol>` + 看板的深度研究页，15 个板块的基本面/资金/新闻/研报 dump。
+删掉的理由，按重要性排：
+
+1. **输出不喂任何下游。** 整个项目是一条链——数据 → 因子 → 信号 → 回测 →
+   纸面日志 → 晨报，每个模块都被下游消费。只有 research 是终端节点：打印完就结束，
+   没有任何因子、信号、回测、筛选器读它的结果。
+2. **手机 App 做得更好。** 公司画像、财报、新闻、股东户数这些，东财/雪球/富途
+   都是实时的、排版好的、随手能翻的。我们这版是文本 dump。
+3. **全仓维护成本最高。** 918 行代码挂在约 10 个 akshare 接口 + yfinance 上，
+   全是最易变的第三方 schema。代码里那些「挨个试两个函数名」的循环就是被打怕的痕迹。
+4. **它喂的是拍脑袋决策。** 本项目反复测出来的结论是收益漏在主观判断上，
+   纸面日志就是为了约束这个；一个新闻/研报 dump 恰好在助长反面习惯。
+
+**如果要回收**：`lockup`（解禁日期＝已知的未来供给冲击）、`shareholders`（股东户数
+变化）、`margin`、`northbound` 这四个是真正可交易的数据。但正确做法是写成因子、
+跑逐日截面 Rank IC 验证有没有预测力，而不是从 `git show ec62374:eq/core/research.py`
+里把 print 函数捞回来（仓库没打 tag，所以这里写的是 commit hash）。
 
 ## 剩余候选（未做）
 

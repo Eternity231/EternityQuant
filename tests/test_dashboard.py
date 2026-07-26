@@ -17,7 +17,7 @@ from streamlit.testing.v1 import AppTest  # noqa: E402
 from eq.web import runner  # noqa: E402
 
 PAGES = ["概览", "晨报", "持仓", "自选", "选股", "回测", "监控规则",
-         "ML 模型", "下载管理", "深度研究"]
+         "ML 模型", "下载管理"]
 
 
 @pytest.fixture

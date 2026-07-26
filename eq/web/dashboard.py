@@ -1,13 +1,8 @@
 """Streamlit 仪表盘主入口（被 streamlit run 直接执行）。
 
-侧边栏分页：
-- 概览（持仓 + 自选 + 最新信号汇总）
-- 持仓
-- 自选
-- 监控规则
-- ML 模型（v0.11：详情 + 激活 + 批量预测 Top10 可交互）
-- 回测
-- 深度研究（v0.11：输入 symbol → 14 板块深度研究）
+侧边栏 9 页：概览 / 晨报 / 持仓 / 自选 / 选股 / 回测 / 监控规则 / ML 模型 / 下载管理。
+页面之间靠 ``elif page == ...`` 分发——某一页里的笔误只有选中那页时才炸，
+所以 tests/test_dashboard.py 用 AppTest 把每一页都真渲染一遍。
 """
 
 from __future__ import annotations
@@ -44,7 +39,7 @@ st.caption(f"今日 {dt.date.today().isoformat()}")
 page = st.sidebar.selectbox(
     "页面",
     ["概览", "晨报", "持仓", "自选", "选股", "回测", "监控规则", "ML 模型",
-     "下载管理", "深度研究"],
+     "下载管理"],
     index=0,
 )
 
@@ -535,77 +530,6 @@ elif page == "ML 模型":
             # sqlite3.Row 是序列不是映射，pd.DataFrame(rows) 会得到 0/1/2 数字列名，
             # 列名全丢。先显式转 dict 再建 DataFrame。
             st.dataframe(pd.DataFrame([dict(r) for r in rows]), width="stretch")
-
-# -------- 深度研究（v0.11） --------
-elif page == "深度研究":
-    st.header("个股深度研究")
-    st.caption("按市场自动选数据源汇总：A 股 11 板块 / 港股 6 / 美股 8 / 加密 1。"
-               "全部本地直连公开接口，不需要任何外部服务。")
-    sym = st.text_input("股票符号", placeholder="如 600519.SH / AAPL.US / 00700.HK / BTC-USDT")
-    # 板块选择
-    from eq.core.research import _DEFAULT_SECTIONS, _SECTION_LABELS
-    preset_secs = list(_DEFAULT_SECTIONS.get("A", ["snapshot"]))
-    secs_chosen = st.multiselect("板块（缺省按市场全拉）", list(_SECTION_LABELS.keys()), default=[], format_func=lambda s: _SECTION_LABELS.get(s, s))
-    if st.button("跑深度研究") and sym:
-        from eq.core.research import format_research, research as do_research
-        with st.spinner("拉取数据中..."):
-            try:
-                report = do_research(sym, sections=secs_chosen or None)
-                # 文本版
-                st.code(format_research(report), language="text")
-                # 结构化展开
-                st.subheader("结构化展开")
-                for sec, data in report.items():
-                    if sec in ("symbol", "market", "as_of"):
-                        continue
-                    with st.expander(f"{_SECTION_LABELS.get(sec, sec)}"):
-                        if isinstance(data, dict) and "error" in data:
-                            st.error(data["error"])
-                        elif isinstance(data, dict) and "note" in data:
-                            st.info(data["note"])
-                        elif isinstance(data, dict) and "profile" in data:
-                            st.json(data["profile"])
-                        elif isinstance(data, dict) and ("metrics" in data or "targets" in data
-                                                         or "major" in data or "filings" in data
-                                                         or "expiry" in data):
-                            # v0.34 新落地的港美板块：结构各异，直接给结构化 JSON
-                            st.json({k: v for k, v in data.items() if not k.endswith("_error")})
-                        elif isinstance(data, dict) and "snapshot" in data:
-                            snap = data["snapshot"]
-                            cols = st.columns(4)
-                            cols[0].metric("最新价", snap.get("close", "?"))
-                            cols[1].metric("漲跌幅", f"{snap.get('change_pct', 0):+.2f}%")
-                            cols[2].metric("今开", snap.get("open", "?"))
-                            cols[3].metric("昨收", snap.get("prev_close", "?"))
-                            if data.get("recent_30d"):
-                                r = data["recent_30d"]
-                                st.caption(f"近 {r['days']} 日：高 {r['high']:.2f}  低 {r['low']:.2f}  均价 {r['avg_close']:.2f}")
-                        elif isinstance(data, dict) and "info" in data:
-                            st.json(data["info"])
-                        elif isinstance(data, dict) and "headlines" in data:
-                            for h in data["headlines"][:10]:
-                                if isinstance(h, dict):
-                                    title = h.get("新闻标题") or h.get("title") or str(h)[:80]
-                                    st.text(f"• {title}")
-                        elif isinstance(data, dict) and "reports" in data:
-                            for r in data["reports"][:10]:
-                                if isinstance(r, dict):
-                                    title = r.get("研报标题") or r.get("title") or str(r)[:80]
-                                    st.text(f"• {title}")
-                        elif isinstance(data, dict) and "recent_5d" in data:
-                            st.dataframe(pd.DataFrame(data["recent_5d"]), width="stretch")
-                        elif isinstance(data, dict) and "recent_10d" in data:
-                            st.dataframe(pd.DataFrame(data["recent_10d"]), width="stretch")
-                        elif isinstance(data, dict) and "recent" in data:
-                            st.dataframe(pd.DataFrame(data["recent"]), width="stretch")
-                        elif isinstance(data, dict) and "upcoming" in data:
-                            st.dataframe(pd.DataFrame(data["upcoming"]), width="stretch")
-                        elif isinstance(data, dict):
-                            st.json(data)
-                        else:
-                            st.text(str(data))
-            except Exception as e:
-                st.error(f"研究失败：{repr(e)[:300]}")
 
 # -------- 下载管理（v0.23：A/港/美股下载 + 缓存清理 + 进度展示） --------
 elif page == "下载管理":
