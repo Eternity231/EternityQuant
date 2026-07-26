@@ -39,7 +39,7 @@ _MIN_UNIVERSE = 30
 
 __all__ = ["load_bars", "build_dataset", "train_local",
            "load_local_model", "predict_local", "factor_scan",
-           "baseline_composite", "score_matrix_local", "backtest_local", "walk_forward_local"]
+           "baseline_composite", "score_matrix_local", "backtest_local", "walk_forward_local", "backtest_predictions"]
 
 
 def load_bars(symbols: list[str], days: int = 1200, workers: int = 8,
@@ -822,3 +822,56 @@ def walk_forward_local(
             "folds": folds, "n_folds_ok": len(folds),
             "n_oos_samples": int(len(all_pred)),
             "predictions": all_pred}
+
+
+def backtest_predictions(
+    predictions: pd.Series,
+    bars: dict[str, pd.DataFrame],
+    *,
+    top_n: int = 10,
+    cfg=None,
+) -> dict[str, Any]:
+    """拿一串**任意来源的样本外预测**跑组合回测（含成本 + 等权买入持有基准）。
+
+    :func:`backtest_local` 要的是一个存盘的模型；滚动重训产出的是
+    「每折各自的模型拼出来的一长串预测」，没有单一模型可存——所以需要这条路。
+
+    这也让「IC 提升了，钱有没有提升」这个问题第一次可以回答：
+    滚动重训把 h=5 的 IC 从 +0.0135 抬到 +0.0222，但 IC 是抽象数字，
+    换手和成本会不会把这点改善吃光，只有跑出来才知道。
+
+    Args:
+        predictions: 带 (datetime, instrument) MultiIndex 的分数序列
+        bars: 对应的行情（至少要覆盖 predictions 的日期范围）
+    """
+    import dataclasses
+
+    from eq.backtest.portfolio import PortfolioConfig, run_portfolio
+
+    if predictions.empty:
+        raise ValueError("预测为空")
+    wide = predictions.unstack("instrument")
+    ranks = wide.rank(axis=1, ascending=False, method="first")
+    sel = ranks <= top_n
+    weight = (1.0 - 0.5 * (ranks - 1) / max(1, top_n - 1)).where(sel, 0.0).fillna(0.0)
+
+    begin = weight.index.min()
+    sub = {s: d[d.index >= begin] for s, d in bars.items() if s in weight.columns}
+    sub = {s: d for s, d in sub.items() if len(d) >= 30}
+    if not sub:
+        raise ValueError("预测覆盖的行情太短，组合回测至少要 30 根 bar")
+    w = weight.reindex(columns=list(sub)).fillna(0.0)
+
+    cfg = cfg or PortfolioConfig(max_positions=top_n, rebalance="monthly",
+                                 allocation="score", cost_model="a_share")
+    res = run_portfolio(sub, w, cfg)
+    free = dataclasses.replace(cfg, cost_model=None, commission_bps=0.0,
+                               slippage_bps=0.0)
+    gross = run_portfolio(sub, w, free)
+    bench = _equal_weight_buy_hold(sub)
+    net = res.metrics.get("total_return", 0.0)
+    return {"result": res, "gross": gross, "benchmark_return": bench,
+            "excess_return": net - bench,
+            "cost_drag": gross.metrics.get("total_return", 0.0) - net,
+            "start": str(begin.date()), "n_symbols": len(sub),
+            "n_days": len(weight)}

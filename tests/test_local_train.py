@@ -726,3 +726,21 @@ def test_pipeline_reports_zero_on_pure_noise(tmp_db, monkeypatch):
 
     assert abs(r["metrics"]["ic"]) < 0.06, \
         f"纯噪声特征上不该有 IC：{r['metrics']['ic']:+.4f}"
+
+
+def test_backtest_predictions_from_walk_forward(trained_big):
+    """滚动重训产出的是一串预测（没有单一模型可存），必须能直接回测。"""
+    _, syms = trained_big
+    wf = lt.walk_forward_local(syms, horizon=5, n_folds=3, test_days=30,
+                               valid_days=40, min_train_days=150, params=FAST)
+    bars = lt.load_bars(syms)
+    bt = lt.backtest_predictions(wf["predictions"], bars, top_n=5)
+    assert "excess_return" in bt and "benchmark_return" in bt
+    assert bt["excess_return"] == pytest.approx(
+        bt["result"].metrics["total_return"] - bt["benchmark_return"])
+    assert bt["n_symbols"] > 0
+
+
+def test_backtest_predictions_rejects_empty():
+    with pytest.raises(ValueError, match="预测为空"):
+        lt.backtest_predictions(pd.Series(dtype=float), {})
