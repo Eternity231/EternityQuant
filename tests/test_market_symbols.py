@@ -69,3 +69,62 @@ def test_yfinance_crypto_maps_usdt_to_usd():
     from eq.data.market import yfinance_symbol
 
     assert yfinance_symbol("BTC-USDT", "CRYPTO") == "BTC-USD"
+
+
+# ---------- file: 股票池来源（v0.42.1） ----------
+
+def test_file_source_parses_one_per_line(tmp_path):
+    """冻结股票池：--from A --top N 每次联网重扫，两次可能拿到不同的票，
+    跑对照实验时结果彼此不可比且不会报错。file: 让池子可复现。"""
+    from eq.cli import _resolve_symbols
+
+    f = tmp_path / "u.txt"
+    f.write_text("600519.SH\n000001.SZ\n000858.SZ\n", encoding="utf-8")
+    syms, label = _resolve_symbols(f"file:{f}")
+    assert syms == ["600519.SH", "000001.SZ", "000858.SZ"]
+    assert "3 只" in label
+
+
+def test_file_source_strips_comments_per_line(tmp_path):
+    """注释必须**按行**剥。整体 split 的话，'# 说明文字' 里除了 # 之外的
+    每个词都会被当成股票代码——这个 bug 真的发生过。"""
+    from eq.cli import _resolve_symbols
+
+    f = tmp_path / "u.txt"
+    f.write_text("# EternityQuant ML 实验股票池 冻结自缓存\n"
+                 "600519.SH\n"
+                 "000001.SZ  # 平安银行\n", encoding="utf-8")
+    syms, _ = _resolve_symbols(f"file:{f}")
+    assert syms == ["600519.SH", "000001.SZ"]
+
+
+def test_file_source_accepts_commas_and_blanks(tmp_path):
+    from eq.cli import _resolve_symbols
+
+    f = tmp_path / "u.txt"
+    f.write_text("600519.SH, 000001.SZ\n\n  \n000858.SZ\n", encoding="utf-8")
+    assert _resolve_symbols(f"file:{f}")[0] == ["600519.SH", "000001.SZ", "000858.SZ"]
+
+
+def test_file_source_dedupes(tmp_path):
+    from eq.cli import _resolve_symbols
+
+    f = tmp_path / "u.txt"
+    f.write_text("600519.SH\n600519.SH\n000001.SZ\n", encoding="utf-8")
+    assert _resolve_symbols(f"file:{f}")[0] == ["600519.SH", "000001.SZ"]
+
+
+def test_file_source_missing_file_raises():
+    from eq.cli import _resolve_symbols
+
+    with pytest.raises(ValueError, match="不存在"):
+        _resolve_symbols("file:Z:/不存在/u.txt")
+
+
+def test_file_source_empty_file_raises(tmp_path):
+    from eq.cli import _resolve_symbols
+
+    f = tmp_path / "empty.txt"
+    f.write_text("# 只有注释\n\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="空的"):
+        _resolve_symbols(f"file:{f}")

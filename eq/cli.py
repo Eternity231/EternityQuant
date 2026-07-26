@@ -117,13 +117,33 @@ def _resolve_symbols(source: str, top_n: int = 100) -> tuple[list[str], str]:
     """把 ``--from`` 的值解析成标的列表。
 
     支持 ``watchlist`` / ``portfolio`` / ``both`` / 市场代码（A/HK/US/CRYPTO）
-    / 逗号分隔的代码列表。screen、cache warm、bt robust 三处都要这套逻辑，
-    抽出来避免各写一遍走样。
+    / ``file:路径``（每行一个代码）/ 逗号分隔的代码列表。
+    screen、cache warm、bt robust 三处都要这套逻辑，抽出来避免各写一遍走样。
+
+    **``file:`` 是为了冻结股票池**：``--from A --top 300`` 每次都重新联网扫市场，
+    两次调用很可能拿到不同的 300 只票。跑对照实验（同一批票换不同参数）时
+    这会让结果彼此不可比，而且不会有任何报错——所以实验前先把池子落盘。
 
     Returns:
         ``(symbols, 人话标签)``
     """
     src = str(source).strip()
+    if src.lower().startswith("file:"):
+        from pathlib import Path
+
+        path = Path(src[5:].strip().strip('"').strip("'"))
+        if not path.exists():
+            raise ValueError(f"股票池文件不存在：{path}")
+        # 必须**按行**剥注释：先整体 split 的话，"# 说明文字" 里除了 '#'
+        # 之外的每个词都会被当成一个股票代码
+        syms: list[str] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            body = line.split("#", 1)[0]
+            syms.extend(tok for tok in body.replace(",", " ").split() if tok)
+        syms = list(dict.fromkeys(syms))
+        if not syms:
+            raise ValueError(f"股票池文件是空的：{path}")
+        return syms, f"{path.name}（{len(syms)} 只）"
     if src in ("watchlist", "portfolio", "both"):
         syms: list[str] = []
         if src in ("watchlist", "both"):
