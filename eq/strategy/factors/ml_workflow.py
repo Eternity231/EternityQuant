@@ -499,6 +499,78 @@ def _build_torch_model(algo: str, device: str):
     raise NotImplementedError(f"algo {algo} 待集成，可选：{sorted(_TORCH_ALGOS)}")
 
 
+# ---------- 优化器相关的默认超参 ----------
+
+# Lion 的更新量是 sign(...)，每个坐标恒定走 ±lr，和梯度大小无关；
+# AdamW 的更新量是 g/√v，被自适应缩放过。所以同一个 lr 在 Lion 下的实际步长
+# 大得多——Lion 论文（Chen et al. 2023, Symbolic Discovery of Optimization
+# Algorithms）明确建议 **lr 取 AdamW 的 1/3~1/10、weight_decay 放大 3~10 倍**
+# （大致保持 lr×wd 乘积不变）。
+#
+# 本项目 v0.32 把默认优化器切成 Lion，但 lr/weight_decay 还留着 AdamW 那套
+# （1e-3 / 1e-5），等于让 Lion 用约 10 倍的步长跑——低信噪比的金融数据上，
+# 这会让它在极小值附近反复横跳，早停挑到的多半是噪声高点。
+_OPT_DEFAULTS = {
+    "lion":  {"lr": 1e-4, "weight_decay": 1e-4},
+    "adamw": {"lr": 1e-3, "weight_decay": 1e-5},
+}
+
+
+def resolve_opt_hparams(optimizer: str, lr: float | None = None,
+                        weight_decay: float | None = None) -> tuple[float, float]:
+    """按优化器给出 (lr, weight_decay)。显式传值优先，None 才用默认。
+
+    显式优先是关键：``--lr`` 传了就必须照做，否则用户根本没法调参
+    （改动前这两个值在调用点写死，命令行想调也调不了）。
+    """
+    d = _OPT_DEFAULTS.get(str(optimizer).lower(), _OPT_DEFAULTS["adamw"])
+    return (d["lr"] if lr is None else float(lr),
+            d["weight_decay"] if weight_decay is None else float(weight_decay))
+
+
+# ---------- 训练期打分：早停必须用「和验收同一把尺」 ----------
+
+def _make_valid_scorer(x_valid, y_valid):
+    """造一个 ``pred_tensor -> float`` 的验证集打分函数，口径＝**每日横截面 Rank IC**。
+
+    修的是一个隐蔽但影响很大的错配：早停按**池化 Pearson IC**挑 checkpoint
+    （把整个验证集当一坨算一次相关），而模型最终是按 :func:`evaluation.evaluate`
+    的**每日横截面 Rank IC** 验收和使用的。两个口径在截面数据上根本不是一回事——
+    池化 IC 会把「不同日期的收益水平差」算成预测力，于是早停可能挑中一个
+    「能区分牛市日和熊市日、但当天选不出好票」的 checkpoint。选的和考的不一致，
+    调参再多也是在优化错的东西。
+
+    统一改成直接调 :func:`evaluation.daily_ic`——全项目只留一个 IC 定义，
+    以后改口径不会再出现两处不同步。
+
+    验证集没有 (datetime, instrument) 索引时（比如直接喂 numpy），
+    ``daily_ic`` 自己会退回池化口径，此时行为和改动前一致。
+    """
+    import numpy as np
+    import pandas as pd
+
+    idx = getattr(x_valid, "index", None)
+    y_arr = np.asarray(y_valid).reshape(-1)
+    if idx is not None and len(idx) == len(y_arr):
+        label = pd.Series(y_arr, index=idx)
+    else:
+        label = pd.Series(y_arr)
+
+    from eq.strategy.factors.evaluation import daily_ic
+
+    def _score(pred_tensor) -> float:
+        arr = pred_tensor.detach().cpu().numpy().reshape(-1)
+        if len(arr) != len(label) or len(arr) < 2:
+            return -float("inf")
+        ics = daily_ic(pd.Series(arr, index=label.index), label)
+        if len(ics) == 0:
+            return -float("inf")
+        m = float(ics.mean())
+        return m if m == m else -float("inf")   # NaN → -inf，别让它当上最佳
+
+    return _score
+
+
 # ---------- 自写最简 MLP（走 torch.cuda，绕开 qlib DNNModelPytorch nan 坑） ----------
 
 class MLPAlphaNet:
@@ -508,10 +580,10 @@ class MLPAlphaNet:
     自写此绕开，只取 qlib handler 的 feature 和 label 做数据，训练用原生 torch。
     """
 
-    def __init__(self, input_dim: int = 158, hidden: int | tuple = 256, lr: float = 1e-3,
+    def __init__(self, input_dim: int = 158, hidden: int | tuple = 256, lr: float | None = None,
                  max_steps: int = 300, batch_size: int = 2000, device: str = "cuda",
                  optimizer: str = "lion", dropout: float = 0.3, seed: int | None = None,
-                 weight_decay: float = 1e-5):
+                 weight_decay: float | None = None):
         import torch
         import torch.nn as nn
 
@@ -519,7 +591,10 @@ class MLPAlphaNet:
             from eq.strategy.factors.validation import set_seed
             set_seed(seed)
         self.device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
+        # lr/weight_decay 缺省时按优化器给（Lion 要比 AdamW 小一个量级，见 _OPT_DEFAULTS）
+        lr, weight_decay = resolve_opt_hparams(optimizer, lr, weight_decay)
         self.lr = lr
+        self.weight_decay = weight_decay
         self.max_steps = max_steps
         self.batch_size = batch_size
         self.dropout = dropout
@@ -551,9 +626,8 @@ class MLPAlphaNet:
         self.best_step = 0
 
     def fit(self, x_train, y_train, x_valid, y_valid, early_stop: int = 30):
-        import torch
         import numpy as np
-        from torch.utils.data import DataLoader, TensorDataset
+        import torch
 
         def _to_tensor(df):
             if hasattr(df, "values"):
@@ -564,6 +638,10 @@ class MLPAlphaNet:
         yt = _to_tensor(y_train).squeeze(-1).to(self.device)
         xv = _to_tensor(x_valid).to(self.device)
         yv = _to_tensor(y_valid).squeeze(-1).to(self.device)
+        # 早停打分要用**每日横截面 Rank IC**，所以得留住验证集的 (日期, 标的) 索引
+        # ——转成 tensor 就丢了。拿不到索引时 scorer 自动退回池化口径。
+        # 只做局部变量：它是闭包，挂到 self 上模型就 pickle 不了（存盘会炸）。
+        scorer = _make_valid_scorer(x_valid, y_valid)
 
         stop = 0
         for step in range(self.max_steps):
@@ -583,11 +661,7 @@ class MLPAlphaNet:
             with torch.no_grad():
                 vp = self.net(xv).squeeze(-1) if len(xv) >= 2 else torch.zeros(1, device=self.device)
                 vl = self.loss_fn(vp, yv).item() if len(xv) >= 2 else float("inf")
-            # IC 作 score（越高越好）
-            if len(xv) >= 2 and vp.std().item() > 0 and yv.std().item() > 0:
-                score = torch.cov(torch.stack([vp, yv]))[0, 1].item() / (vp.std().item() * yv.std().item())
-            else:
-                score = -float("inf")
+            score = scorer(vp)
             # 每 10 步或新最佳打进度
             mem_mb = torch.cuda.memory_allocated() / 1e6 if self.device.type == "cuda" else 0.0
             if step % 10 == 0 or score > self.best_score:
@@ -639,9 +713,10 @@ class RecurrentAlphaNet:
 
     def __init__(self, input_dim: int = 158, seq_len: int = 6, input_size: int = 26,
                  hidden_size: int = 64, num_layers: int = 2, cell_type: str = "gru",
-                 lr: float = 1e-3, max_steps: int = 200, batch_size: int = 4000,
+                 lr: float | None = None, max_steps: int = 200, batch_size: int = 4000,
                  device: str = "cuda", dropout: float = 0.1, use_scheduler: bool = True,
-                 optimizer: str = "lion", seed: int | None = None):
+                 optimizer: str = "lion", seed: int | None = None,
+                 weight_decay: float | None = None):
         import math
 
         import torch
@@ -667,6 +742,10 @@ class RecurrentAlphaNet:
             input_size = need
         self.input_dim = input_dim
         self.input_size = input_size
+        # lr 缺省按优化器给（Lion 比 AdamW 小一个量级，见 _OPT_DEFAULTS）。
+        # 必须在 self.lr 赋值**之前**解析——warmup 用的是 self.lr，
+        # 拿到 None 会在 self.lr/10 处炸。
+        lr, _ = resolve_opt_hparams(optimizer, lr, None)
         self.lr = lr
         self.max_steps = max_steps
         self.batch_size = batch_size
@@ -693,15 +772,18 @@ class RecurrentAlphaNet:
             nn.BatchNorm1d(hidden_size),
             nn.Linear(hidden_size, 1),
         ).to(self.device)
-        # weight_decay 1e-5 → 1e-6：LSTM 对 weight_decay 极敏感，过强会把权重
-        # 压向 0 加剧输出塌缩。LSTM 本身有梯度范裁剪，无需强 weight_decay。
+        # weight_decay **不**跟着 Lion 那套放大 10 倍：RNN 对 weight_decay 极敏感，
+        # 过强会把权重压向 0、加剧输出塌缩（实测过 pred.std()=0 恒 IC=0），
+        # 所以这里独立定在 1e-6，显式传参可覆盖。（lr 已在上面解析过）
+        weight_decay = 1e-6 if weight_decay is None else float(weight_decay)
+        self.weight_decay = weight_decay
         # 默认 Lion：显存省半 + 符号操作抗噪，适合低信噪比金融数据；
         # optimizer="adamw" 可切回（warmup/scheduler 都走 param_groups[0]["lr"] 兼容）。
         _all_params = list(self.net.parameters()) + list(self.head.parameters()) + list(self.input_bn.parameters())
         if optimizer.lower() == "lion":
-            self.opt = _LionOpt(_all_params, lr=lr, weight_decay=1e-6)
+            self.opt = _LionOpt(_all_params, lr=lr, weight_decay=weight_decay)
         else:
-            self.opt = torch.optim.AdamW(_all_params, lr=lr, weight_decay=1e-6)
+            self.opt = torch.optim.AdamW(_all_params, lr=lr, weight_decay=weight_decay)
         if use_scheduler:
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.opt, mode="max", factor=0.5, patience=5, min_lr=1e-6,
@@ -747,14 +829,20 @@ class RecurrentAlphaNet:
         xt = _to_tensor(x_train).to(self.device)
         yt = _to_tensor(y_train).squeeze(-1).to(self.device)
         xv = _to_tensor(x_valid).to(self.device)
-        yv = _to_tensor(y_valid).squeeze(-1).to(self.device)
+        # 同 MLP：早停口径统一到每日横截面 Rank IC（见 _make_valid_scorer）。
+        # 打分改由 scorer 用 pandas 侧的 y_valid 完成，不再需要 yv 张量。
+        # 同样只做局部变量：闭包不可 pickle，挂上去模型存不了盘。
+        scorer = _make_valid_scorer(x_valid, y_valid)
 
         stop = 0
         for step in range(self.max_steps):
-            # warmup：首 _warmup_steps 步 lr 从 1e-4 线性升到 self.lr，
+            # warmup：首 _warmup_steps 步 lr 从 self.lr/10 线性升到 self.lr，
             # 防首步权重过大 + BN 未收敛导致 LSTM 输出塌缩成常数（pred.std()=0）。
+            # 起点写成相对值：原来硬编码 1e-4，Lion 默认 lr 也是 1e-4 时
+            # warmup 变成 1e-4→1e-4 的空转，等于没预热。
             if step < self._warmup_steps:
-                warmup_lr = 1e-4 + (self.lr - 1e-4) * (step + 1) / self._warmup_steps
+                _lr0 = self.lr / 10
+                warmup_lr = _lr0 + (self.lr - _lr0) * (step + 1) / self._warmup_steps
                 for g in self.opt.param_groups:
                     g["lr"] = warmup_lr
             self.net.train()
@@ -784,14 +872,10 @@ class RecurrentAlphaNet:
                 xv_r = self.input_bn(xv_r.reshape(-1, self.input_size)).reshape(xv_r.size(0), self.seq_len, self.input_size)
                 out, _ = self.net(xv_r)
                 vp = self.head(out[:, -1, :]).squeeze(-1)
-                # IC 算法加 ε 保护：std=0 时不再直接判 -inf（那会让 best_score 永不更新），
-                # 改用 ε 保护分母，std=0 时 score=0（中性），训练能继续推进。
-                vp_std = vp.std().item()
-                yv_std = yv.std().item()
-                if len(xv) >= 2 and yv_std > 0:
-                    cov = torch.cov(torch.stack([vp, yv]))[0, 1].item()
-                    score = cov / (vp_std * yv_std + 1e-8)
-                else:
+                # 输出塌缩（pred.std()=0）时打 0 而不是 -inf：-inf 会让 best_score
+                # 永不更新，warmup 阶段还没散开的模型会被判死刑，训练推进不下去。
+                score = scorer(vp)
+                if score == -float("inf") or vp.std().item() == 0:
                     score = 0.0
             # 动态学习率（IC 不再提升时降 LR）
             if self.use_scheduler:
@@ -882,6 +966,10 @@ def train_torch(
     embargo_days: int | None = None,
     seed: int = 42,
     feature_set: str = "Alpha158",
+    # v0.36：学习率/权重衰减此前写死在调用点，命令行给了也没用。
+    # None = 按优化器取默认（见 resolve_opt_hparams）
+    lr: float | None = None,
+    weight_decay: float | None = None,
 ) -> dict[str, Any]:
     """走 qlib PyTorch pipeline 训练 ALSTM/GRU/LSTM/MLP/DeepLOB/TFT，用 CUDA。
 
@@ -1058,9 +1146,9 @@ def train_torch(
 
         if algo == "mlp":
             model = MLPAlphaNet(
-                input_dim=n_feat, hidden=(512, 256, 128), lr=1e-3, max_steps=300,
+                input_dim=n_feat, hidden=(512, 256, 128), lr=lr, max_steps=300,
                 batch_size=8000, device=device, optimizer=optimizer,
-                dropout=dropout, seed=seed,
+                dropout=dropout, seed=seed, weight_decay=weight_decay,
             )
             notes = f"自写 MLPAlphaNet（{device}, {optimizer}, dropout={dropout}, {feature_set}）"
         else:
@@ -1077,8 +1165,9 @@ def train_torch(
             model = RecurrentAlphaNet(
                 input_dim=n_feat, seq_len=_seq, input_size=_in,
                 hidden_size=_hs, num_layers=_nl, cell_type=cell,
-                lr=1e-3, max_steps=200, batch_size=_bs, device=device,
+                lr=lr, max_steps=200, batch_size=_bs, device=device,
                 dropout=dropout, use_scheduler=True, optimizer=optimizer, seed=seed,
+                weight_decay=weight_decay,
             )
             notes = (f"自写 {cell.upper()}（{device}, {optimizer}, dropout={dropout}, "
                      f"{feature_set}, seq={_seq}×{_in}）")

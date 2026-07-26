@@ -1655,6 +1655,11 @@ def ml_train(
     embargo: int = typer.Option(-1, "--embargo",
                                 help="段间 purge 的交易日数，-1=自动取 horizon（标签用到 T+h 的价格，不 purge 就是泄漏）"),
     seed: int = typer.Option(42, "--seed", help="随机种子（此前无种子控制，两次跑结果不可比）"),
+    lr: float = typer.Option(-1.0, "--lr",
+                             help="学习率，-1=按优化器取默认（lion 1e-4 / adamw 1e-3）。"
+                                  "Lion 是符号更新，步长和梯度大小无关，需比 AdamW 小一个量级"),
+    weight_decay: float = typer.Option(-1.0, "--weight-decay",
+                                       help="权重衰减，-1=按优化器取默认（lion 1e-4 / adamw 1e-5）"),
 ):
     # torch DLL 预热（Windows + cu132 坑：qlib 集成链触发 torch 延迟加载 c10.dll 失败，ml 命令才预热）
     try:
@@ -1720,7 +1725,9 @@ def ml_train(
                 orthogonalize=orthogonalize,
                 gpu_ids=gpus if gpus else None,
                 test_ratio=test_ratio, embargo_days=(None if embargo < 0 else embargo),
-                seed=seed, feature_set=features, **kw,
+                seed=seed, feature_set=features,
+                lr=(None if lr < 0 else lr),
+                weight_decay=(None if weight_decay < 0 else weight_decay), **kw,
             )
         elif algo in _TORCH_ALGOS:
             # PyTorch 模型默认 cuda（GPU 参数透传给 qlib，cuda → GPU=0）
@@ -1736,9 +1743,14 @@ def ml_train(
                 train_start=train_start, train_end=train_end,
                 valid_start=valid_start, valid_end=valid_end,
                 device=device, name=name or None, dropout=dropout,
+                # optimizer 此前**没传**——gru/lstm/mlp 走这个分支，
+                # `--optimizer adamw` 静默失效，永远用默认 lion
+                optimizer=optimizer,
                 gpu_ids=gpus if gpus else None,
                 test_ratio=test_ratio, embargo_days=(None if embargo < 0 else embargo),
-                seed=seed, feature_set=features, **kw,
+                seed=seed, feature_set=features,
+                lr=(None if lr < 0 else lr),
+                weight_decay=(None if weight_decay < 0 else weight_decay), **kw,
             )
         else:
             result = wf_train(

@@ -768,6 +768,62 @@ eq hk train --test-ratio 0.2 --cs-norm --seed 42
 | `--features` | `Alpha158`（截面因子）\| `Alpha360`（6 价量字段 × 60 天，**真时序**） |
 | `--cs-norm` | （港股）标签按日横截面 rank 归一化 |
 
+### 早停口径对齐（v0.36）—— v0.25 那次审查的漏网之鱼
+
+v0.25 修好了**报告**口径（`evaluate` 改成每日横截面 Rank IC），但**早停**口径
+一直没动：`MLPAlphaNet.fit` / `RecurrentAlphaNet.fit` 里挑 `best_state` 用的
+仍然是内联算的**池化 Pearson IC**。也就是——
+
+> 拿一把尺选 checkpoint，拿另一把尺给它打分。
+
+这正是上表问题 #2 在训练循环里的残留。后果不是数字虚高（成绩早就按 Rank IC 报了），
+而是**选错模型**：池化口径下「能区分牛市日和熊市日、但当天一只票都选不出来」的
+checkpoint 得分很高，于是早停可能就停在它身上。选的和考的不一致，超参调得再细
+也是在优化错的目标。
+
+v0.36 把两处内联计算都换成直接调 `evaluation.daily_ic`——全项目只留一个 IC 定义。
+`tests/test_train_hparams.py` 里构造了一个两种口径结论**相反**的例子钉住这件事：
+标签由「日内共同偏移」主导时，只会预测大盘的模型 pooled IC > 0.9，每日截面 IC ≈ 0。
+
+### 学习率与优化器（v0.36）
+
+Lion 的更新量是 `sign(...)`，每个坐标恒定走 ±lr，和梯度大小无关；AdamW 的更新量
+被 `g/√v` 自适应缩放过。所以**同一个 lr 在 Lion 下的实际步长大得多**——Lion 论文
+（Chen et al. 2023）明确建议 lr 取 AdamW 的 1/3~1/10、weight_decay 放大 3~10 倍，
+大致保持 lr×wd 乘积不变。
+
+v0.32 把默认优化器切成了 Lion，但 lr / weight_decay 还留着 AdamW 那套
+（1e-3 / 1e-5），等于让 Lion 用约 10 倍的步长跑。v0.36 改成按优化器给默认值：
+
+| 优化器 | lr | weight_decay |
+|--------|-----|--------------|
+| lion（默认） | 1e-4 | 1e-4 |
+| adamw | 1e-3 | 1e-5 |
+
+RNN 路径的 weight_decay 例外，独立定在 1e-6——它对权重衰减极敏感，过强会把权重
+压向 0、加剧输出塌缩（实测出现过 `pred.std()=0` 恒 IC=0）。
+
+顺带修的两个静默失效：
+
+- `--lr` / `--weight-decay` **此前根本不存在**，两个值写死在调用点，想调也调不了
+- `--optimizer` 对 gru/lstm/mlp **静默失效**——那个分支压根没把它传下去
+  （和之前 `--dropout` 一模一样的毛病）。`tests/test_train_hparams.py` 加了一条
+  源码级守卫，两个调用点少透传任何一个参数都会失败
+
+```bash
+eq ml train gru --optimizer adamw --lr 5e-4 --weight-decay 1e-5
+eq ml train mlp                      # 不传就按优化器取默认
+```
+
+**这两项改动都还没在真实行情上做过 A/B**（本机 qlib 数据目录是空的）。
+理由是原理性的，不是实测的。想验证就固定 `--seed` 跑两次对比 `test_ic`：
+
+```bash
+eq ml train gru --seed 42 --lr 1e-3 --name lr1e-3   # 旧默认
+eq ml train gru --seed 42 --name lr-default          # 新默认
+eq ml list                                           # 比 test_ic，不是 valid_ic
+```
+
 ### 评估口径（v0.25）
 
 `eq.strategy.factors.evaluation` 提供业界标准口径，训练结束自动打印：
