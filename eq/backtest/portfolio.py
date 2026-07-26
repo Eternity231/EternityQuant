@@ -62,6 +62,9 @@ class PortfolioConfig:
     # 执行延迟（bar）：0 = 收盘看到信号、同一根收盘成交（散户做不到）；
     # 1 = 次日成交。组合层面尤其重要——调仓要动一篮子票，更不可能在收盘瞬间完成。
     execution_delay: int = 1
+    # 行业集中度上限：同一行业最多持几只。0/None = 不限制。
+    # 需要配合 run_portfolio 的 industries 参数使用；拿不到行业归属的标的不受限。
+    max_per_industry: int = 0
 
     def resolve_costs(self) -> CostModel:
         from eq.backtest.cost import from_bps
@@ -174,7 +177,8 @@ def _rebalance_mask(index: pd.DatetimeIndex, mode: Rebalance,
 
 
 def _target_weights(row_desire: np.ndarray, row_score: np.ndarray,
-                    row_invvol: np.ndarray, cfg: PortfolioConfig) -> np.ndarray:
+                    row_invvol: np.ndarray, cfg: PortfolioConfig,
+                    industries: list[str | None] | None = None) -> np.ndarray:
     """算一天的目标权重（已应用持仓数/权重上限/现金缓冲）。"""
     n = len(row_desire)
     w = np.zeros(n)
@@ -182,9 +186,31 @@ def _target_weights(row_desire: np.ndarray, row_score: np.ndarray,
     if len(idx) == 0:
         return w
 
-    # 超过最大持仓数时按信号强度取前 N
+    # 按信号强度排序，后面的筛选都在这个序上做
+    idx = idx[np.argsort(-row_score[idx], kind="stable")]
+
+    # 行业约束：同一行业最多占 max_per_industry 个名额。
+    # 单票上限管不住这种集中——10 只票全是白酒，每只 10% 也照样是满仓一个行业，
+    # 一条政策就能把整个组合带走。行业名额限制发生在**选股阶段**，
+    # 因为等到分配权重时候选池已经全是同行业了，再怎么调权重也分散不了。
+    if cfg.max_per_industry and cfg.max_per_industry > 0 and industries is not None:
+        kept, used = [], {}
+        for i in idx:
+            ind = industries[i]
+            if ind is None or ind == "":
+                kept.append(i)                 # 行业未知的不设限，否则数据缺失＝被禁买
+                continue
+            if used.get(ind, 0) >= cfg.max_per_industry:
+                continue
+            used[ind] = used.get(ind, 0) + 1
+            kept.append(i)
+        idx = np.array(kept, dtype=int) if kept else idx[:0]
+        if len(idx) == 0:
+            return w
+
+    # 超过最大持仓数时取信号最强的前 N（idx 已按强度排好序）
     if len(idx) > cfg.max_positions:
-        idx = idx[np.argsort(-row_score[idx], kind="stable")[:cfg.max_positions]]
+        idx = idx[:cfg.max_positions]
 
     if cfg.allocation == "equal":
         raw = np.ones(len(idx))
@@ -228,6 +254,7 @@ def run_portfolio(
     bars: dict[str, pd.DataFrame],
     strategy,
     cfg: PortfolioConfig | None = None,
+    industries: dict[str, str] | None = None,
 ) -> PortfolioResult:
     """跑一次组合回测。
 
@@ -235,6 +262,10 @@ def run_portfolio(
         bars: ``{symbol: OHLCV DataFrame}``，各标的日期不必完全一致
         strategy: 信号函数 / ``{symbol: 信号函数}`` / 日期×标的的分数 DataFrame。
             函数形态要求**因果**（只用当期及历史数据），本项目因子库都满足。
+        industries: ``{symbol: 行业名}``，配合 ``cfg.max_per_industry`` 限制
+            行业集中度。缺失的标的不受限制——数据拿不到不该等于禁止买入。
+            行业归属视为**静态**：A 股行业变更极少，且用当前归属回溯历史
+            带来的偏差远小于「完全不控行业」的风险。
     """
     cfg = cfg or PortfolioConfig()
     bars = {s: d for s, d in bars.items() if d is not None and len(d) >= 30}
@@ -271,6 +302,10 @@ def run_portfolio(
     cash = cfg.initial_cash
     entry_price = np.zeros(n_sym)
     entry_date: list[Any] = [None] * n_sym
+    # 行业列表按 syms 的列顺序排好，主循环里直接按下标取
+    ind_list = ([industries.get(s) for s in syms]
+                if industries and cfg.max_per_industry else None)
+
     equity_hist = np.zeros(n_days)
     weight_hist = np.zeros((n_days, n_sym))
     trades: list[dict[str, Any]] = []
@@ -284,7 +319,7 @@ def run_portfolio(
 
         if rebal[i] and equity > 0:
             want = d_arr[i] * valid * t_arr[i]
-            tw = _target_weights(want, s_arr[i], v_arr[i], cfg)
+            tw = _target_weights(want, s_arr[i], v_arr[i], cfg, ind_list)
             target_shares = np.zeros(n_sym)
             for j in range(n_sym):
                 if tw[j] > 0 and valid[j]:

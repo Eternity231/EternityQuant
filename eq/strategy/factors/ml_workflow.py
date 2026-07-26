@@ -230,15 +230,8 @@ def train(
     #     - Fillna: NaN 填 0
     #   learn_processors (标签):
     #     DropnaLabel → CSZScoreNorm (横截面 z-score，去截面均值/方差影响)
-    infer_procs = [
-        {"class": "ProcessInf", "kwargs": {}},
-        {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
-        {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-    ]
-    learn_procs = [
-        {"class": "DropnaLabel"},
-        {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
-    ]
+    infer_procs = infer_processors()
+    learn_procs = learn_processors(rank_norm=False)   # 树模型保留幅度信息
     label_expr = [f"Ref($close, -{horizon}) / Ref($close, -1) - 1"]
     handler = _resolve_handler(feature_set)(
         instruments=universe,
@@ -499,6 +492,95 @@ def _build_torch_model(algo: str, device: str):
     raise NotImplementedError(f"algo {algo} 待集成，可选：{sorted(_TORCH_ALGOS)}")
 
 
+# ---------- 多种子集成 ----------
+
+class SeedEnsemble:
+    """同配置、不同随机种子的一组模型，预测取**标准化后**的平均。
+
+    低信噪比数据上单次训练的方差极大：同一份数据同一套超参，换个种子
+    test IC 能差出一倍。集成是这种场景下最稳的一招——它降的是方差，
+    不需要任何额外的调参运气。
+
+    **为什么先标准化再平均**：各模型的输出尺度不可比（MSE 训出来的回归值，
+    不同种子收敛到的量纲不一样），直接取算术平均等于给输出方差大的模型
+    更高的话语权。逐模型去均值除标准差之后再平均，每个成员的权重才一样。
+    标准化是单调变换，不改变任何单个模型的截面排序。
+
+    对 :func:`_eval_segment` 的兼容：它先试 qlib 签名 ``predict(dataset, segment=)``，
+    抛 TypeError 再退回 ``predict(x)``。本类只接一个位置参数，正好走后者。
+    """
+
+    def __init__(self, models: list, seeds: list[int]):
+        if not models:
+            raise ValueError("集成至少要有一个模型")
+        self.models = models
+        self.seeds = list(seeds)
+        # 成员里最好的那个 valid 分数，仅供日志参考（集成本身的分数要另外评）
+        self.member_scores = [float(getattr(m, "best_score", 0.0)) for m in models]
+        self.best_score = max(self.member_scores) if self.member_scores else 0.0
+        self.best_step = max((int(getattr(m, "best_step", 0)) for m in models), default=0)
+
+    def predict(self, x):
+        import numpy as np
+
+        acc = None
+        for m in self.models:
+            p = np.asarray(m.predict(x), dtype=float).reshape(-1)
+            s = p.std()
+            z = (p - p.mean()) / s if s > 0 else np.zeros_like(p)
+            acc = z if acc is None else acc + z
+        return acc / len(self.models)
+
+    def __len__(self) -> int:
+        return len(self.models)
+
+
+# ---------- 特征/标签处理器：训练和推理必须用同一套 ----------
+
+def infer_processors() -> list[dict]:
+    """特征处理器链，**训练和预测共用**（对标 qlib benchmarks 的 Alpha158 配置）。
+
+    - ``ProcessInf``：Inf 换成列均值，否则 BatchNorm1d 梯度直接爆
+    - ``RobustZScoreNorm``：MAD（中位绝对偏差）z-score，比普通 z-score 抗异常；
+      ``clip_outlier=True`` 截断 3σ 外的极值
+    - ``Fillna``：剩余缺失填 0
+
+    **为什么必须抽成一个函数**：改之前这份配置在文件里散着写了四遍，
+    其中 ``predict_batch`` 那份和训练那份对不上——
+
+    | | 训练 | 预测（旧） |
+    |---|---|---|
+    | ProcessInf | 有 | **没有** |
+    | RobustZScoreNorm | ``fields_group="feature"``, ``clip_outlier=True`` | 裸调用，两个参数都没有 |
+    | CSRankNorm | 只作用在 **label** 上 | **加在特征上**（训练时根本没有这一步）|
+
+    也就是模型训练时吃的是 z-score 特征，上线推理时吃的是横截面 rank（[0,1] 均匀分布）
+    ——分布完全不同，等于拿 A 的尺子量 B。这类 train/serve skew 不会报错、
+    也不会让预测变成 NaN，只是安静地把每一次 ``eq ml predict`` 的结果打偏。
+    """
+    return [
+        {"class": "ProcessInf", "kwargs": {}},
+        {"class": "RobustZScoreNorm",
+         "kwargs": {"fields_group": "feature", "clip_outlier": True}},
+        {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
+    ]
+
+
+def learn_processors(rank_norm: bool = True) -> list[dict]:
+    """标签处理器链。
+
+    ``CSRankNorm`` 把当日截面的未来收益转成 [0,1] 均匀分布——这一步决定了
+    模型学的是「今天这批票里哪只更好」而不是「明天大盘涨不涨」。
+    qlib 官方 GRU/ALSTM benchmark 用的就是它；``rank_norm=False`` 退回
+    ``CSZScoreNorm``（截面 z-score，保留幅度信息，但对异常值更敏感）。
+    """
+    norm = "CSRankNorm" if rank_norm else "CSZScoreNorm"
+    return [
+        {"class": "DropnaLabel"},
+        {"class": norm, "kwargs": {"fields_group": "label"}},
+    ]
+
+
 # ---------- 优化器相关的默认超参 ----------
 
 # Lion 的更新量是 sign(...)，每个坐标恒定走 ±lr，和梯度大小无关；
@@ -558,8 +640,11 @@ def _make_valid_scorer(x_valid, y_valid):
 
     from eq.strategy.factors.evaluation import daily_ic
 
-    def _score(pred_tensor) -> float:
-        arr = pred_tensor.detach().cpu().numpy().reshape(-1)
+    def _score(pred) -> float:
+        # 既接 torch 张量（训练循环里），也接 numpy 数组（集成评分时）
+        if hasattr(pred, "detach"):
+            pred = pred.detach().cpu().numpy()
+        arr = np.asarray(pred, dtype=float).reshape(-1)
         if len(arr) != len(label) or len(arr) < 2:
             return -float("inf")
         ics = daily_ic(pd.Series(arr, index=label.index), label)
@@ -970,6 +1055,9 @@ def train_torch(
     # None = 按优化器取默认（见 resolve_opt_hparams）
     lr: float | None = None,
     weight_decay: float | None = None,
+    # v0.37：多种子集成。低信噪比数据上单次训练方差极大，同超参换个种子
+    # test IC 能差一倍；集成降的是方差，不靠调参运气。见 SeedEnsemble。
+    n_seeds: int = 1,
 ) -> dict[str, Any]:
     """走 qlib PyTorch pipeline 训练 ALSTM/GRU/LSTM/MLP/DeepLOB/TFT，用 CUDA。
 
@@ -1014,15 +1102,8 @@ def train_torch(
     #     - CSRankNorm 横截面排序归一化，把未来收益转成 [0,1] 均匀分布
     #     - 这是官方 GRU/ALSTM/LSTM benchmark 的标准配置，比 CSZScoreNorm 更抗异常
     handler_cls = _resolve_handler(feature_set)
-    infer_procs = [
-        {"class": "ProcessInf", "kwargs": {}},
-        {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
-        {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-    ]
-    learn_procs = [
-        {"class": "DropnaLabel"},
-        {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
-    ]
+    infer_procs = infer_processors()
+    learn_procs = learn_processors(rank_norm=True)
     label_expr = [f"Ref($close, -{horizon}) / Ref($close, -1) - 1"]
     handler = handler_cls(
         instruments=universe,
@@ -1144,12 +1225,14 @@ def train_torch(
         if float(y_train.std()) == 0 or len(y_train) < 10:
             print(f"  [DIAG] 警告: 标签无方差或样本过少（{len(y_train)}），无信号可学", flush=True)
 
+        # 模型工厂：同一套超参、只换种子，供多种子集成复用（数据集只建一次）
         if algo == "mlp":
-            model = MLPAlphaNet(
-                input_dim=n_feat, hidden=(512, 256, 128), lr=lr, max_steps=300,
-                batch_size=8000, device=device, optimizer=optimizer,
-                dropout=dropout, seed=seed, weight_decay=weight_decay,
-            )
+            def _make(_seed: int):
+                return MLPAlphaNet(
+                    input_dim=n_feat, hidden=(512, 256, 128), lr=lr, max_steps=300,
+                    batch_size=8000, device=device, optimizer=optimizer,
+                    dropout=dropout, seed=_seed, weight_decay=weight_decay,
+                )
             notes = f"自写 MLPAlphaNet（{device}, {optimizer}, dropout={dropout}, {feature_set}）"
         else:
             # 研究结论：GRU > LSTM（2 门 vs 3 门，参数少不易过拟合），浅层 2-3 层最优
@@ -1162,17 +1245,40 @@ def train_torch(
                 _seq, _in = 60, 6
             else:
                 _seq, _in = 6, 26
-            model = RecurrentAlphaNet(
-                input_dim=n_feat, seq_len=_seq, input_size=_in,
-                hidden_size=_hs, num_layers=_nl, cell_type=cell,
-                lr=lr, max_steps=200, batch_size=_bs, device=device,
-                dropout=dropout, use_scheduler=True, optimizer=optimizer, seed=seed,
-                weight_decay=weight_decay,
-            )
+
+            def _make(_seed: int):
+                return RecurrentAlphaNet(
+                    input_dim=n_feat, seq_len=_seq, input_size=_in,
+                    hidden_size=_hs, num_layers=_nl, cell_type=cell,
+                    lr=lr, max_steps=200, batch_size=_bs, device=device,
+                    dropout=dropout, use_scheduler=True, optimizer=optimizer,
+                    seed=_seed, weight_decay=weight_decay,
+                )
             notes = (f"自写 {cell.upper()}（{device}, {optimizer}, dropout={dropout}, "
                      f"{feature_set}, seq={_seq}×{_in}）")
-        model.fit(x_train, y_train, x_valid, y_valid, early_stop=20 if algo != "mlp" else 30)
-        valid_ic = float(model.best_score)
+
+        _es = 20 if algo != "mlp" else 30
+        _n = max(1, int(n_seeds))
+        _seeds = [seed + i for i in range(_n)]
+        _members = []
+        for _i, _s in enumerate(_seeds):
+            if _n > 1:
+                print(f"  [集成 {_i + 1}/{_n}] seed={_s}", flush=True)
+            _m = _make(_s)
+            _m.fit(x_train, y_train, x_valid, y_valid, early_stop=_es)
+            _members.append(_m)
+        if _n > 1:
+            model = SeedEnsemble(_members, _seeds)
+            # 集成的 valid 分数要重新算——成员各自的 best_score 是各自的，
+            # 平均之后是另一个模型，不能拿成员最好的那个冒充集成成绩
+            valid_ic = _make_valid_scorer(x_valid, y_valid)(model.predict(x_valid))
+            print(f"  [集成完成] {_n} 个种子  成员 valid IC "
+                  f"{[round(s, 4) for s in model.member_scores]}  "
+                  f"集成 {valid_ic:+.4f}", flush=True)
+            notes += f"｜{_n} 种子集成"
+        else:
+            model = _members[0]
+            valid_ic = float(model.best_score)
         epochs = model.best_step + 1
 
         test_report = _eval_on_test(model, dataset, segments)
@@ -1180,7 +1286,10 @@ def train_torch(
 
         # 存盘（pickle 整个模型实例，含 net state_dict）
         import pickle as _pkl
-        model_path = _ensure_dir() / f"torch_{algo}_{universe}_{horizon}d.pkl"
+        # 文件名带种子数：集成模型不能覆盖同 algo 的单模型，否则想对比两者时
+        # 先训的那个已经被后训的冲掉了
+        _suffix = f"_x{_n}" if _n > 1 else ""
+        model_path = _ensure_dir() / f"torch_{algo}_{universe}_{horizon}d{_suffix}.pkl"
         with open(model_path, "wb") as f:
             _pkl.dump(model, f)
 
@@ -1194,6 +1303,10 @@ def train_torch(
             valid_period=f"{segments['valid'][0]}~{segments['valid'][1]}",
             metrics={"ic": ic, "valid_ic": valid_ic, "algo": algo, "horizon": horizon,
                      "device": device, "epochs": epochs, "seed": seed,
+                     "n_seeds": _n,
+                     # 成员各自的 valid IC：集成没跑赢最好的成员时能一眼看出来
+                     **({"member_ics": [round(s, 4) for s in model.member_scores]}
+                        if _n > 1 else {}),
                      "embargo_days": embargo, "dropout": dropout, "feature_set": feature_set,
                      **{f"test_{k}": v for k, v in (test_report or {}).items()
                         if k != "ic_series" and not isinstance(v, list)}},
@@ -1319,19 +1432,16 @@ def predict_batch(
 
     # 重新构造 handler 取特征（predict 不需要真 label，用占位表达式避免 horizon 未来数据问题）
     # label 用 Ref($close,-1)/Ref($close,-1)-1 恒为 0 的占位，handler 能跑通，predict 只用 feature
-    # infer_processors 必须与训练时同配置（RobustZScoreNorm+Fillna+CSRankNorm），
-    # 否则特征未归一化/未填 NaN，喂给模型全 NaN（之前 infer_processors=[] 空置的 bug）
+    # infer_processors 必须与训练时**逐字**一致，所以直接调用同一个函数。
+    # 旧版在这里手抄了一份，抄错了三处（缺 ProcessInf、丢 clip_outlier、
+    # 多了个训练时没有的 CSRankNorm），详见 infer_processors() 的 docstring。
     handler = Alpha158(
         instruments=universe,
         start_time=predict_date,
         end_time=predict_date,
         fit_start_time="2015-01-01",
         fit_end_time=predict_date,
-        infer_processors=[
-            {"class": "RobustZScoreNorm", "module_path": "qlib.data.dataset.processor"},
-            {"class": "Fillna", "module_path": "qlib.data.dataset.processor"},
-            {"class": "CSRankNorm", "module_path": "qlib.data.dataset.processor"},
-        ],
+        infer_processors=infer_processors(),
         label=["Ref($close, -1) / Ref($close, -1) - 1"],
     )
     from qlib.data.dataset import DatasetH
@@ -1442,20 +1552,20 @@ def search_lstm(
           "ic":0.12, "epochs":23}, ...]
     """
     _qlib_init()
-    from qlib.contrib.data.handler import Alpha158, _DEFAULT_INFER_PROCESSORS
+    from qlib.contrib.data.handler import Alpha158
     from qlib.data.dataset import DatasetH
 
     # handler（支持 csi300/csi500/all/watchlist）
     if universe not in ("csi300", "csi500", "all", "csi800", "watchlist"):
         raise ValueError(f"universe {universe} 暂不支持，可选 csi300/csi500/all/watchlist")
     actual_univ = universe if universe != "all" else "csi500"  # all = csi500 + 中证1000
-    learn_procs = [{"class": "DropnaLabel"}, {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}}]
+    learn_procs = learn_processors(rank_norm=False)
     label_expr = [f"Ref($close, -{horizon}) / Ref($close, -1) - 1"]
     handler = Alpha158(
         instruments=actual_univ,
         start_time=train_start, end_time=valid_end,
         fit_start_time=train_start, fit_end_time=train_end,
-        infer_processors=_DEFAULT_INFER_PROCESSORS,
+        infer_processors=infer_processors(),   # 统一成和训练/预测同一份
         learn_processors=learn_procs,
         label=label_expr,
     )

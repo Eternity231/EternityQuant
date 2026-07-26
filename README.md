@@ -824,6 +824,35 @@ eq ml train gru --seed 42 --name lr-default          # 新默认
 eq ml list                                           # 比 test_ic，不是 valid_ic
 ```
 
+### 多种子集成（v0.37）
+
+低信噪比数据上单次训练的方差极大：同一份数据、同一套超参，换个种子 test IC
+能差出一倍。集成降的是**方差**，不需要任何调参运气，是这类场景里最稳的一招。
+
+```bash
+eq ml train gru --seeds 5      # 跑 5 个种子取平均，训练时间线性增加
+```
+
+成员预测**先标准化再平均**：各模型输出尺度不可比（MSE 训出来的回归值量纲不同），
+直接算术平均等于给输出方差大的成员更高话语权。标准化是单调变换，不改变任何
+单个模型的截面排序。注册表里同时记 `n_seeds` 和 `member_ics`——集成没跑赢
+最好的成员时能一眼看出来。
+
+### 训练与推理的特征处理必须一致（v0.37 修）
+
+`predict_batch` 里的 `infer_processors` 是手抄的，和训练那份对不上三处：
+
+| | 训练 | 预测（修复前） |
+|---|---|---|
+| ProcessInf | 有 | **没有** |
+| RobustZScoreNorm | `fields_group="feature"`, `clip_outlier=True` | 裸调用，两个参数都没有 |
+| CSRankNorm | 只作用在 **label** | **加在特征上**（训练时根本没这步）|
+
+也就是模型训练时吃的是 z-score 特征，上线推理时吃的是横截面 rank（[0,1] 均匀分布）
+——分布完全不同。这类 train/serve skew 不报错、不产生 NaN，只是安静地把每一次
+`eq ml predict` 的结果打偏。现在统一由 `ml_workflow.infer_processors()` 提供，
+全文件只此一份，测试里有源码级守卫。
+
 ### 评估口径（v0.25）
 
 `eq.strategy.factors.evaluation` 提供业界标准口径，训练结束自动打印：
@@ -1202,6 +1231,58 @@ eq dash --no-theme                   # 本次禁用主题（排查显示问题�
 建仓/加仓/减仓补零负值校验；`signals` 表从"建了没人写"变成真的记录触发历史；
 sqlite3 date/timestamp 适配器显式注册（消除 Python 3.12+ 废弃告警）；
 Streamlit `use_container_width` → `width="stretch"`（旧参数已过移除期）。
+
+## 事件因子（v0.37）
+
+v0.35 删掉深度研究时留了个回收清单：解禁 / 股东户数 / 融资融券 / 北向持股
+这四项不是给人看的资讯，是**可交易的数据**。v0.37 把它们写成了因子
+（`eq/strategy/factors/event.py`），不是报告。
+
+| 因子 | 含义 | 方向 |
+|------|------|------|
+| `days_to_event` | 距下一次解禁还有几天 | 日期本身提前公开，无前视问题 |
+| `event_pressure` | 未来 N 天解禁压力（按比例加权、按距离指数衰减） | 越大压力越大 |
+| `holder_change` | 股东户数环比变化，**取负** | 户数下降＝筹码集中＝正分 |
+| `balance_momentum` | 融资余额 / 北向持股的 N 日变化率 | 用变化率不用绝对额，否则是在赌大小盘 |
+
+### 这个模块最要命的地方：前视偏差
+
+外部数据几乎都有两个日期——**报告期**（2025 年三季度末股东户数）和
+**公告日**（2025-10-24 披露）。按报告期对齐，等于让 9 月 30 日的策略用上
+10 月 24 日才公布的数字：回测 IC 会非常漂亮，实盘一分钱赚不到。
+
+所有对齐一律走 `align_events()`，它**只认公告日**且强制 `公告日 <= 交易日`。
+`tests/test_event_factors.py` 专门构造「报告期早、公告日晚」的数据来验证这条。
+
+（写这个模块时自己就踩了一次：`ffill_limit` 用「值是不是 NaN」判断数据新鲜度，
+但 `merge_asof` 出来的值本身已经前向填充过，`notna()` 恒为真，限制形同虚设。
+改成按公告日分组计龄。）
+
+### 现状：预测力**尚未验证**
+
+本模块只保证「算得对、不穿越」，**不保证有 alpha**。用法是先拉数据、再跑截面 IC：
+
+```python
+from eq.strategy.factors.event import build_panel, evaluate_factor
+print(evaluate_factor(build_panel(factors), bars, horizon=5))
+```
+
+走的是和 ML 模型**同一套** `evaluation.evaluate`（逐日截面 Rank IC），
+两者可以直接比较。IC 站不住就该扔掉，别因为「听起来有道理」就塞进策略。
+
+## 行业集中度约束（v0.37）
+
+单票权重上限管不住行业集中——10 只票全是白酒，每只 10% 也照样是满仓一个行业，
+一条政策就能把整个组合带走。
+
+```python
+cfg = PortfolioConfig(max_positions=10, max_per_industry=2)
+run_portfolio(bars, strategy, cfg, industries={"600519.SH": "白酒", ...})
+```
+
+约束发生在**选股阶段**而不是权重分配阶段：等到分配权重时候选池已经全是同行业了，
+再怎么调权重也分散不了。行业归属缺失的标的**不受限制**——数据拿不到不该等于禁止买入。
+默认 `max_per_industry=0`（不限制），行为与旧版一致。
 
 ## 砍掉的东西
 

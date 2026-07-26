@@ -308,3 +308,96 @@ def test_backtest_model_without_predictions(tmp_db):
 
     with pytest.raises(ValueError, match="没有预测记录"):
         backtest_model("不存在的模型")
+
+
+# ---------- 行业集中度约束（v0.37） ----------
+
+def _sector_bars(n_days: int = 120):
+    """造 9 只票：3 个行业 × 3 只。同行业内走势相近，行业间不相关。"""
+    import numpy as np
+    import pandas as pd
+
+    idx = pd.bdate_range("2024-01-01", periods=n_days)
+    rng = np.random.default_rng(11)
+    bars, inds = {}, {}
+    for ind in ("白酒", "银行", "半导体"):
+        common = np.cumsum(rng.normal(0.15, 1.0, n_days))     # 行业共同因子
+        for k in range(3):
+            sym = f"{ind}{k}"
+            c = 100 + common + np.cumsum(rng.normal(0, 0.3, n_days))
+            c = np.maximum(c, 1.0)
+            bars[sym] = pd.DataFrame(
+                {"open": c, "high": c * 1.01, "low": c * 0.99, "close": c,
+                 "volume": 1e6},
+                index=idx)
+            inds[sym] = ind
+    return bars, inds, idx
+
+
+def _all_in_scores(bars, idx):
+    """所有票每天都想买，且给同行业更高分——不加约束必然全押一个行业。"""
+    import pandas as pd
+
+    return pd.DataFrame(
+        {s: (0.9 if s.startswith("白酒") else 0.5) for s in bars},
+        index=idx)
+
+
+def test_industry_cap_limits_same_sector_holdings():
+    from eq.backtest.portfolio import PortfolioConfig, run_portfolio
+
+    bars, inds, idx = _sector_bars()
+    scores = _all_in_scores(bars, idx)
+
+    cfg = PortfolioConfig(max_positions=6, max_per_industry=1, min_weight=0.01)
+    res = run_portfolio(bars, scores, cfg, industries=inds)
+    held = res.weights[res.weights > 1e-6]
+    for day in held.index:
+        row = held.loc[day].dropna()
+        per_ind: dict[str, int] = {}
+        for sym in row.index:
+            per_ind[inds[sym]] = per_ind.get(inds[sym], 0) + 1
+        assert all(v <= 1 for v in per_ind.values()), f"{day} 违反行业上限：{per_ind}"
+
+
+def test_without_cap_portfolio_concentrates():
+    """不设约束时确实会全压高分行业——证明上面的测试不是空转。"""
+    from eq.backtest.portfolio import PortfolioConfig, run_portfolio
+
+    bars, inds, idx = _sector_bars()
+    res = run_portfolio(bars, _all_in_scores(bars, idx),
+                        PortfolioConfig(max_positions=3, min_weight=0.01))
+    last = res.weights.iloc[-1]
+    holdings = [s for s in last.index if last[s] > 1e-6]
+    assert holdings and all(s.startswith("白酒") for s in holdings), \
+        f"无约束下应集中在白酒，实得 {holdings}"
+
+
+def test_unknown_industry_is_not_blocked():
+    """行业归属缺失的标的不受限——数据拿不到不该等于禁止买入。"""
+    from eq.backtest.portfolio import PortfolioConfig, run_portfolio
+
+    bars, inds, idx = _sector_bars()
+    partial = {s: v for s, v in inds.items() if not s.startswith("半导体")}
+    cfg = PortfolioConfig(max_positions=9, max_per_industry=1, min_weight=0.01)
+    res = run_portfolio(bars, _all_in_scores(bars, idx), cfg, industries=partial)
+    last = res.weights.iloc[-1]
+    semis = [s for s in last.index if s.startswith("半导体") and last[s] > 1e-6]
+    assert len(semis) > 1, f"未知行业的票不该被名额限制，实得 {semis}"
+
+
+def test_industry_cap_off_by_default():
+    from eq.backtest.portfolio import PortfolioConfig
+
+    assert PortfolioConfig().max_per_industry == 0
+
+
+def test_industry_cap_ignored_without_mapping():
+    """只设 max_per_industry 但没给 industries 时按不限制处理，不能报错。"""
+    from eq.backtest.portfolio import PortfolioConfig, run_portfolio
+
+    bars, _, idx = _sector_bars()
+    res = run_portfolio(bars, _all_in_scores(bars, idx),
+                        PortfolioConfig(max_positions=3, max_per_industry=1,
+                                        min_weight=0.01))
+    assert len(res.equity_curve) > 0

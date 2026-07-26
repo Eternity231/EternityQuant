@@ -1660,6 +1660,10 @@ def ml_train(
                                   "Lion 是符号更新，步长和梯度大小无关，需比 AdamW 小一个量级"),
     weight_decay: float = typer.Option(-1.0, "--weight-decay",
                                        help="权重衰减，-1=按优化器取默认（lion 1e-4 / adamw 1e-5）"),
+    seeds: int = typer.Option(1, "--seeds",
+                              help="多种子集成：跑 N 次同配置不同种子取平均。"
+                                   "低信噪比数据上单次训练方差极大（同超参换个种子 IC 能差一倍），"
+                                   "集成降方差不靠调参运气。建议 3~5，训练时间线性增加"),
 ):
     # torch DLL 预热（Windows + cu132 坑：qlib 集成链触发 torch 延迟加载 c10.dll 失败，ml 命令才预热）
     try:
@@ -1750,7 +1754,8 @@ def ml_train(
                 test_ratio=test_ratio, embargo_days=(None if embargo < 0 else embargo),
                 seed=seed, feature_set=features,
                 lr=(None if lr < 0 else lr),
-                weight_decay=(None if weight_decay < 0 else weight_decay), **kw,
+                weight_decay=(None if weight_decay < 0 else weight_decay),
+                n_seeds=seeds, **kw,
             )
         else:
             result = wf_train(
